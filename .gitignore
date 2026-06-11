@@ -1,0 +1,33 @@
+# === Build output (multi-GB) ===
+/out/
+
+# === Regenerable recompiled sources (~374M each) ===
+# Regenerate with: cmake --build <build> --target nhllegacy_codegen
+# (needs the rexglue SDK + the game XEX). Not tracked to keep the repo lean.
+/generated/
+/generated.bak_080/
+
+# === Large GPU trace captures (~439M; regenerable) ===
+/gpu_trace/
+*.xtr
+
+# === Game image — copyrighted, not redistributable ===
+/assets/
+*.xex
+
+# === Backups ===
+*.bak_080
+*.bak2
+
+# === Root-level build/run artifacts ===
+/*.log
+/*.png
+/*.bin
+/run_stderr.log
+/run_stdout.log
+
+# === Local editor/tool settings ===
+.claude/settings.local.json
+
+# === Vendored third-party build dirs (added in M0c) ===
+/third_party/**/build/

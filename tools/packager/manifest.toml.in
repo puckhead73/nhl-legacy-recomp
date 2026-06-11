@@ -1,0 +1,16 @@
+# Dev payload manifest, generated at CMake configure time from
+# assets/default.xex. Release zips get a fresh manifest from
+# release/package.ps1 instead.
+
+[tool]
+version      = "@PACKAGER_VERSION@-dev"
+sdk_version  = "@REXGLUE_VERSION_STRING@"
+port_build   = "@CMAKE_BUILD_TYPE@"
+
+[xex]
+title        = "NHL Legacy (vanilla)"
+sha256       = "@NHLLEGACY_XEX_SHA256@"
+size_bytes   = @NHLLEGACY_XEX_SIZE@
+
+[port]
+exe          = "nhllegacy.exe"
