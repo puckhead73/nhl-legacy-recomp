@@ -146,6 +146,40 @@ samples (matched by guest address). Validate the player appears like the oracle.
 the focused flat-RTT work; it is deep (prior sessions' "green wall" / EDRAM-sequencing
 divergence live here), so it is scoped as its own effort, not a one-shot change.
 
+## Demonstration: flat RT renders the player; EDRAM folds it away (the thesis, shown)
+
+Three captures of the **same** scene_02 frame 150 (composite over black):
+
+| capture | path | result |
+|---|---|---|
+| `replay_scene02_full.png` | base/SDK oracle | UI + player, correct (center-right, textured) |
+| `h3_edram_f150_black.png` | beta **EDRAM** (folds) | UI correct, **player MISSING** (folded/sequenced away) |
+| `h3_offscreen_f150_black.png` | beta **flat** offscreen RTV | UI + **player TEXTURED** (Ducks jersey), but mispositioned (far-right + left wrap) |
+
+**This is the answer to "are we still hitting the fold?": no.** The EDRAM path (the low
+cut we delete) renders the player away. The **flat** path renders the player **textured**
+— the EDRAM fold-to-black does not happen on a flat RT. The high cut escapes the fold.
+
+The flat path's residual is **positioning**, and it is NOT the fold — it is that the
+offscreen path uses a **single** RT and piles all ~19 multi-pass surfaces into it, so the
+player's intermediate render + the composite don't line up. Confirmed: a viewport-only fix
+(route the 27 wide `vte=0x43F` draws through a native-viewport flat branch) changed **0**
+visible pixels — the visible player comes from the 640×360 passes + composite, which a
+single RT can't separate. So the remaining work is genuinely the **multi-pass flat RT
+manager**, not a fold fix:
+
+1. Map each guest color surface (`RB_COLOR_INFO.color_base`) → its own **flat host RT** at
+   logical size (viewport extent), instead of one shared offscreen RT.
+2. Bind the per-surface flat RT per draw; render with the native guest viewport.
+3. On each PM4 `Resolve`, copy the source flat RT → a flat host **texture**; map the guest
+   resolve-dest address → that host texture.
+4. When a draw samples a resolved guest address, bind the mapped host texture (skip the
+   tiled guest-memory round-trip).
+5. Present/capture the frontbuffer surface's flat RT.
+
+None of this models EDRAM tiles, so the fold cannot form — it is the genuine high-cut
+renderer, scoped as its own (multi-session) build.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
