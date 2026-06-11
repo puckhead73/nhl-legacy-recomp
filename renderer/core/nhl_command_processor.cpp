@@ -3722,7 +3722,13 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
                 rok ? "captured" : "FAILED");
   }
 
-  if (beta_takeover_) {
+  // Only run the (expensive, ~4s) post-frame device-removal poll + drains on a frame
+  // where we actually did owned rendering — i.e. the capture frame and not yet dumped.
+  // On a streaming trace, every frame BEFORE NHL_BETA_CAPTURE_FRAME does no owned draws
+  // (beta_takeover_rendered_ stays 0), so the poll there is pure wasted idle (~4s/frame)
+  // that made reaching a late capture frame take minutes. Gating it lets the streaming
+  // replay fast-forward to the capture frame. No rendering change.
+  if (beta_takeover_ && beta_takeover_rendered_ > 0 && !beta_capture_done_) {
     if (beta_renderdoc_ && beta_rdoc_capturing_) {
       const uint32_t ok = beta_renderdoc_->api_1_0_0()->EndFrameCapture(
           GetD3D12Provider().GetDevice(), nullptr);
