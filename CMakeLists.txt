@@ -15,6 +15,9 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/diag_hooks.cpp
+    # High-cut engine (M1): D3D9 entry-point TAP — call-counting pass-through
+    # hooks for runtime correlation. Env-gated (NHL_D3D9_TAP); no behavior change.
+    gpu/hooks/d3d9_tap.cpp
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
