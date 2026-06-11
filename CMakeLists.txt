@@ -15,9 +15,12 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/diag_hooks.cpp
-    # High-cut engine (M1): D3D9 entry-point TAP — call-counting pass-through
-    # hooks for runtime correlation. Env-gated (NHL_D3D9_TAP); no behavior change.
-    gpu/hooks/d3d9_tap.cpp
+    # High-cut engine (H-1): D3D9 logical resource graph — pass-through hooks that
+    # build the EDRAM-free RT/texture/resolve graph. Env-gated (NHL_HIGHCUT); no
+    # behavior change. Supersedes the M1 correlation tap (gpu/hooks/d3d9_tap.cpp,
+    # kept in-tree for reference) — both override the same symbols, so only one may
+    # be compiled into the target at a time.
+    gpu/hooks/d3d9_resources.cpp
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
