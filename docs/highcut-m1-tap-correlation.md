@@ -39,6 +39,34 @@ game's D3D9 calls on the live title and route them wherever we want (next: plume
 draw is the **~48–60/frame** function (`sub_827E2140`), not the big-but-infrequent
 `sub_827EF8E0`. Frequency correlation is the right tool to finish pinning.
 
+## Expanded correlation — 34 functions over ~1320 frames
+
+Ground truth from the swap log: **draws≈62/frame, resolves=2/frame, shader_loads=16/frame**.
+
+| guest fn | calls/frame | read (by frequency vs ground truth) |
+|---|---|---|
+| `sub_827E5938` | **137** | hottest per-draw setter (~2.2×/draw) — Set{Vertex,Pixel}ShaderConstantF / SetSamplerState class |
+| `sub_827E2140` | **48** | **DrawIndexedPrimitive** (≈ the 62 PM4 draws; remainder likely a 2nd draw entry) |
+| `sub_827EE438` / `sub_827E38B8` | 7.4 / 7.1 | per-some-draws setter (SetTexture / SetStreamSource / state batch) |
+| `sub_827E39D8`/`ED9A8`/`E6978`/`E6D58` | 3.8–4.4 | mid per-frame state |
+| `sub_827E8C20` | 2.8 | |
+| `sub_827EB558` | 2.5 | COM Release |
+| `sub_827E12B8` (tiny) / `sub_827E7138` | **~2.0** | **Resolve** candidates (match resolves=2/frame) |
+| `sub_827EB650` | 1.9 | Get* (0 stores) |
+| `sub_827EF8E0` | 1.8 | low-freq per-frame (Clear / BeginScene-class; NOT the draw) |
+| `sub_827EB4E0` | 1.8 | COM refcount |
+| `sub_827E2260` / `sub_827EC318` | **1.00** | **per-frame-once** ops — Clear-backbuffer / SetRenderTarget / BeginScene/EndScene |
+| `sub_827F1C88` | 1.00 | **Present/Swap** (VdSwap) |
+| `sub_827E3140` | 0.01 | device/resource init (startup) |
+| `sub_827FA878` | 0.00 (2) | rare — reset/mode-change |
+| `sub_827EED20`/`F97E0`/`ECD58`/`E5570`/`EDEC0` | ~0 | cold paths (init/teardown/error) — not in the hot render loop |
+
+**Confident:** swap=`sub_827F1C88`, device-init=`sub_827E3140`, draw≈`sub_827E2140`,
+hottest-setter=`sub_827E5938`, per-frame-once∈{`sub_827E2260`,`sub_827EC318`},
+resolve∈{`sub_827E12B8`,`sub_827E7138`}. **To finalize** Clear/Resolve/Draw/Present exactly: read the
+~5 candidate bodies (full PPC disasm in `generated/default/nhllegacy_recomp.31.cpp`) for the tell-tale
+register writes (VGT_DRAW_INITIATOR for draw, RB_COPY_CONTROL/kCopy for resolve, color-clear for Clear).
+
 ## Next (M1 cont.)
 
 1. **Finish pinning** the core entries by tapping more candidates and matching exact
