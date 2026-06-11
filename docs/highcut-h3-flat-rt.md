@@ -211,6 +211,35 @@ run past 1.0 — a localized, single-draw fix.
 placement so the player lands like the oracle. No multi-pass machinery needed for this
 scene — the texture is already there; only the blit is misplaced.
 
+## Isolated to ONE draw: the player composite samples a resolved RTT texture beta untiles wrong
+
+Drilling into the ~430–470 composite blit (`NHL_BETA_DEPTH_DIAG` + `NHL_BETA_BIND_DIAG`):
+
+- **All composite draws 430–472 have a correct, standard viewport**: `VPORT(xs=640 xo=640
+  ys=-360 yo=360)`, `ndc_scale=(1,1,1)`, full 1280×720. So the misplacement is **not** the
+  viewport.
+- **Draw #430 is the player composite**: it samples a **1280×720** texture at
+  `0x1AF09000` (fmt=6, **tiled=1, pitch=40 → 1280px**, resident) and draws it full-screen.
+  The texture is a correct, un-folded, 1280-wide player RTT — pitch == width, no 640 fold.
+- **Ground-truth dump of `0x1AF09000`** (`NHL_DUMP_ADDRS`, base path) shows the player
+  content **split to the left+right edges** under the approximate untile — the same
+  far-right+wrap signature, in the texture's untiled layout.
+- **Decisive:** the **base/SDK path renders this exact texture correctly** (player
+  center-right, `replay_scene02_full.png`), while **beta renders it split**. Same texture,
+  same fetch constant — so **beta's untile/sample of this resolved RTT texture diverges
+  from the base**.
+
+**Conclusion — the residual is texture/binding PARITY, not the fold.** The high cut already
+escaped the fold (flat RT renders the player textured). What's left is the documented hard
+core of the owned backend (build-order doc §4.1): "reproduce the CP's binding and
+constant computation exactly." Specifically, beta's `D3D12TextureCache` untile / sampler /
+UV handling for this **resolved-render-target texture** must match the base byte-for-byte
+(the UI's ordinary tiled textures already match; the resolved RTT has a different
+tiling/addressing the beta path doesn't yet reproduce). That is iterative renderer-parity
+work (diff beta's untiled texture vs the base for `0x1AF09000`, find the addressing
+divergence, fix), not a one-line change — and it generalizes to all 3D scenes (gameplay
+included), so it is worth doing as a parity pass rather than per-scene.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
