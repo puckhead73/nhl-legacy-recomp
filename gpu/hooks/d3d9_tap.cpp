@@ -66,22 +66,31 @@ void Dump(const char* tag) {
     }
 }
 
-inline void Hit(int slot) {
+inline uint64_t Hit(int slot) {
     uint64_t n = g_taps[slot].calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1) REXLOG_INFO("[d3d9-tap] FIRST-CALL {}", g_taps[slot].name);
     if (slot == S_sub_827F1C88) {  // swap drives the per-frame dump
         uint64_t f = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (f % 120 == 0) Dump("tick");
     }
+    return n;
 }
 
 }  // namespace
 
-// Generate a pass-through hook for every tapped function.
-#define TAP_HOOK(sym)                            \
-    REX_HOOK_RAW(sym) {                          \
-        if (g_enabled) Hit(S_##sym);             \
-        __imp__##sym(ctx, base);                 \
+// Generate a pass-through hook for every tapped function. Logs the PPC args
+// (r3=this, r4..r7) on the first 2 calls — SetRenderTarget shows (index, surf*)
+// (small r4 + heap r5); resource setters show a resource pointer.
+#define TAP_HOOK(sym)                                                         \
+    REX_HOOK_RAW(sym) {                                                       \
+        if (g_enabled) {                                                      \
+            uint64_t n = Hit(S_##sym);                                        \
+            if (n <= 2)                                                       \
+                REXLOG_INFO("[d3d9-tap] ARG {} r3={:08X} r4={:08X} r5={:08X} " \
+                            "r6={:08X} r7={:08X}", #sym, ctx.r3.u32,          \
+                            ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32);  \
+        }                                                                     \
+        __imp__##sym(ctx, base);                                             \
     }
 #define X(sym) TAP_HOOK(sym)
 TAP_LIST(X)

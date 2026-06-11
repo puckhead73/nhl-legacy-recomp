@@ -98,6 +98,34 @@ This is exactly the kind of ground truth that only the live tap could reveal, an
 investment (plume routing) — routing *resources+present* through plume is viable; routing *draws* is not, for
 this title, without PM4.
 
+## SetRenderTarget / Resolve pinned (sizes the hybrid's EDRAM bookkeeping)
+
+Tapped arg signatures (first calls; device = `r3=ADEC6A80`) + body reads:
+
+- **Resolve = `sub_827EF8E0` — OUT-OF-LINE, CONFIRMED.** Body does `fcfid`→`stfs` of a **3-vertex (x,y) float
+  rectangle** (`stfs f,0(r3)…20(r3)`) = the D3D9 resolve's `kRectangleList`/`k_32_32_FLOAT` rect (per SDK
+  xenos.h). Args = `(device, flags=0x300, …, destTex=BFC6D0C0)` → **resolve dest texture is a hook argument**. ~2/frame = resolves=2.
+- **The whole resource-binding layer is OUT-OF-LINE and pointer/descriptor-based.** `sub_827E5938` (137/frame)
+  and `sub_827E2140` (48/frame, indexed r4=0,1,…) build 24-byte fetch constants from a resource; `sub_827E6480`
+  (~0.8/frame) **copies a surface/texture descriptor block into a device slot** `(index+120)*16` via a VMX copy
+  loop, args `(device, index=0, surface=ADBC7B00, 16)` — i.e. **SetRenderTarget / SetTexture-class bind**, at
+  RT-change cadence. So bound textures / vertex buffers / render targets are visible **by pointer** at the hook
+  level.
+- **Swap/Present `sub_827F1C88`** args `(device, surface=BFC6D0C0, …, 0x500=1280, 0x2D0=720)` → present surface +
+  size at the hook.
+
+**Verdict:** Resolve + the resource-binding verbs (incl. the SetRenderTarget-class surface bind) are **out-of-line
+and carry logical resource pointers**; only the **per-draw DRAW_INDX is inlined**.
+
+### Why this shrinks the hybrid's EDRAM cost a lot
+Because *where/what* (current RT, bound textures, resolve src→dest, present surface+size) all come from D3D9
+hooks **as logical pointers**, the hybrid does **not** need the heavy "reverse-map EDRAM base → which resource"
+machinery. The residual bookkeeping is light: **attribute each inlined PM4 draw to the currently-bound logical RT
+by call ordering, render it to a flat RT sized from the draw's viewport.** The fold dies (flat RTs) and the
+EDRAM↔resource reverse-mapping — the historically hard/buggy part — is largely avoided. (One item still worth a
+final airtight check: that `sub_827E6480` is specifically `SetRenderTarget` vs `SetTexture` — tap by the
+render-target surface pointer to confirm; strong-inference for now from the API's consistency.)
+
 ## Next (M1 cont.)
 
 1. **Finish pinning** the core entries by tapping more candidates and matching exact
