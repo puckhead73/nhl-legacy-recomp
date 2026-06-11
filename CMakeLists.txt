@@ -21,6 +21,9 @@ set(NHLLEGACY_SOURCES
     # kept in-tree for reference) — both override the same symbols, so only one may
     # be compiled into the target at a time.
     gpu/hooks/d3d9_resources.cpp
+    # High-cut engine (H-2): first plume-driven frame — an in-process plume D3D12
+    # swapchain driven by the guest Present hook. Env-gated (NHL_HIGHCUT_PRESENT).
+    gpu/hooks/plume_present.cpp
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
@@ -44,6 +47,14 @@ else()
 endif()
 
 rexglue_setup_target(nhllegacy)
+
+# High-cut engine (H-2): vendored plume RHI (MIT, third_party/plume). Built as a
+# static lib in its own directory scope (C++17, its own backends) and linked into
+# nhllegacy so gpu/hooks/plume_present.cpp can drive an in-process plume swapchain
+# from the intercepted guest Present. Same add_subdirectory pattern proven by the
+# standalone gpu/smoke build.
+add_subdirectory(third_party/plume ${CMAKE_BINARY_DIR}/plume_build)
+target_link_libraries(nhllegacy PRIVATE plume d3d12 dxgi dxguid)
 
 # snappy (for .xtr trace decompression in the in-host replay mode). Statically
 # linked into rexruntime.dll but not re-exported, so link it directly; lib name

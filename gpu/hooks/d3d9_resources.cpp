@@ -48,6 +48,14 @@ namespace {
 
 const bool g_enabled = std::getenv("NHL_HIGHCUT") != nullptr;
 
+}  // namespace
+
+// H-2: drive the in-process plume swapchain once per guest Present. Implemented in
+// gpu/hooks/plume_present.cpp; self-gating on NHL_HIGHCUT_PRESENT (no-op otherwise).
+extern "C" void HighcutPlumeTick();
+
+namespace {
+
 // ---------------------------------------------------------------------------
 // Guest memory read (big-endian). `base` is the virtual membase; the recomp's own
 // loads use base+addr directly (REX_RAW_ADDR), so we match that — the descriptor
@@ -314,8 +322,10 @@ REX_HOOK_RAW(sub_827EF8E0) {
 }
 
 // Present/Swap (1/frame): args (device r3, surface* r4, _, w r6, h r7). Drives the
-// per-frame graph dump.
+// per-frame graph dump (H-1) and the in-process plume swapchain (H-2).
 REX_HOOK_RAW(sub_827F1C88) {
+    // H-2: advance the plume frame in lock-step with the guest present (self-gating).
+    HighcutPlumeTick();
     if (g_enabled) {
         std::lock_guard<std::mutex> lk(g_mtx);
         const uint32_t surf = ctx.r4.u32;
