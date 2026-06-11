@@ -76,14 +76,42 @@ scene. Establish that harness first, or the "after" image is unreadable.
   above, and the trace-replay harness must first be made readable for 3D (live or
   full-capture).
 
-## Recommended next step
+## Validation harness — ESTABLISHED (oracle readable; "harness first" step)
 
-1. Stand up a **readable 3D validation harness**: a live beta takeover of a 3D scene, or a
-   `NHL_CAPTURE_FULL` self-contained 3D capture, so output is judgeable.
-2. Build the **flat multi-pass RTT** orchestration in the beta CP: per guest render pass,
+The readable oracle is in place and proves the fold is **not** in the scene:
+
+- **Oracle = base/SDK path, whole-stream replay.** Replaying the *entire* scene_02 stream
+  through the base path (textures warm across frames) renders the create-player EQUIPMENT
+  screen with the **3D player model correctly positioned** — upright, center-right, **no
+  fold / no wrap / no mis-projection** (`replay_scene02_full.png`, fully textured Bruins
+  jersey). A single-frame base replay (`replay_frame.png`) shows the same geometry as a
+  black **silhouette** (early frame, textures not yet uploaded) — still correctly placed.
+- **Conclusion:** the faithful SDK path renders this 3D frame correctly. The empty beta
+  output is therefore a **beta-backend** gap (no multi-pass RTT into flat RTs), not a
+  scene/fold property — exactly what fork (a)'s flat-RTT build must close.
+- **Harness recipe:**
+  - *Oracle:* `NHL_REPLAY_XTR=scene_02\…_stream.xtr` (no `NHL_BACKEND`) → whole-stream
+    replay → `replay_scene02_full.png` (warm, textured, correctly placed). Reference image.
+  - *Test (to fill once the build lands):* same trace through `NHL_BACKEND=beta
+    NHL_BETA_TAKEOVER=1` with the flat-RTT path → compare the player's placement/shape to
+    the oracle. "Fold gone" = player lands like the oracle (not folded/wrapped/empty).
+  - Note: the beta side must replay the **whole stream** (warm textures) and capture a
+    **late** frame to be comparable — today's single-frame takeover would be cold even if
+    geometry were correct. Wiring beta's streaming-replay + late-frame capture is the
+    first build sub-step.
+- Composite `beta_owned_draw.png`/`replay_frame.png` over **black** before judging
+  (RTV-alpha artifact, `[[beta-png-alpha-artifact]]`).
+
+## Recommended next step (harness done → build)
+
+1. ✅ Readable 3D validation harness established (above): oracle = base whole-stream replay
+   of scene_02 (`replay_scene02_full.png`), player correctly placed.
+2. Wire beta's **streaming replay + late-frame capture** so its output is comparable to the
+   oracle (whole-stream warm textures, not the cold single-frame takeover).
+3. Build the **flat multi-pass RTT** orchestration in the beta CP: per guest render pass,
    allocate/bind a flat host RT at the logical size (H-1 graph + viewport/resolve regs);
    on each PM4 `Resolve`, copy flat-RT → flat resolve-dest texture; composite samples the
-   flat textures. Validate the fold is absent vs the EDRAM path's folded output.
+   flat textures. Validate the player lands like the oracle (fold absent).
 
 ## Reproduce (the diagnostic runs above)
 
