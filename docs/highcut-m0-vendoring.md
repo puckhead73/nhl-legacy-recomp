@@ -48,9 +48,25 @@ The environment reports `Is a git repository: false`. Vendoring multiple third-p
 (or a manual backup snapshot) so the large structural changes are reversible. (plume's "unstable API" caveat
 makes a safety net doubly worthwhile.)
 
+## Vendored (M0c) — pinned, fetched, not committed
+
+Both deps are MIT and fetched at pinned commits by `tools/fetch_thirdparty.ps1`. They are **gitignored** (not
+committed) — ~350M is mostly prebuilt binaries (`dxc-bin`) and headers (`Vulkan-Headers`) that don't belong in
+our history; the pins below make them reproducible.
+
+| Dep | Path | Pinned commit | Notes |
+|---|---|---|---|
+| **plume** | `third_party/plume` | `4f556be1531698174a597e7e0a215c22d3238a24` | RHI + contrib: volk, VulkanMemoryAllocator, Vulkan-Headers, D3D12MemoryAllocator. ~57M. |
+| **XenosRecomp** | `tools/xenos_recomp` | `990d03b28a27b50277ee5d8d942e1c5f873869d1` | shader tool + thirdparty: smol-v, zstd, xxHash, fmt, **dxc-bin** (prebuilt DXC). ~293M. |
+
+Repair/reproduce: `pwsh tools/fetch_thirdparty.ps1`.
+
 ## Status / next
 
-M0a (license review) and M0b (plume structure & integration) are **done** and clean: plume + XenosRecomp are MIT
-and vendorable; UnleashedRecomp is GPL → reference-only. The next action (M0c) is the first that **physically
-modifies the project** (clone ~6 repos into the tree + CMake changes). Given the no-VCS risk, recommend
-establishing a safety net first, then vendoring.
+- **VCS safety net: DONE** — `git init` + baseline commit `b25b75c` on `master` (hand-written source only; big
+  regenerable/copyrighted artifacts gitignored).
+- **M0a/M0b: DONE** (licenses clean, plume fit confirmed).
+- **M0c vendoring: DONE** — plume + XenosRecomp fetched at the pins above.
+- **Next (M0c build):** wire CMake (`add_subdirectory(third_party/plume)`, new `gpu` target) and stand up a plume
+  cleared-window standalone on D3D12 + Vulkan. Then M1: pin the core D3D9 entry points via runtime correlation
+  and route the first hooked frame through plume.

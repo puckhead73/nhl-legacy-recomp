@@ -29,5 +29,7 @@
 # === Local editor/tool settings ===
 .claude/settings.local.json
 
-# === Vendored third-party build dirs (added in M0c) ===
-/third_party/**/build/
+# === Vendored third-party (M0c) — fetched/pinned, not committed (~350M, prebuilt bins/headers) ===
+# Reproduce with: pwsh tools/fetch_thirdparty.ps1   (pinned commits in docs/highcut-m0-vendoring.md)
+/third_party/
+/tools/xenos_recomp/
