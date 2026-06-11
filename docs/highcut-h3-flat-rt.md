@@ -180,6 +180,37 @@ manager**, not a fold fix:
 None of this models EDRAM tiles, so the fold cannot form — it is the genuine high-cut
 renderer, scoped as its own (multi-session) build.
 
+## REFRAME: the missing player is a mispositioned composite blit, not the fold or multi-pass
+
+`NHL_BETA_MAX_DRAW` bisection of scene_02 frame 150 (flat offscreen path) localizes the
+visible content precisely:
+
+| MAX_DRAW | result |
+|---|---|
+| 250 | black (early passes render then get cleared — they're render-to-texture) |
+| 430 | solid blue (the background fill) |
+| 470 | **full player (right) + left sliver**, UI header + partial equipment list |
+| 560 / 600 | full UI + same mispositioned player |
+
+So the visible frame is painted by the **late** draws (~430→600): blue background → UI →
+**a single composite blit of the player at draws ~430–470**, sampling the player's
+already-resolved texture (present in guest RAM from the trace; the texture cache uploads
+it — that's why the player is fully textured). The early render-to-texture passes are
+cleared away, as expected.
+
+**This reframes the remaining work entirely.** The player is *not* lost to the EDRAM fold
+(it renders, textured) and the fix is *not* a multi-pass RT manager. It is a **single
+composite draw** whose placement is wrong: the player lands shifted right and wraps at
+x=1280 (full player at x≈960–1280 + a sliver wrapping to x≈0–80), vs the oracle's
+center-right placement. That signature (right-shift + wrap-at-RT-width) points at the
+composite blit's viewport/UV mapping or a WRAP sampler address mode on a quad whose UVs
+run past 1.0 — a localized, single-draw fix.
+
+**Next step (focused):** inspect the ~430–470 composite draw's vertices/UVs + sampler
+(RenderDoc on the takeover frame, or dump the draw's VB/fetch-constants) and correct its
+placement so the player lands like the oracle. No multi-pass machinery needed for this
+scene — the texture is already there; only the blit is misplaced.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
