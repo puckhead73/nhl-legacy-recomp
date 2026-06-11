@@ -996,6 +996,82 @@ D3D_PRIMITIVE_TOPOLOGY HostPrimToD3DTopology(uint32_t host_prim) {
 }
 }  // namespace
 
+// Route (a): on a guest resolve (kCopy) in the flat path, copy our flat offscreen RT
+// (the just-rendered pass) into a host texture keyed by the resolve DEST address, then
+// clear the RT for the next pass. A later draw sampling that dest binds this host texture
+// (see write_tex_table) instead of a guest-RAM untile of the resolved surface — so the
+// composite samples our flat host RT and the player lands correctly (no fold, no untile).
+void NhlD3D12CommandProcessor::BetaFlatResolve() {
+  if (!beta_offscreen_rt_ || !beta_rtv_heap_ || !memory_) return;
+  // The guest resolve's physical dest address (what a later texture fetch will sample)
+  // is NOT RB_COPY_DEST_BASE<<12 — Xenos uses tiled resolve addressing. GetResolveInfo
+  // computes the real copy_dest_base, matching the sampling draw's fetch-constant base.
+  namespace draw_util = rex::graphics::draw_util;
+  draw_util::ResolveInfo ri{};
+  if (!draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, 1, 1, false, false, ri)) {
+    return;
+  }
+  const uint32_t dest = ri.copy_dest_base;
+  if (!dest) return;
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  auto& fr = beta_flat_resolves_[dest];
+  if (!fr.tex) {
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width = beta_rt_width_;
+    d.Height = beta_rt_height_;
+    d.DepthOrArraySize = 1;
+    d.MipLevels = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&fr.tex)))) {
+      REXLOG_ERROR("[nhl-beta] flat-resolve: host tex create failed dest=0x{:X}", dest);
+      beta_flat_resolves_.erase(dest);
+      return;
+    }
+    fr.state = D3D12_RESOURCE_STATE_COPY_DEST;
+  }
+  d3d12::DeferredCommandList& dcl = GetDeferredCommandList();
+  auto barrier = [&](ID3D12Resource* r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = r;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    dcl.D3DResourceBarrier(1, &b);
+  };
+  if (fr.state != D3D12_RESOURCE_STATE_COPY_DEST) {
+    barrier(fr.tex.Get(), fr.state, D3D12_RESOURCE_STATE_COPY_DEST);
+    fr.state = D3D12_RESOURCE_STATE_COPY_DEST;
+  }
+  barrier(beta_offscreen_rt_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+          D3D12_RESOURCE_STATE_COPY_SOURCE);
+  dcl.D3DCopyResource(fr.tex.Get(), beta_offscreen_rt_.Get());
+  barrier(beta_offscreen_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+          D3D12_RESOURCE_STATE_RENDER_TARGET);
+  barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  fr.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  // NOTE: do NOT clear the scratch here — the final composite pass renders into it and is
+  // what we dump. Clearing after the frontbuffer resolve wiped the final frame to black.
+  // Per-pass separation is instead handled by the guest's own background/clear draws.
+  // (NHL_BETA_FLAT_CLEAR re-enables a transparent clear for experimentation.)
+  if (std::getenv("NHL_BETA_FLAT_CLEAR")) {
+    const float clear0[4] = {0, 0, 0, 0};
+    dcl.D3DClearRenderTargetView(beta_rtv_heap_->GetCPUDescriptorHandleForHeapStart(), clear0, 0,
+                                 nullptr);
+  }
+  if (std::getenv("NHL_BETA_FLAT_DIAG"))
+    REXLOG_INFO("[nhl-beta] flat-resolve #{}: offscreen RT -> host tex copy_dest_base=0x{:X} "
+                "extent_start=0x{:X}",
+                beta_resolves_seen_++, dest, ri.copy_dest_extent_start);
+}
+
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     xenos::PrimitiveType primitive_type, uint32_t index_count,
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info) {
@@ -1340,7 +1416,12 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   uint32_t x_max = guest_w, y_max = guest_h;
   const auto vte_vp = register_file_->Get<reg::PA_CL_VTE_CNTL>();
   const bool vport_xform = vte_vp.vport_x_scale_ena && vte_vp.vport_y_scale_ena;
-  if (edram && vport_xform) {
+  // NHL_BETA_FLAT (route a): 3D passes render flat with their NATIVE guest viewport into
+  // the logical-sized scratch RT — surface_pitch never enters, so the wide-into-narrow
+  // EDRAM fold cannot form. Needs the un-clamped x_max so the true 1280-wide extent/ndc
+  // is reported (else the player's viewport clamps to the 640 pitch and wraps).
+  static const bool flat_mode = std::getenv("NHL_BETA_FLAT") != nullptr;
+  if ((edram || flat_mode) && vport_xform) {
     x_max = 8192;  // ~xenos max RT size; viewport not clamped to pitch (scissor clamps instead)
     y_max = 8192;
   }
@@ -1408,6 +1489,20 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         }
       }
     }
+  } else if (flat_mode && vport_xform) {
+    // Route (a) FLAT 3D: render this 3D draw with its NATIVE guest viewport (vpi from the
+    // un-clamped x_max) directly into the flat scratch RT. vpi.xy_extent is the guest's
+    // true viewport extent (1280 for the create-player model), so geometry lands 1:1 at
+    // full width — no surface_pitch, no fold, no wrap. 2D draws are untouched.
+    vp.TopLeftX = float(vpi.xy_offset[0]);
+    vp.TopLeftY = float(vpi.xy_offset[1]);
+    vp.Width = float(vpi.xy_extent[0]);
+    vp.Height = float(vpi.xy_extent[1]);
+    auto clampL = [](LONG v, LONG hi) { return v < 0 ? 0 : (v > hi ? hi : v); };
+    scissor = {clampL(LONG(vpi.xy_offset[0]), LONG(beta_rt_width_)),
+               clampL(LONG(vpi.xy_offset[1]), LONG(beta_rt_height_)),
+               clampL(LONG(vpi.xy_offset[0] + vpi.xy_extent[0]), LONG(beta_rt_width_)),
+               clampL(LONG(vpi.xy_offset[1] + vpi.xy_extent[1]), LONG(beta_rt_height_))};
   } else if (guest_w == beta_rt_width_ || std::getenv("NHL_BETA_VP_FULLRT")) {
     // 1:1 guest-surface==RT (the validated 2D menu/intro path) — keep the full-RT
     // viewport exactly as before so those frames stay byte-identical.
@@ -2028,8 +2123,26 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   auto write_tex_table = [&](const auto& tbs, D3D12_GPU_DESCRIPTOR_HANDLE& out) {
     if (tbs.empty() || !view_ok) return;
     out.ptr = view_gpu.ptr + UINT64(view_off) * view_inc;
+    static const bool flat_sub = std::getenv("NHL_BETA_FLAT") != nullptr;
     for (size_t i = 0; i < tbs.size(); ++i) {
       D3D12_CPU_DESCRIPTOR_HANDLE h{view_cpu.ptr + SIZE_T(view_off + i) * view_inc};
+      // Route (a): if this binding samples a captured resolve DEST, bind our flat host
+      // RT (correct, no guest-RAM untile) instead of the texture cache's SRV.
+      if (flat_sub) {
+        xenos::xe_gpu_texture_fetch_t ftf{};
+        std::memcpy(&ftf, &regs[0x4800 + tbs[i].fetch_constant * 6], 24);
+        const uint32_t fbase = uint32_t(ftf.base_address) << 12;
+        auto fit = beta_flat_resolves_.find(fbase);
+        if (fit != beta_flat_resolves_.end() && fit->second.tex) {
+          D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+          sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+          sd.Texture2D.MipLevels = 1;
+          GetD3D12Provider().GetDevice()->CreateShaderResourceView(fit->second.tex.Get(), &sd, h);
+          continue;
+        }
+      }
       if (beta_faketex && beta_fake_tex_ready_) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -3495,7 +3608,19 @@ bool NhlD3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, ui
           RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);
         }
       } else {
-        RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);
+        // Flat path (route a): treat a guest resolve (kCopy) as a host capture of our
+        // flat RT into the dest's host texture; render color/depth passes, skip no-ops.
+        static const bool flat_rt = std::getenv("NHL_BETA_FLAT") != nullptr;
+        if (flat_rt) {
+          const auto em = register_file_->Get<rex::graphics::reg::RB_MODECONTROL>().edram_mode;
+          if (em == xenos::EdramMode::kCopy) {
+            BetaFlatResolve();
+          } else if (em != xenos::EdramMode::kNoOperation) {
+            RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);
+          }
+        } else {
+          RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);
+        }
       }
     }
     return true;

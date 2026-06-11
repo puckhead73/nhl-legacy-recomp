@@ -221,6 +221,23 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   void DumpBetaOffscreenTarget(const char* path);  // awaits, maps, writes PNG
   Microsoft::WRL::ComPtr<ID3D12Resource> beta_offscreen_rt_;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> beta_rtv_heap_;
+
+  // High-cut multi-pass FLAT path (NHL_BETA_FLAT, route a). The defect: composites
+  // sample a *resolved render target* texture, which beta's offscreen path reads back
+  // from guest RAM and untiles as a plain texture — wrong layout for a resolved surface,
+  // so the player lands shifted (proven: the composite quad/UV/sampler are perfect).
+  // Fix: on each guest resolve (kCopy), COPY our flat offscreen RT (the just-rendered
+  // pass) into a host texture keyed by the resolve DEST address, then CLEAR the RT for
+  // the next pass; when a later draw samples that dest address, bind THIS host texture
+  // instead of the guest-RAM untile. No EDRAM, no fold, no guest round-trip. The 3D
+  // passes render flat with their native viewport (see the flat branch in
+  // RenderBetaOwnedDraw). Takeover offscreen path only; gated by NHL_BETA_FLAT.
+  struct FlatResolveTex {
+    Microsoft::WRL::ComPtr<ID3D12Resource> tex;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+  };
+  std::map<uint32_t, FlatResolveTex> beta_flat_resolves_;  // resolve dest addr -> host copy
+  void BetaFlatResolve();  // capture the offscreen RT into the resolve dest's host texture
   // D3D12 debug-layer message queue (when NHL_BETA_D3D12_DEBUG); drained to the log
   // to capture the exact validation error.
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> beta_info_queue_;

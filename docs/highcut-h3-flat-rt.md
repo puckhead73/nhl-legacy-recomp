@@ -240,6 +240,29 @@ work (diff beta's untiled texture vs the base for `0x1AF09000`, find the address
 divergence, fix), not a one-line change — and it generalizes to all 3D scenes (gameplay
 included), so it is worth doing as a parity pass rather than per-scene.
 
+## Route (a) BUILT — resolve→host-texture substitution works (fold-untile eliminated)
+
+The high-cut multi-pass flat path (`NHL_BETA_FLAT`, route a) is implemented and the core
+mechanism is validated:
+- **`BetaFlatResolve()`** — on each guest resolve (kCopy), copy our flat offscreen RT (the
+  just-rendered pass) into a host texture keyed by the resolve's **physical** dest address.
+  The dest must come from `draw_util::GetResolveInfo().copy_dest_base` (NOT
+  `RB_COPY_DEST_BASE<<12` — Xenos uses tiled resolve addressing); with that, the captured
+  dests include `0x1AF09000`, exactly the texture the player composite samples.
+- **SRV substitution** (`write_tex_table`) — when a draw samples a captured resolve dest,
+  bind our host texture instead of the guest-RAM untile.
+- **Flat 3D viewport** — 3D passes render with their native viewport into the flat RT.
+
+**Result on scene_02 frame 150:** the **mispositioned far-right/wrapped player is GONE** and
+the UI renders perfectly — the substitution replaced the bad resolved-RTT untile, proving
+the mechanism. **Remaining:** the player's flat render into the scratch comes up empty
+(center-right blank) — its multi-pass render needs work: with depth ON it's depth-culled
+(single depth buffer accumulates across passes → needs per-pass depth); with depth OFF more
+content renders but green-tinted (the known EDRAM green-additive artifact) and the player
+still doesn't resolve. So route (a)'s substitution is done; the **flat multi-pass render of
+the player (per-pass depth + green + the multi-level RTT chain)** is the next layer. Gated
+by `NHL_BETA_FLAT`; default build unchanged.
+
 ## ROOT CAUSE CONFIRMED (in-engine diagnostic, no RenderDoc): the resolved-RTT untile
 
 A new in-engine diagnostic (`NHL_BETA_VTX_DUMP=<draw>`, in `RenderBetaOwnedDraw`) decodes a
