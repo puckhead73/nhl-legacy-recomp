@@ -113,6 +113,39 @@ The readable oracle is in place and proves the fold is **not** in the scene:
    on each PM4 `Resolve`, copy flat-RT → flat resolve-dest texture; composite samples the
    flat textures. Validate the player lands like the oracle (fold absent).
 
+## Build phase — progress (this session)
+
+**Sub-step 1 DONE — fast readable harness.** The beta takeover ran a ~4 s/frame
+device-removal poll on *every* frame, so fast-forwarding a streaming trace to a late
+capture frame took ~12 min (reached only frame 7 in 40 s). Gated it to the capture frame
+(`beta_takeover_rendered_>0 && !beta_capture_done_`); streaming replay now reaches frame
+168 in seconds (commit "make beta streaming replay fast"). With it, replaying scene_02 to
+`NHL_BETA_CAPTURE_FRAME=150` through the EDRAM path renders the **EQUIPMENT screen UI
+correctly** — **but the 3D player model is missing** (right side empty; oracle has the
+Bruins player). This is the precise, fast, readable test for the flat-RTT work.
+
+**Diagnosis of the missing player (EDRAM_DIAG, capture frame = 581 owned draws):**
+
+| draws | surf_pitch | extent | reading |
+|---|---|---|---|
+| 199 | 640 | 640×360 | half-res 3D player passes |
+| **27** | **640** | **1280×720** | **wide-into-narrow fold draws** (1280 content into a 640-pitch surface) |
+| 199 | 1280 | 1280×720 | full-res UI / composite |
+| 61/27/26… | 320/480/800 | … | intermediate RTT surfaces (thumbnails, shadow/reflection) |
+
+Resolves fire and report `ok=true` (player surfaces resolve to guest textures, e.g.
+`surf_pitch=640 -> copy_dest=(640×360)`). So the player **is** drawn and resolved, yet
+never reaches the composite. The gap is the **fold** on the 27 wide draws (the SDK RT
+cache stores 1280-wide into a 640-pitch host RT) **and/or** a resolve→sample address
+mismatch the composite reads from — the closed-SDK EDRAM-sequencing problem.
+
+**Implementation target (next):** intercept the 27 `extent=1280 / pitch=640` wide draws
+(and the player's 640×360 passes) and render them into **our own flat host RTs at the
+logical extent**; honor their `Resolve` as a flat host copy into the texture the composite
+samples (matched by guest address). Validate the player appears like the oracle. This is
+the focused flat-RTT work; it is deep (prior sessions' "green wall" / EDRAM-sequencing
+divergence live here), so it is scoped as its own effort, not a one-shot change.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
