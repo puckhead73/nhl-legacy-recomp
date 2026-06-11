@@ -35,7 +35,10 @@ const bool g_enabled = std::getenv("NHL_D3D9_TAP") != nullptr;
     X(sub_827EB650) X(sub_827EDAB0) X(sub_827EB6E0) X(sub_827E7138)          \
     X(sub_827E57F8) X(sub_827E12B8) X(sub_827F97E0) X(sub_827E8C20)          \
     X(sub_827E5570) X(sub_827E52E0) X(sub_827E4D68) X(sub_827E44D8)          \
-    X(sub_827E39D8) X(sub_827E38B8)
+    X(sub_827E39D8) X(sub_827E38B8)                                          \
+    /* packet-writing VERB candidates (in-lib callers of reserve-space) */   \
+    X(sub_827F1588) X(sub_827F24C8) X(sub_827F2B60) X(sub_827F4488)          \
+    X(sub_827F51B8) X(sub_827F52A8) X(sub_827F8B10)
 
 enum {
 #define X(sym) S_##sym,

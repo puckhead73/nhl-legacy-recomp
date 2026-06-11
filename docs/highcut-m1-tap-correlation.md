@@ -67,6 +67,37 @@ resolve∈{`sub_827E12B8`,`sub_827E7138`}. **To finalize** Clear/Resolve/Draw/Pr
 ~5 candidate bodies (full PPC disasm in `generated/default/nhllegacy_recomp.31.cpp`) for the tell-tale
 register writes (VGT_DRAW_INITIATOR for draw, RB_COPY_CONTROL/kCopy for resolve, color-clear for Clear).
 
+## ⚠️ Key architectural finding: the per-draw path is INLINED (hybrid required)
+
+Tapping the out-of-line packet-writing verb candidates (the in-lib callers of the reserve-space primitive
+`sub_827EC318`: `sub_827F1588/24C8/2B60/4488/51B8/52A8/8B10`) shows them **cold — ~0 calls/frame** during
+gameplay. Cross-checked with:
+- **reserve-space `sub_827EC318` = 1.00/frame** (NOT per-draw — so draws don't call a reserve helper per packet).
+- the **hot per-draw functions are fetch-constant builders** (`sub_827E5938` writes a 24-byte = 6-dword Xenos
+  fetch constant, 137/frame = SetTexture/SetVertexBuffer; `sub_827E2140` 48/frame, similar).
+- **no out-of-line function matches the ~61 draws/frame.**
+
+⇒ **NHL Legacy inlines the per-draw `DrawIndexedPrimitive` packet emission** (the DRAW_INDX is written inline as
+a few dword stores into a bulk-reserved command buffer); only the *resource-binding* helpers (SetTexture/
+SetVertexBuffer fetch-constant builders) and the cold setup verbs are out-of-line.
+
+**This refines (partially walks back) the optimistic Phase-0 read.** The cleanly-hookable out-of-line D3D9
+surface gives us: **resource binding** (SetTexture/SetStreamSource), **present/swap** (`sub_827F1C88`),
+**device/resource creation** (`sub_827E3140`), **refcounting**, and cold-path setup — but **NOT the per-draw
+call**. So a *pure* "hook every D3D9 verb → plume" high cut **cannot cleanly capture draws** for this game.
+
+### Strategic options (decision point)
+1. **Hybrid high cut:** hook the out-of-line surface (resources / render targets / present / device) at the D3D9
+   level — which is enough to **own render-target sizing and kill the EDRAM fold** — but obtain **draws/clear/
+   resolve from the PM4 stream** (the rexglue low cut), since those are inlined. More moving parts than pure-A,
+   but still removes the fold (we control RT allocation at the D3D9 level) and is the realistic shape for NHL.
+2. **Reconsider scope:** if the draw path must stay PM4-level anyway, weigh how much the high cut actually buys
+   vs. fixing the EDRAM modeling in the existing low cut.
+
+This is exactly the kind of ground truth that only the live tap could reveal, and it should gate the next big
+investment (plume routing) — routing *resources+present* through plume is viable; routing *draws* is not, for
+this title, without PM4.
+
 ## Next (M1 cont.)
 
 1. **Finish pinning** the core entries by tapping more candidates and matching exact

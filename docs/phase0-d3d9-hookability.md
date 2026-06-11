@@ -87,9 +87,20 @@ labeling task — best finished with runtime correlation (RenderDoc on the base/
 breakpoints matched against known D3D9 call counts), since they carry no import fingerprint. The statics above
 already give the buckets and the high-value anchors.
 
+## ⚠️ UPDATE (M1 runtime tap): the per-draw path is INLINED — hybrid, not pure-A
+
+The live tap (`docs/highcut-m1-tap-correlation.md`) **partially walks back caveat #3 above.** Runtime
+frequency correlation shows the out-of-line surface is cleanly hookable for **resource binding, present/swap,
+device creation, refcounting, and setup** — but the **per-draw `DrawIndexedPrimitive` packet emission is
+INLINED** (no out-of-line function matches ~61 draws/frame; the hot per-draw functions are fetch-constant
+builders; reserve-space is 1/frame; the out-of-line packet verbs are cold). So a *pure* D3D9-verb high cut
+**cannot capture draws** for NHL Legacy — the realistic shape is a **hybrid** (D3D9 hooks for resources/RTs/
+present + PM4 for draws/clear/resolve). See the M1 doc for the strategic options. This does not change that the
+*hookable surface is real and proven on the live game*; it changes what that surface covers.
+
 ## Decision
 
-**Proceed with Approach A (true D3D9-API hook).** Present, resource creation, ref-counting, and the entire
+**Proceed with Approach A (true D3D9-API hook)** — *as later refined to a hybrid by the M1 tap (above).* Present, resource creation, ref-counting, and the entire
 data-plane (incl. Draw `sub_827EF8E0`) are out-of-line and hookable; the surface is bounded at 181 functions in
 one library TU; all three Phase-0 caveats are addressed. The next concrete step (M1) is to pin the core entry
 points (Present, Clear, CreateDevice, Create{Texture,VertexBuffer,IndexBuffer,RenderTarget}, SetRenderTarget,
