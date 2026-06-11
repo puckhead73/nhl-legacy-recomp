@@ -2233,6 +2233,88 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   if (idx_tex_vs != kUnavail) write_tex_table(vs_texs, tex_table_vs);
   if (idx_samp_vs != kUnavail) write_samp_table(vs_samps, samp_table_vs);
 
+  // NHL_BETA_VTX_DUMP=<draw_index>: ground-truth decode of this draw's vertex
+  // attributes using the REAL per-attribute offsets+formats from the VS vertex
+  // bindings (the generic pos@0 diag reads garbage for 2D composite quads), plus the
+  // bound texture's clamp/wrap address mode. For the player composite (#430) this pins
+  // whether the misplacement is the quad POSITIONS, the UVs, or a WRAP sampler.
+  {
+    static const char* vd_env = std::getenv("NHL_BETA_VTX_DUMP");
+    if (vd_env && beta_takeover_rendered_ == uint32_t(std::strtoul(vd_env, nullptr, 10))) {
+      namespace xe = rex::graphics::xenos;
+      auto fbe = [](const uint8_t* b) {  // big-endian (k8in32) float
+        uint8_t s[4] = {b[3], b[2], b[1], b[0]};
+        float r;
+        std::memcpy(&r, s, 4);
+        return r;
+      };
+      const auto& vbs2 = beta_current_vs_->vertex_bindings();
+      REXLOG_INFO("[nhl-beta] VTXDUMP #{}: {} vertex bindings, host_verts={} (vp x={} w={} | sc {},{},{},{})",
+                  beta_takeover_rendered_, vbs2.size(), result.host_draw_vertex_count,
+                  vp.TopLeftX, vp.Width, scissor.left, scissor.top, scissor.right, scissor.bottom);
+      for (const auto& b : vbs2) {
+        xe::xe_gpu_vertex_fetch_t vf{};
+        vf.dword_0 = regs[0x4800 + b.fetch_constant * 2];
+        vf.dword_1 = regs[0x4800 + b.fetch_constant * 2 + 1];
+        const uint32_t addr = vf.address << 2;
+        const uint8_t* vbase = memory_ ? memory_->TranslatePhysical<const uint8_t*>(addr) : nullptr;
+        const uint32_t stride_b = b.stride_words * 4;
+        REXLOG_INFO("[nhl-beta]   binding fc={} addr=0x{:X} stride={}B attrs={}", b.fetch_constant,
+                    addr, stride_b, b.attributes.size());
+        // half (k_16_16_FLOAT) decode: the guest stores k8in32 big-endian, so within a
+        // 4-byte word the two halves are at [b3,b2] (h0) and [b1,b0] (h1).
+        auto hbe = [](uint16_t h) {
+          uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF, bits;
+          if (e == 0) bits = m ? s | ((127 - 15 + 1) << 23) | (m << 13) : s;  // (approx subnormal)
+          else if (e == 31) bits = s | 0x7F800000u | (m << 13);
+          else bits = s | ((e + 112) << 23) | (m << 13);
+          float r; std::memcpy(&r, &bits, 4); return r;
+        };
+        for (size_t ai = 0; ai < b.attributes.size(); ++ai) {
+          const auto& at = b.attributes[ai].fetch_instr.attributes;
+          const uint32_t off_b = uint32_t(at.offset) * 4;
+          const int nc = xe::GetVertexFormatComponentCount(at.data_format);
+          const bool is_half = (at.data_format == xe::VertexFormat::k_16_16_FLOAT ||
+                                at.data_format == xe::VertexFormat::k_16_16_16_16_FLOAT);
+          for (uint32_t v = 0; v < 4 && vbase; ++v) {
+            const uint8_t* p = vbase + size_t(v) * stride_b + off_b;
+            char buf[200];
+            int n = 0;
+            const int words = (nc + 1) / 2 * (is_half ? 1 : 0) + (is_half ? 0 : nc);
+            if (is_half) {
+              for (int w = 0; w < (nc + 1) / 2; ++w) {
+                const uint8_t* q = p + w * 4;
+                uint16_t h0 = uint16_t((q[3] << 8) | q[2]), h1 = uint16_t((q[1] << 8) | q[0]);
+                n += std::snprintf(buf + n, sizeof(buf) - size_t(n), "%.4f %.4f ", hbe(h0), hbe(h1));
+              }
+            } else {
+              for (int c = 0; c < nc && c < 4; ++c)
+                n += std::snprintf(buf + n, sizeof(buf) - size_t(n), "%.4f ", fbe(p + c * 4));
+            }
+            (void)words;
+            // raw hex of the attribute span for manual decode of any format
+            int hn = 0; char hx[64];
+            for (int bb = 0; bb < nc * (is_half ? 2 : 4) && bb < 16; ++bb)
+              hn += std::snprintf(hx + hn, sizeof(hx) - size_t(hn), "%02X", p[bb]);
+            REXLOG_INFO("[nhl-beta]     attr{} fmt={} off_dw={} comps={} v{}: [{}] raw={}", ai,
+                        uint32_t(at.data_format), at.offset, nc, v, buf, hx);
+          }
+        }
+      }
+      if (eff_ps) {
+        for (const auto& tb : eff_ps->texture_bindings()) {
+          xe::xe_gpu_texture_fetch_t tf{};
+          std::memcpy(&tf, &regs[0x4800 + tb.fetch_constant * 6], 24);
+          REXLOG_INFO("[nhl-beta]   tex fc={} base=0x{:X} {}x{} clamp_x={} clamp_y={} "
+                      "(ClampMode 0=repeat/WRAP,2=clamp_to_edge,6=clamp_to_border)",
+                      tb.fetch_constant, uint32_t(tf.base_address) << 12,
+                      uint32_t(tf.size_2d.width) + 1, uint32_t(tf.size_2d.height) + 1,
+                      uint32_t(tf.clamp_x), uint32_t(tf.clamp_y));
+        }
+      }
+    }
+  }
+
   // Record the draw into the open (ours, in takeover) command list. The view +
   // sampler heaps were already (re)bound by RequestView/SamplerBindfulDescriptors
   // above through the CP's own tracking, so we must NOT call SetDescriptorHeaps with

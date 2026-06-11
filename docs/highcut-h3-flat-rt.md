@@ -240,7 +240,45 @@ work (diff beta's untiled texture vs the base for `0x1AF09000`, find the address
 divergence, fix), not a one-line change — and it generalizes to all 3D scenes (gameplay
 included), so it is worth doing as a parity pass rather than per-scene.
 
-## Where the deep dive stands (log-based debugging exhausted → use the frame debugger)
+## ROOT CAUSE CONFIRMED (in-engine diagnostic, no RenderDoc): the resolved-RTT untile
+
+A new in-engine diagnostic (`NHL_BETA_VTX_DUMP=<draw>`, in `RenderBetaOwnedDraw`) decodes a
+draw's vertex attributes with their **real** per-attribute offsets+formats (the generic
+`pos@0` diag read garbage) plus the bound texture's clamp mode. For draw #430 (player
+composite) it shows the blit is **provably perfect**:
+
+| vertex | position (px) | UV |
+|---|---|---|
+| v0 | (0, 0)     | (0, 0) |
+| v1 | (0, 720)   | (0, 1) |
+| v2 | (1280,720) | (1, 1) |
+| v3 | (1280, 0)  | (1, 0) |
+
+…a full-screen quad, **UV [0,1]×[0,1] exactly**, **CLAMP** sampler (`clamp_x/y=2`, not wrap),
+sampling `0x1AF09000`. A full-screen quad + [0,1] UVs + clamp reproduces the texture
+**verbatim** — so the player rendering shifted+wrapped means **beta's reconstruction of the
+texture `0x1AF09000` is itself shifted.** It is **not** the geometry, the UVs, or the
+sampler.
+
+**Root cause:** the texture is a **resolved render target**. The base path renders it
+correctly because it keeps/binds the resolved *host* texture (no guest round-trip). Beta's
+flat/offscreen path has no resolve, so it reads the resolved surface back from **guest RAM
+and untiles it as a plain texture** — but a resolved surface's guest-RAM layout does not
+match a plain-texture untile per its fetch constant, so it comes out shifted.
+
+**Fix (two routes, both high-cut-aligned):**
+- (a) **Multi-pass flat:** render the player pass into a flat host RT, resolve it (host copy)
+  to a host texture, and bind THAT for the composite — no guest-RAM untile. This is the
+  flat multi-pass path; it makes the composite correct because it samples a real host RT.
+- (b) **Fix the resolved-surface untile:** reconstruct the resolved tiling correctly when
+  reading `0x1AF09000` from guest RAM (match how the resolve stored it, not the plain
+  texture untile). Narrower, but tricky.
+
+Route (a) is the cleaner high-cut answer and generalizes to all 3D (gameplay). Both are
+real renderer work, but the unknown is now **gone** — it's the resolved-RTT texture, full
+stop, proven by the in-engine vertex/UV/sampler decode.
+
+## (superseded) Earlier note: log-based debugging exhausted → use the frame debugger
 
 The misplacement is fully isolated to draw **#430** (player composite): correct full-frame
 viewport, samples a correct 1280×720 player RTT texture (`0x1AF09000`), yet renders the
