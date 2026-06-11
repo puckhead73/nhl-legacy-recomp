@@ -1013,6 +1013,12 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
   }
   const uint32_t dest = ri.copy_dest_base;
   if (!dest) return;
+  // NHL_BETA_FLAT_KEEPFIRST: a dest can be resolved multiple times per frame; if a later
+  // resolve's scratch is empty it would overwrite a good earlier capture. Keep the first.
+  if (std::getenv("NHL_BETA_FLAT_KEEPFIRST")) {
+    auto exist = beta_flat_resolves_.find(dest);
+    if (exist != beta_flat_resolves_.end() && exist->second.tex) return;
+  }
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   auto& fr = beta_flat_resolves_[dest];
   if (!fr.tex) {
@@ -1065,6 +1071,15 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
     const float clear0[4] = {0, 0, 0, 0};
     dcl.D3DClearRenderTargetView(beta_rtv_heap_->GetCPUDescriptorHandleForHeapStart(), clear0, 0,
                                  nullptr);
+  }
+  // Per-pass depth: clear the depth target at each pass boundary (resolve) so the next
+  // pass's z-test starts from the far plane. The single depth target otherwise accumulates
+  // across passes, so later passes (e.g. the player) fail LESS/LEQUAL and get culled. We do
+  // NOT clear color here (the final composite renders into the scratch and is what we dump).
+  if (beta_depth_enabled_ && beta_depth_ready_ && beta_dsv_heap_) {
+    dcl.D3DClearDepthStencilView(beta_dsv_heap_->GetCPUDescriptorHandleForHeapStart(),
+                                 D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                 beta_depth_clear_, 0, 0, nullptr);
   }
   if (std::getenv("NHL_BETA_FLAT_DIAG"))
     REXLOG_INFO("[nhl-beta] flat-resolve #{}: offscreen RT -> host tex copy_dest_base=0x{:X} "
@@ -2134,12 +2149,20 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         const uint32_t fbase = uint32_t(ftf.base_address) << 12;
         auto fit = beta_flat_resolves_.find(fbase);
         if (fit != beta_flat_resolves_.end() && fit->second.tex) {
+          ID3D12Resource* srvtex = fit->second.tex.Get();
+          // NHL_BETA_FLAT_FAKE: bind a solid-red texture instead of the captured one, to
+          // isolate WHERE the composite places this resolved texture (does it sample it at
+          // all / full-screen?) vs whether the captured content is empty.
+          if (std::getenv("NHL_BETA_FLAT_FAKE")) {
+            EnsureBetaFakeTexture();
+            if (beta_fake_tex_ready_) srvtex = beta_fake_tex_.Get();
+          }
           D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
           sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
           sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
           sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
           sd.Texture2D.MipLevels = 1;
-          GetD3D12Provider().GetDevice()->CreateShaderResourceView(fit->second.tex.Get(), &sd, h);
+          GetD3D12Provider().GetDevice()->CreateShaderResourceView(srvtex, &sd, h);
           continue;
         }
       }

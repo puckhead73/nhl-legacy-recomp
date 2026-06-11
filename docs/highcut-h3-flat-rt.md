@@ -263,6 +263,38 @@ still doesn't resolve. So route (a)'s substitution is done; the **flat multi-pas
 the player (per-pass depth + green + the multi-level RTT chain)** is the next layer. Gated
 by `NHL_BETA_FLAT`; default build unchanged.
 
+**Per-pass depth (added):** `BetaFlatResolve` now clears the depth target at each resolve
+(pass boundary) so each pass z-tests from the far plane (the single depth target otherwise
+accumulates and culls later passes; color is NOT cleared — the composite scratch is what we
+dump). Result: the green tint is gone and the UI stays perfect — but **the player is still
+missing**, so it is not (only) depth. Key clue from `NHL_BETA_FLAT_DIAG`: **`0x1AF09000` is
+resolved TWICE (resolves #13 and #16)**, so the capture is overwritten by the 2nd resolve,
+whose scratch may not hold the player; the player is built through a **multi-level RTT
+chain** (its geometry → intermediate resolves → composited into `0x1AF09000`). Next focused
+step: dump the captured `0x1AF09000` host texture (and the intermediates) to see at which
+chain level the player content is lost (double-resolve overwrite vs an empty geometry pass),
+then fix that level (keep both resolves, or accumulate rather than overwrite).
+
+**Localized further (decisive):**
+- `NHL_BETA_FLAT_FAKE` (substitute solid RED for the resolved texture) turns the **whole
+  background red** → the substitution fires and the player composite is a **full-screen quad**
+  sampling `0x1AF09000`. So substitution + composite are correct; the captured texture is
+  just **empty**.
+- `NHL_BETA_FLAT_KEEPFIRST` (don't overwrite a dest on its 2nd resolve) → **still no player**,
+  so BOTH captures of `0x1AF09000` are empty — not a double-resolve overwrite.
+- ⇒ The player's actual **3D geometry doesn't render into ANY captured scratch.** Beta
+  renders the player's geometry to nothing (even though the player exists in the trace's
+  guest RAM — that's why the *old* untile path showed it, mispositioned). So the residual is
+  **beta's 3D-geometry rendering parity** (the player's VS/PS reconstruction, vertex/texture/
+  constant bindings for the 3D draws producing visible output) — the deep Tier-1 core, a
+  **separate, larger problem from the fold**, which route (a) has already solved.
+
+**Bottom line:** route (a) (the high-cut flat resolve→host-texture substitution) is built,
+gated (`NHL_BETA_FLAT`), and **eliminates the fold-untile** (the mispositioned player is gone;
+the UI is perfect). Making the player *appear* now depends on beta rendering 3D geometry
+faithfully — Tier-1 3D parity — not on the fold. Diagnostic toggles: `NHL_BETA_FLAT_FAKE`,
+`NHL_BETA_FLAT_KEEPFIRST`, `NHL_BETA_FLAT_CLEAR`, `NHL_BETA_FLAT_DIAG`.
+
 ## ROOT CAUSE CONFIRMED (in-engine diagnostic, no RenderDoc): the resolved-RTT untile
 
 A new in-engine diagnostic (`NHL_BETA_VTX_DUMP=<draw>`, in `RenderBetaOwnedDraw`) decodes a
