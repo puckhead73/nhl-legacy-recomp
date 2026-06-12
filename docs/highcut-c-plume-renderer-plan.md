@@ -226,9 +226,19 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   texture-binding count. In live mode it found **textured draws** — e.g. draw#22/#26/#30 have
   `vfetch_bindings=1` + `ps_tex=1` (a real textured menu element; VS 8528 B). That is the C-4 render
   target (select via `NHL_HIGHCUT_XLAT_DRAW`).
-  - **C-4 IMPLEMENTED (2026-06-12) — build-clean, runtime-verify pending.** The full textured path
-    is coded + compiles (`_build_beta.bat` → BUILD_EXIT=0); what remains is a LIVE run that reaches a
-    textured menu draw to produce the v2 packet + visually confirm the sample. What was built:
+  - **C-4 DONE (2026-06-12, verified live).** A real textured menu draw (live draw#22: 6-vert quad,
+    512×256 DXT1 tiled k8in16, ortho-via-perspective transform from VS float constants) renders on
+    plume with its guest texture sampled: **45,269 fragments** (matches the analytically predicted
+    visible-quad area ~44.7k within 1%), **0 validation errors**, the textured element visible in
+    the plume window (bottom-right, same placement as in-game). The render is a STATIC single-draw
+    replay by design (the disk packet holds one captured draw); live full-frame is C-5.
+    **Post-bring-up fixes that were needed (commit a9f2e4a):** (1) the packet's SystemConstants
+    lacked the PA_CL_VTE_CNTL flags — the VS epilogue computes `w' = WNotReciprocal ? w : 1/w` and a
+    projective draw (clip-w≈111k) without the flag got xy MULTIPLIED by w at the host divide → 0
+    fragments, validation-clean (diagnosed by parsing the packet + spirv-dis of the epilogue);
+    (2) the C-3 solid+counter pass needed set1 bindings 1/2 (VS/PS float constants) — this VS takes
+    its whole transform from float constants; (3) D3D→Vulkan y-flip baked into packet
+    ndc_scale/offset[1] (plume passes viewports verbatim). What was built:
     - **PS translation (CP side, `nhl_command_processor.cpp` survey block).** For the selected draw,
       the VS AND PS are re-translated with the SHARED interpolator mask (`vs_writes & ps_reads`, set
       on `SpirvShaderTranslator::Modification.{vertex,pixel}.interpolator_mask`; PS also gets
@@ -256,10 +266,11 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     - **Verify recipe.** Dump (live, reach a textured menu draw):
       `NHL_BACKEND=beta NHL_BETA_TAKEOVER=1 NHL_BETA_LIVE=1 NHL_HIGHCUT_XLAT_TEST=1 NHL_HIGHCUT_XLAT_DRAW=22`
       → writes `highcut_p3_{vs,ps}.spv` + `highcut_p3_draw.bin`. Render:
-      `NHL_HIGHCUT_PRESENT=1 NHL_HIGHCUT_C3=full` (add the validation layer env). Done = textured menu
-      element visible in the plume window + 0 VUID. **Open risks** (no test feedback yet): 8888
-      channel order (R8G8B8A8 vs swap to BGRA) + the fetch-constant swizzle are unapplied; DXT endian
-      is best-effort; param-gen interpolator pairing; the empty set2 layout slot. Then C-5, C-6.
+      `NHL_HIGHCUT_PRESENT=1 NHL_HIGHCUT_C3=full` (add the validation layer env); helper scripts
+      `_c4dump.ps1` / `_c4render.ps1`. VERIFIED: textured element visible + 0 VUID + counter 45,269.
+      **Residual (deferred to C-5):** the guest fetch-constant swizzle is unapplied (identity view) and
+      DXT endian is best-effort — revisit if a texture's colors look wrong; 8888 channel order
+      untested (this draw was DXT1). Then C-5 (full frame), C-6 (takeover).
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
