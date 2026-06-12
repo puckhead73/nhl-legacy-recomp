@@ -28,8 +28,15 @@ namespace nhl::highcut {
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
 constexpr uint32_t kDrawPacketVersion = 3;          // C-5a: inline VS SPIR-V + viewport + blend
 
-// Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert strip).
-enum DrawTopology : uint32_t { kTopoTriangleList = 0, kTopoTriangleStrip = 1 };
+// Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
+// strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
+// side expands it with an index buffer ({0,1,2,0,2,3} per 4-vert quad) and a TRIANGLE_LIST pipeline;
+// vertex_count carries the GUEST quad-vertex count (4 * #quads).
+enum DrawTopology : uint32_t {
+    kTopoTriangleList = 0,
+    kTopoTriangleStrip = 1,
+    kTopoTriangleListQuadExpand = 2,  // index-expanded quad list (vertex_count = guest 4*#quads)
+};
 
 // Plume-neutral texel format the untiled blob is in (the CP side mustn't depend on plume's
 // RenderFormat enum; the plume thread maps these to the matching RenderFormat).

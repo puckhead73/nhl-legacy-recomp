@@ -2075,6 +2075,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     if (result.guest_primitive_type == xenos::PrimitiveType::kRectangleList) {
       hdr.topology = nhl::highcut::kTopoTriangleStrip;
       hdr.vertex_count = (index_count / 3) * 4;  // 4 strip verts per guest rect (single rect -> 4)
+    } else if (result.guest_primitive_type == xenos::PrimitiveType::kQuadList) {
+      // C-5a.1: menu text/glyphs. No quad host-shader type in the translator, so the plume side
+      // index-expands (4-vert quads -> 2 tris) and draws TRIANGLE_LIST; carry the guest vert count.
+      hdr.topology = nhl::highcut::kTopoTriangleListQuadExpand;
+      hdr.vertex_count = index_count;  // guest quad-vert count (4 * #quads)
     } else {
       hdr.topology = nhl::highcut::kTopoTriangleList;
       hdr.vertex_count = index_count;

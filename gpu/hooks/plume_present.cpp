@@ -101,7 +101,9 @@ struct RenderableDraw {
     std::unique_ptr<RenderPipelineLayout> layout;
     std::unique_ptr<RenderDescriptorSet> set0, set1, set3;
     std::unique_ptr<RenderPipeline> pipeline;
+    std::unique_ptr<RenderBuffer> indexBuf;  // C-5a.1: quad-list expansion ({0,1,2,0,2,3}/quad)
     uint32_t vertexCount = 0;
+    uint32_t indexCount = 0;  // >0 => drawIndexedInstanced (quad expand); else drawInstanced
     bool textured = false;  // has set3 (textures+samplers) bound
 };
 
@@ -670,6 +672,23 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     blend.renderTargetWriteMask = uint8_t(hdr.color_write_mask & 0xF);
     auto topo = (hdr.topology == hc::kTopoTriangleStrip) ? RenderPrimitiveTopology::TRIANGLE_STRIP
                                                          : RenderPrimitiveTopology::TRIANGLE_LIST;
+    // C-5a.1: quad-list (menu text) -> a TRIANGLE_LIST index buffer, {0,1,2,0,2,3} per 4-vert quad.
+    if (hdr.topology == hc::kTopoTriangleListQuadExpand) {
+        const uint32_t quads = hdr.vertex_count / 4;
+        std::vector<uint32_t> idx;
+        idx.reserve(size_t(quads) * 6);
+        for (uint32_t q = 0; q < quads; ++q) {
+            const uint32_t b = q * 4;
+            idx.push_back(b + 0); idx.push_back(b + 1); idx.push_back(b + 2);
+            idx.push_back(b + 0); idx.push_back(b + 2); idx.push_back(b + 3);
+        }
+        if (!idx.empty()) {
+            const uint64_t bytes = idx.size() * sizeof(uint32_t);
+            d.indexBuf = c.device->createBuffer(RenderBufferDesc::IndexBuffer(bytes, RenderHeapType::UPLOAD));
+            if (d.indexBuf) { void* p = d.indexBuf->map(); std::memcpy(p, idx.data(), bytes); d.indexBuf->unmap(); }
+            if (d.indexBuf) d.indexCount = uint32_t(idx.size());
+        }
+    }
     RenderGraphicsPipelineDesc pd;
     pd.pipelineLayout = d.layout.get();
     pd.vertexShader = d.vs.get();
@@ -965,7 +984,14 @@ void RenderClear(PlumeCtx& c) {
             c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);
             c.cmd->setGraphicsDescriptorSet(d.set1.get(), 1);
             if (d.textured) c.cmd->setGraphicsDescriptorSet(d.set3.get(), 3);
-            c.cmd->drawInstanced(d.vertexCount, 1, 0, 0);
+            if (d.indexCount > 0) {  // C-5a.1: quad-list expansion
+                RenderIndexBufferView iv(d.indexBuf.get(), d.indexCount * uint32_t(sizeof(uint32_t)),
+                                         RenderFormat::R32_UINT);
+                c.cmd->setIndexBuffer(&iv);
+                c.cmd->drawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
+            } else {
+                c.cmd->drawInstanced(d.vertexCount, 1, 0, 0);
+            }
         }
     }
 

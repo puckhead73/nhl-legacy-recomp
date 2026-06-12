@@ -275,12 +275,20 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
   Resolve = host copy. Validate menu, then a 3D scene (the fold is structurally absent → no shear).
-  - **C-5a IMPLEMENTED (2026-06-12, build-clean, runtime-verify pending) — multi-draw, single flat
-    RT.** Disk-replay (chosen over the live co-run): capture EVERY owned draw of a menu frame, replay
-    them all into one flat RT (the swapchain) with per-draw blend. Scope: proves N-draw composition;
-    per-surface RTs + Resolve=host-copy is C-5b. Expected PARTIAL result (draws targeting intermediate
-    guest surfaces land on the back buffer; resolve-sourced content only if the beta takeover already
-    wrote it to guest RAM). Built:
+  - **C-5a DONE (2026-06-12, verified live) — multi-draw, single flat RT.** Disk-replay (chosen over
+    the live co-run): capture EVERY owned draw of a menu frame, replay all into one flat RT with
+    per-draw blend. **VERIFIED: 136/136 draws built, 0 skipped, 0 VUID, and the plume window shows a
+    recognizable NHL Legacy main menu** (Stanley Cup, EA/NHL logos, team crest, shield, arena bg) —
+    far beyond the "partial composite" bar. Per-draw alpha blend (`src6/dst7`=SrcAlpha/InvSrcAlpha)
+    + the vte/y-flip fixes carried over (`flags=0x70C00`, `ndc=(1,-1)`). Primitive mix in the frame:
+    1523 kTriangleList + 42 kRectangleList render correct; **312 kQuadList = the menu text**, fixed
+    by **C-5a.1** below; 98 kLineList (thin dividers) still render as degenerate tris (minor, TODO).
+    - **C-5a.1 kQuadList text (build-clean, re-verify pending):** the translator has no quad host-
+      shader type, so the plume side index-expands quad lists ({0,1,2,0,2,3} per 4-vert quad) into a
+      TRIANGLE_LIST `drawIndexedInstanced`. Capture tags `kQuadList` draws `kTopoTriangleListQuadExpand`
+      with `vertex_count` = guest quad-vert count; plume builds the index buffer + draws indexed.
+      (Diagonal choice is visually irrelevant — cull=NONE + planar textured quad.)
+    Built:
     - **Packet → v3** (`highcut_draw_packet.h`): adds INLINE VS SPIR-V per draw (each frame draw has
       its own VS), per-draw viewport, and per-draw blend (decoded from `RB_BLENDCONTROL0` into
       `PacketBlendFactor`/`PacketBlendOp` = the xenos enum values, so the plume side maps without
