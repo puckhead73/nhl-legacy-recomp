@@ -141,10 +141,34 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   (no Vulkan SDK), so this is driver-acceptance, not full validation-layer spirv-val.
   The remaining "render a triangle" part (pipeline + draw) needs the VS's descriptor/binding
   environment (system-constants UBO, shared-memory SSBO for vertex fetch) → that is **C-3**.
-- **C-3 — one real decoded guest draw.** Bridge from the CP decode: take a 2D menu draw's
+- **C-3 — one real decoded guest draw. IN PROGRESS (C-3a scaffolding built; pipeline create
+  BLOCKED on a driver crash).** Bridge from the CP decode: take a 2D menu draw's
   vertex/index/constants/viewport (the data the beta CP already decodes in `RenderBetaOwnedDraw`),
   upload to plume, build a pipeline from its translated SPIR-V, draw it flat. Solid-color first
   (defer textures). *Done = a recognizable menu element rendered by plume.*
+  - **VS resource interface (reflected from the SPIR-V):** set0/binding0 = `xe_shared_memory`
+    (StorageBuffer, vertex fetch); set1/bindings 0,3,4 = system / bool-loop / fetch constants
+    (UBOs); input `gl_VertexIndex`; output `gl_Position`. NO IA vertex input (fetch is via SSBO),
+    no float-constant or texture bindings for this simple VS.
+  - **C-3a built (gated `NHL_HIGHCUT_C3`):** solid-color PS (`gpu/hooks/shaders/solid.hlsl`,
+    zero-input) + a reflection-driven descriptor/pipeline layout (set0 byte-address buffer; set1
+    CBV@0,3,4) + `createGraphicsPipeline`, in `plume_present.cpp`. Layout + PS + VS module all
+    create fine.
+  - **Float-controls portability fix:** P-3 now translates with `signed_zero_inf_nan_preserve` /
+    `denorm_flush_to_zero` / `rounding_mode_rte` **disabled** (`Features(true)` had enabled them).
+    plume's device doesn't enable `VK_KHR_shader_float_controls`, and those execution modes made
+    the driver crash. The VS SPIR-V is now vanilla (capabilities = `[Shader]` only, 6144 bytes).
+  - **BLOCKER:** `vkCreateGraphicsPipelines` still **crashes the driver** (no `VkResult` error, no
+    stderr) compiling the translated VS — with BOTH the correct full layout and an empty layout.
+    The module itself is accepted by `vkCreateShaderModule` (C-2) and is structurally well-formed.
+    Diagnosing needs validation output, which is currently unreachable: no `spirv-val`/Vulkan SDK;
+    Steam bundles `VkLayer_khronos_validation.dll` but plume creates no `VkDebugUtilsMessenger`, so
+    the layer's messages go to `OutputDebugString` (uncaptured), not stderr. **Next: add a debug
+    messenger to plume's Vulkan device (reproducible patch) to route validation -> REXLOG, OR
+    install the Vulkan SDK** — then the exact pipeline-creation error is visible and fixable.
+  - C-3b (after the pipeline creates): populate the descriptor buffers from the beta CP's decoded
+    data (system constants NDC transform, fetch-constant vfetch descriptor, shared-memory SSBO
+    vertex bytes) and `drawInstanced` — the actual rendered geometry.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

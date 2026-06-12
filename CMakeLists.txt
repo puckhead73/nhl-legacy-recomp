@@ -88,6 +88,9 @@ plume_compile_vertex_shader(nhllegacy
     "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleVert VSMain)
 plume_compile_pixel_shader(nhllegacy
     "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleFrag PSMain)
+# C-3a: zero-input solid-color PS to pair with a translated Xenos VS for pipeline creation.
+plume_compile_pixel_shader(nhllegacy
+    "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/solid.hlsl" solidFrag PSMain)
 
 # High-cut path C (P-1): vendor glslang for the Xenos->SPIR-V translator PORT. The SDK's
 # spirv_builder.h / spirv_translator.h ARE Xenia's (they extend glslang's spv::Builder) but the

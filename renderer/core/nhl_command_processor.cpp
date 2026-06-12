@@ -1560,6 +1560,13 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     const uint32_t p3_num_reg = register_file_->Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg;
     const uint32_t p3_reg_count = p3_vs.GetDynamicAddressableRegisterCount(p3_num_reg);
     rg::SpirvShaderTranslator::Features p3_features(/*all=*/true);
+    // C-3: plume's Vulkan device does not enable VK_KHR_shader_float_controls; the driver
+    // crashes in vkCreateGraphicsPipelines compiling a shader that declares the denorm/rounding/
+    // NaN-preserve execution modes. Disable those float-controls for now (a bring-up accuracy
+    // simplification — re-enable once the plume device advertises float-controls support).
+    p3_features.signed_zero_inf_nan_preserve_float32 = false;
+    p3_features.denorm_flush_to_zero_float32 = false;
+    p3_features.rounding_mode_rte_float32 = false;
     rg::SpirvShaderTranslator p3_xlat(p3_features, /*native_2x_msaa_with_attachments=*/false,
                                       /*native_2x_msaa_no_attachments=*/false,
                                       /*edram_fragment_shader_interlock=*/false);

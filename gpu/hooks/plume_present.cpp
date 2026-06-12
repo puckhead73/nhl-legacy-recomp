@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "plume_render_interface.h"
+#include "plume_render_interface_builders.h"  // C-3a: descriptor-set / pipeline-layout builders
 
 // High-cut C-1: embedded bring-up triangle shaders (compiled by plume's shader cmake into
 // ${CMAKE_BINARY_DIR}/shaders, which is on the include path). SPIRV for the Vulkan backend
@@ -55,6 +56,8 @@
 #include "shaders/triangleFrag.hlsl.spirv.h"
 #include "shaders/triangleVert.hlsl.dxil.h"
 #include "shaders/triangleFrag.hlsl.dxil.h"
+// C-3a: zero-input solid-color PS to pair with the translated Xenos VS for pipeline creation.
+#include "shaders/solidFrag.hlsl.spirv.h"
 
 namespace plume {
 std::unique_ptr<RenderInterface> CreateD3D12Interface();
@@ -105,6 +108,11 @@ struct PlumeCtx {
     // C-2: shader module created from a translated Xenos VS (the shader bridge), once.
     std::unique_ptr<RenderShader> xlatVS;
     bool xlatDone = false;
+    // C-3a: a real graphics pipeline built from the translated VS + solid PS + the VS's
+    // reflected descriptor layout (set0: shared-memory SSBO; set1: system/bool/fetch UBOs).
+    std::unique_ptr<RenderShader> xlatPS;
+    std::unique_ptr<RenderPipelineLayout> xlatLayout;
+    std::unique_ptr<RenderPipeline> xlatPipeline;
     uint64_t frame = 0;
 };
 
@@ -286,6 +294,62 @@ void RenderClear(PlumeCtx& c) {
                 REXLOG_INFO("[highcut-C2] translated Xenos VS -> plume shader module: {} "
                             "({} bytes, magic=0x{:08X}). Any vkCreateShaderModule error would be on stderr.",
                             c.xlatVS ? "module object created" : "null", uint32_t(spv.size()), magic);
+
+                // C-3a: build a real graphics pipeline from the translated VS + a solid-color PS,
+                // with a pipeline layout matching the VS's reflected descriptor interface:
+                //   set 0 -> binding 0: xe_shared_memory (StorageBuffer / byte-address buffer)
+                //   set 1 -> bindings 0,3,4: system / bool-loop / fetch constants (UBOs)
+                // Vulkan validates the layout, the float-controls capabilities, and VS<->PS stage
+                // linking at pipeline creation — so success proves the translated shader is fully
+                // pipeline-compilable on a real device (C-3b then binds decoded data + draws).
+                // C-3a: build a graphics pipeline from the translated VS + solid PS. GATED by
+                // NHL_HIGHCUT_C3 (the driver can crash compiling the pipeline, so keep it off the
+                // stable C-2/present path). Value selects the pipeline layout for isolation:
+                //   "empty" -> no descriptor sets (tests whether the SPIR-V compile alone crashes)
+                //   else    -> the real layout (set0:SSBO@0, set1:CBV@0,3,4) matching the VS.
+                const char* c3gate = std::getenv("NHL_HIGHCUT_C3");
+                if (c.xlatVS && c3gate) {
+                    const bool emptyLayout = std::strcmp(c3gate, "empty") == 0;
+                    c.xlatPS = c.device->createShader(solidFragBlobSPIRV, sizeof(solidFragBlobSPIRV), "PSMain", fmt);
+                    REXLOG_INFO("[highcut-C3a] step: solid PS module {} (layout mode='{}')",
+                                c.xlatPS ? "ok" : "null", emptyLayout ? "empty" : "full");
+
+                    RenderDescriptorSetBuilder set0, set1;
+                    RenderPipelineLayoutBuilder lb;
+                    lb.begin(/*isLocal=*/false, /*allowInputLayout=*/false);
+                    if (!emptyLayout) {
+                        set0.begin(); set0.addByteAddressBuffer(0); set0.end();           // shared memory
+                        set1.begin();                                                     // constants (gaps 1,2)
+                        set1.addConstantBuffer(0); set1.addConstantBuffer(3); set1.addConstantBuffer(4);
+                        set1.end();
+                        lb.addDescriptorSet(set0);  // -> set 0
+                        lb.addDescriptorSet(set1);  // -> set 1
+                    }
+                    lb.end();
+                    c.xlatLayout = lb.create(c.device.get());
+                    REXLOG_INFO("[highcut-C3a] step: pipeline layout {}", c.xlatLayout ? "ok" : "null");
+
+                    if (c.xlatLayout && c.xlatPS) {
+                        REXLOG_INFO("[highcut-C3a] step: creating graphics pipeline...");
+                        // The Xenos VS fetches vertices from the SSBO via gl_VertexIndex — NO IA
+                        // vertex input, so the pipeline has no input slots/elements.
+                        RenderGraphicsPipelineDesc pd;
+                        pd.pipelineLayout = c.xlatLayout.get();
+                        pd.vertexShader = c.xlatVS.get();
+                        pd.pixelShader = c.xlatPS.get();
+                        pd.renderTargetFormat[0] = kSwapFormat;
+                        pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
+                        pd.renderTargetCount = 1;
+                        pd.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+                        c.xlatPipeline = c.device->createGraphicsPipeline(pd);
+                        REXLOG_INFO("[highcut-C3a] graphics pipeline (layout={}): {} "
+                                    "— any pipeline/driver error is on stderr.",
+                                    emptyLayout ? "empty" : "set0=SSBO@0,set1=CBV@0,3,4",
+                                    c.xlatPipeline ? "CREATED" : "FAILED (null)");
+                    } else {
+                        REXLOG_ERROR("[highcut-C3a] pipeline layout or solid PS creation failed");
+                    }
+                }
             } else {
                 REXLOG_INFO("[highcut-C2] translated VS available but plume backend is not SPIRV "
                             "(fmt={}) — skipping (d3d12 cannot consume SPIR-V)", int(fmt));
