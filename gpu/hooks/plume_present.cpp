@@ -999,7 +999,13 @@ void RenderClear(PlumeCtx& c) {
     // each draw positions its geometry via its own ndc (baked into its SystemConstants). Per-surface
     // RTs + Resolve=host-copy (correct render-to-texture composition) is C-5b.
     if (c5_mode && !c.c5draws.empty()) {
+        // Bisection: replay only draws [MINDRAW, MAXDRAW) to isolate an artifact to a draw index.
+        static const uint32_t c5_min = []() { const char* s = std::getenv("NHL_HIGHCUT_C5_MINDRAW"); return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 0u; }();
+        static const uint32_t c5_max = []() { const char* s = std::getenv("NHL_HIGHCUT_C5_MAXDRAW"); return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 0xFFFFFFFFu; }();
+        uint32_t di = 0;
         for (auto& d : c.c5draws) {
+            const uint32_t this_i = di++;
+            if (this_i < c5_min || this_i >= c5_max) continue;
             c.cmd->setGraphicsPipelineLayout(d.layout.get());
             c.cmd->setPipeline(d.pipeline.get());
             c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);
