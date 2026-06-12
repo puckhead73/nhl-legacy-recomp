@@ -275,6 +275,33 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
   Resolve = host copy. Validate menu, then a 3D scene (the fold is structurally absent → no shear).
+  - **C-5a IMPLEMENTED (2026-06-12, build-clean, runtime-verify pending) — multi-draw, single flat
+    RT.** Disk-replay (chosen over the live co-run): capture EVERY owned draw of a menu frame, replay
+    them all into one flat RT (the swapchain) with per-draw blend. Scope: proves N-draw composition;
+    per-surface RTs + Resolve=host-copy is C-5b. Expected PARTIAL result (draws targeting intermediate
+    guest surfaces land on the back buffer; resolve-sourced content only if the beta takeover already
+    wrote it to guest RAM). Built:
+    - **Packet → v3** (`highcut_draw_packet.h`): adds INLINE VS SPIR-V per draw (each frame draw has
+      its own VS), per-draw viewport, and per-draw blend (decoded from `RB_BLENDCONTROL0` into
+      `PacketBlendFactor`/`PacketBlendOp` = the xenos enum values, so the plume side maps without
+      guessing). + `color_write_mask`.
+    - **Capture** (`nhl_command_processor.cpp`, gate `NHL_HIGHCUT_FRAME_CAPTURE`): the C-4 survey/
+      packet machinery now runs the masked VS+PS translate + untile + packet dump for EVERY
+      interesting owned draw (not just the selected one) → `highcut_frame_<N>.bin` (dense per-frame
+      index `highcut_capture_idx_`, reset in `IssueSwap`); the per-frame draw count → `highcut_frame
+      .count`. Overwrites each frame, so the last static-menu frame before exit is the captured one.
+    - **Replay** (`plume_present.cpp`, gate `NHL_HIGHCUT_C5`): `RenderableDraw` (a fully self-
+      contained per-draw resource bundle) + `BuildRenderableDraw` (VS+PS modules, own constant/
+      shared/float buffers, textures+sampler, superset layout sets 0/1/[2-empty/3], pipeline with the
+      packet's blend+topology) + `LoadC5Frames` (loads count→`highcut_frame_0..N-1.bin`). `RenderClear`
+      replays the vector in order after the clear; the C-1 triangle is suppressed in C-5 mode.
+    - **Scripts** `_c5dump.ps1` (capture: beta-live + F10 at a menu) / `_c5render.ps1`
+      (`NHL_HIGHCUT_PRESENT=1 NHL_HIGHCUT_C5=1` + validation). Done = several real draws blend
+      correctly into one flat RT (a partial menu), 0 VUID. Risks: blend-factor coverage (default
+      Copy), intermediate-surface draws (C-5b), capture cost (one-shot N translate+untile).
+  - **C-5b (next):** per-surface flat plume RTs (each guest color/depth surface → its own RT at
+    logical size) + guest Resolve = host copy → plume-texture keyed by dest address; correct
+    render-to-texture composition. **C-5c:** depth + a 3D scene.
 - **C-6 — takeover.** Suppress rexglue's present/GPU where possible so plume is the only output;
   optionally switch plume to D3D12 once rexglue's device is off.
 

@@ -136,6 +136,11 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   uint32_t beta_takeover_rendered_ = 0;
   uint32_t beta_takeover_skipped_textured_ = 0;
   uint32_t beta_takeover_draw_seen_ = 0;  // total takeover draws seen (for NHL_BETA_MAX_DRAW)
+  // High-cut C-5a frame capture (NHL_HIGHCUT_FRAME_CAPTURE): dense per-frame index of the owned
+  // draws dumped to highcut_frame_<N>.bin this frame; reset each frame in IssueSwap, and the final
+  // count written to highcut_frame.count so the plume replay knows how many to load. Overwrites
+  // every frame, so the last (static-menu) frame before exit is the captured one.
+  uint32_t highcut_capture_idx_ = 0;
   bool beta_ucode_dumped_ = false;        // dump textured VS/PS ucode disasm once
   void FinalizeBetaTakeoverCapture();
   // Live continuous rendering (NHL_BETA_LIVE): present our offscreen RT to the window

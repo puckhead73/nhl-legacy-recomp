@@ -1,26 +1,24 @@
-// High-cut path C: a self-describing binary packet that carries one decoded guest draw's
-// data from the beta CommandProcessor thread (RenderBetaOwnedDraw) to the plume Vulkan thread,
-// so the translated Xenos VS (+ PS, from C-4) can fetch + transform real vertices, sample the
-// real guest texture, and render the draw.
+// High-cut path C: a self-describing binary packet that carries one decoded guest draw's data from
+// the beta CommandProcessor thread (RenderBetaOwnedDraw) to the plume Vulkan thread, so the
+// translated Xenos VS+PS can fetch+transform real vertices, sample the real guest texture, and
+// render the draw. Bridged via a disk file (so beta-takeover and plume-present need not co-run).
 //
-// Bridged via a disk file (highcut_p3_draw.bin in the cwd) — like highcut_p3_vs.spv — because the
-// beta-takeover and plume-present subsystems don't co-run cleanly in one process (beta fires the
-// owned draw during early boot before plume's init). The plume thread loads the packet and fills
-// the descriptor buffers (constants UBOs + shared-memory SSBO) and, for C-4, creates the pixel
-// shader module + the sampled texture(s).
+// C-4 used ONE packet (highcut_p3_draw.bin). C-5a (NHL_HIGHCUT_FRAME_CAPTURE) writes ONE packet PER
+// owned draw of a frame — highcut_frame_<N>.bin, N = 0..(highcut_frame.count-1) — and the plume
+// thread replays them ALL in order into one flat RT with per-draw blend + viewport.
 //
-// VERSION 2 (C-4) payload layout, in order, immediately after the header:
+// VERSION 3 payload layout, in order, immediately after the header:
 //   fetch_constants[fetch_bytes]   — full 192-dword fetch register space -> uvec4[48] UBO
-//   system_constants[sys_bytes]    — SpirvShaderTranslator::SystemConstants (incl. color_exp_bias)
-//   shared_memory[shared_bytes]    — guest vertex bytes (the vertex fetch base is REBASED to 0)
+//   system_constants[sys_bytes]    — SpirvShaderTranslator::SystemConstants (color_exp_bias, vte
+//                                    w-division flags, y-flipped ndc)
+//   shared_memory[shared_bytes]    — guest vertex bytes (vertex fetch base REBASED to 0)
 //   bool_loop_constants[bool_bytes]— 40 dwords (8 bool + 32 loop) -> the b/loop UBO
 //   vs_float_constants[vs_float_bytes] — PACKED VS float constants (ascending storage index)
 //   ps_float_constants[ps_float_bytes] — PACKED PS float constants (ascending storage index)
-//   pixel_shader_spirv[ps_spirv_bytes] — translated guest PS SPIR-V (0 => VS-only C-3 path)
+//   vertex_shader_spirv[vs_spirv_bytes] — translated guest VS SPIR-V (masked interpolators), INLINE
+//                                    per draw (0 => fall back to the shared highcut_p3_vs.spv)
+//   pixel_shader_spirv[ps_spirv_bytes]  — translated guest PS SPIR-V (0 => VS-only / solid PS path)
 //   for each of texture_count: TexturePacketDesc desc; uint8_t linear_texels[desc.data_bytes];
-//
-// The float constants are packed (not the full 256-entry bank) because the translator indexes them
-// via GetPackedFloatConstantIndex — see SpirvShaderTranslator and the beta path's pack_floats.
 
 #pragma once
 #include <cstdint>
@@ -28,14 +26,13 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 2;          // C-4: PS SPIR-V + textures + b/loop + floats
+constexpr uint32_t kDrawPacketVersion = 3;          // C-5a: inline VS SPIR-V + viewport + blend
 
-// Plume topology for the host draw (the translated VS's expected primitive). Xenos RectangleList
-// is translated as kRectangleListAsTriangleStrip and drawn as a 4-vertex TRIANGLE_STRIP.
+// Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert strip).
 enum DrawTopology : uint32_t { kTopoTriangleList = 0, kTopoTriangleStrip = 1 };
 
 // Plume-neutral texel format the untiled blob is in (the CP side mustn't depend on plume's
-// RenderFormat enum; the plume thread maps these to the matching RenderFormat). Bring-up set.
+// RenderFormat enum; the plume thread maps these to the matching RenderFormat).
 enum PacketTexFormat : uint32_t {
     kTexRGBA8 = 0,  // R8G8B8A8_UNORM  (k_8_8_8_8 untiled + endian-swapped)
     kTexBC1 = 1,    // BC1_UNORM       (k_DXT1)
@@ -43,10 +40,18 @@ enum PacketTexFormat : uint32_t {
     kTexBC3 = 3,    // BC3_UNORM       (k_DXT4_5)
 };
 
-// One sampled texture for the pixel shader: an already-UNTILED LINEAR texel blob plus the
-// metadata plume needs to create the RenderTexture + view + upload. One per PS texture binding
-// (the translator emits a separate binding for the unsigned and signed views of a fetch constant;
-// for bring-up both point at the same untiled bytes — see is_signed).
+// Plume-neutral blend factor/op — the xenos::BlendFactor / BlendOp enum VALUES (the CP decodes
+// RB_BLENDCONTROL into these; the plume side maps them to RenderBlend / RenderBlendOperation).
+enum PacketBlendFactor : uint32_t {
+    kBlendZero = 0, kBlendOne = 1, kBlendSrcColor = 4, kBlendInvSrcColor = 5,
+    kBlendSrcAlpha = 6, kBlendInvSrcAlpha = 7, kBlendDstColor = 8, kBlendInvDstColor = 9,
+    kBlendDstAlpha = 10, kBlendInvDstAlpha = 11, kBlendConstColor = 12, kBlendInvConstColor = 13,
+    kBlendConstAlpha = 14, kBlendInvConstAlpha = 15, kBlendSrcAlphaSat = 16,
+};
+enum PacketBlendOp : uint32_t {
+    kBlendOpAdd = 0, kBlendOpSubtract = 1, kBlendOpMin = 2, kBlendOpMax = 3, kBlendOpRevSubtract = 4,
+};
+
 struct TexturePacketDesc {
     uint32_t width;            // logical texel width
     uint32_t height;           // logical texel height
@@ -69,10 +74,17 @@ struct DrawPacketHeader {
     uint32_t bool_bytes;       // size of the bool/loop-constants blob (40 dwords = 160)
     uint32_t vs_float_bytes;   // size of the packed VS float-constants blob
     uint32_t ps_float_bytes;   // size of the packed PS float-constants blob
-    uint32_t ps_spirv_bytes;   // size of the translated PS SPIR-V blob (0 => no PS / C-3 path)
+    uint32_t vs_spirv_bytes;   // size of the inline VS SPIR-V (0 => shared highcut_p3_vs.spv)
+    uint32_t ps_spirv_bytes;   // size of the translated PS SPIR-V blob (0 => no PS / solid path)
     uint32_t texture_count;    // number of TexturePacketDesc + texel blobs that follow (PS textures)
     uint32_t ps_sampler_count; // number of PS sampler bindings (set 3, after the textures)
-    uint32_t reserved1;
+    // Per-draw viewport (plume sets this before the draw): from vpi.xy_offset/xy_extent/z_min/z_max.
+    float vp_x, vp_y, vp_w, vp_h, vp_zmin, vp_zmax;
+    // Per-draw blend (decoded from RB_BLENDCONTROL0 + RB_COLOR_MASK). Factors/ops are PacketBlend*.
+    uint32_t blend_enable;     // 1 => blend; (kBlendOne,kBlendZero,kBlendOpAdd) is identity (copy)
+    uint32_t blend_src, blend_dst, blend_op;           // color
+    uint32_t blend_src_a, blend_dst_a, blend_op_a;     // alpha
+    uint32_t color_write_mask; // RGBA bits 0..3 (1=R,2=G,4=B,8=A)
 };
 
 }  // namespace nhl::highcut

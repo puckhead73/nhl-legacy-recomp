@@ -88,6 +88,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+// C-5a: a fully self-contained renderable draw — owns ALL its plume resources (its own VS+PS,
+// constant/shared/float buffers, textures+sampler, pipeline layout + descriptor sets, and the
+// graphics pipeline built with this draw's blend + topology). A captured frame = a vector of these,
+// replayed in order into one flat RT with per-draw blend. (The C-4 single-draw path stays separate.)
+struct RenderableDraw {
+    std::unique_ptr<RenderShader> vs, ps;
+    std::unique_ptr<RenderBuffer> sysBuf, boolBuf, fetchBuf, sharedBuf, vsFloatBuf, psFloatBuf;
+    std::vector<std::unique_ptr<RenderTexture>> textures;
+    std::vector<std::unique_ptr<RenderTextureView>> texViews;
+    std::unique_ptr<RenderSampler> sampler;
+    std::unique_ptr<RenderPipelineLayout> layout;
+    std::unique_ptr<RenderDescriptorSet> set0, set1, set3;
+    std::unique_ptr<RenderPipeline> pipeline;
+    uint32_t vertexCount = 0;
+    bool textured = false;  // has set3 (textures+samplers) bound
+};
+
 struct PlumeCtx {
     HWND hwnd = nullptr;
     std::unique_ptr<RenderInterface> ri;
@@ -138,6 +155,9 @@ struct PlumeCtx {
     std::unique_ptr<RenderSampler> xlatSampler;
     std::unique_ptr<RenderDescriptorSet> xlatTexSet0, xlatTexSet1, xlatTexSet3;
     bool xlatTexDrawReady = false;
+    // C-5a: the captured frame's draws, replayed in order into the swapchain with per-draw blend.
+    std::vector<RenderableDraw> c5draws;
+    bool c5loaded = false;
     uint64_t frame = 0;
 };
 
@@ -451,7 +471,254 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     return true;
 }
 
+// C-5a: map the packet's plume-neutral blend factor/op (= Xenos enum values) to plume's enums.
+RenderBlend toPlumeBlend(uint32_t f) {
+    namespace hc = nhl::highcut;
+    switch (f) {
+        case hc::kBlendZero: return RenderBlend::ZERO;
+        case hc::kBlendOne: return RenderBlend::ONE;
+        case hc::kBlendSrcColor: return RenderBlend::SRC_COLOR;
+        case hc::kBlendInvSrcColor: return RenderBlend::INV_SRC_COLOR;
+        case hc::kBlendSrcAlpha: return RenderBlend::SRC_ALPHA;
+        case hc::kBlendInvSrcAlpha: return RenderBlend::INV_SRC_ALPHA;
+        case hc::kBlendDstColor: return RenderBlend::DEST_COLOR;
+        case hc::kBlendInvDstColor: return RenderBlend::INV_DEST_COLOR;
+        case hc::kBlendDstAlpha: return RenderBlend::DEST_ALPHA;
+        case hc::kBlendInvDstAlpha: return RenderBlend::INV_DEST_ALPHA;
+        case hc::kBlendSrcAlphaSat: return RenderBlend::SRC_ALPHA_SAT;
+        case hc::kBlendConstColor: case hc::kBlendConstAlpha: return RenderBlend::BLEND_FACTOR;
+        case hc::kBlendInvConstColor: case hc::kBlendInvConstAlpha: return RenderBlend::INV_BLEND_FACTOR;
+        default: return RenderBlend::ONE;
+    }
+}
+RenderBlendOperation toPlumeBlendOp(uint32_t o) {
+    namespace hc = nhl::highcut;
+    switch (o) {
+        case hc::kBlendOpSubtract: return RenderBlendOperation::SUBTRACT;
+        case hc::kBlendOpRevSubtract: return RenderBlendOperation::REV_SUBTRACT;
+        case hc::kBlendOpMin: return RenderBlendOperation::MIN;
+        case hc::kBlendOpMax: return RenderBlendOperation::MAX;
+        default: return RenderBlendOperation::ADD;
+    }
+}
+
+// C-5a: build ONE fully self-contained RenderableDraw from a v3 packet (in memory). Mirrors the C-4
+// CreateTexturedDraw resource setup, but owns everything per-draw (its own VS/PS/buffers/textures/
+// layout/sets/pipeline) so many can be replayed into one RT. Draws with no translated PS are skipped
+// (return false) — C-5a needs a color PS. Returns false on any resource-creation failure.
+bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, RenderableDraw& d) {
+    namespace hc = nhl::highcut;
+    if (bytes.size() < sizeof(hc::DrawPacketHeader)) return false;
+    hc::DrawPacketHeader hdr{};
+    std::memcpy(&hdr, bytes.data(), sizeof(hdr));
+    if (hdr.magic != hc::kDrawPacketMagic || hdr.version != hc::kDrawPacketVersion) return false;
+    if (hdr.vs_spirv_bytes == 0 || hdr.ps_spirv_bytes == 0) return false;  // need VS + color PS
+    const RenderShaderFormat fmt = c.ri->getCapabilities().shaderFormat;
+    if (fmt != RenderShaderFormat::SPIRV) return false;
+
+    size_t off = sizeof(hdr);
+    auto take = [&](uint32_t n) -> const uint8_t* {
+        if (off + n > bytes.size()) return nullptr;
+        const uint8_t* p = bytes.data() + off;
+        off += n;
+        return p;
+    };
+    const uint8_t* fetch = take(hdr.fetch_bytes);
+    const uint8_t* sysc = take(hdr.sys_bytes);
+    const uint8_t* shared = take(hdr.shared_bytes);
+    const uint8_t* boolc = take(hdr.bool_bytes);
+    const uint8_t* vsf = take(hdr.vs_float_bytes);
+    const uint8_t* psf = take(hdr.ps_float_bytes);
+    const uint8_t* vsSpirv = take(hdr.vs_spirv_bytes);
+    const uint8_t* psSpirv = take(hdr.ps_spirv_bytes);
+    if (!fetch || !sysc || !boolc || !vsf || !psf || !vsSpirv || !psSpirv) return false;
+    struct TexLoad { hc::TexturePacketDesc desc; const uint8_t* data; };
+    std::vector<TexLoad> texs;
+    for (uint32_t i = 0; i < hdr.texture_count; ++i) {
+        const uint8_t* dp = take(uint32_t(sizeof(hc::TexturePacketDesc)));
+        if (!dp) return false;
+        TexLoad t{};
+        std::memcpy(&t.desc, dp, sizeof(t.desc));
+        t.data = take(t.desc.data_bytes);
+        if (!t.data && t.desc.data_bytes) return false;
+        texs.push_back(t);
+    }
+
+    d.vs = c.device->createShader(vsSpirv, hdr.vs_spirv_bytes, "main", fmt);
+    d.ps = c.device->createShader(psSpirv, hdr.ps_spirv_bytes, "main", fmt);
+    if (!d.vs || !d.ps) return false;
+    const bool textured = hdr.texture_count > 0;
+    d.textured = textured;
+
+    constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16, kShared = 1u << 16;
+    auto mkUbo = [&](uint64_t sz, const uint8_t* src, uint32_t srcN) {
+        auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
+        if (b) {
+            void* p = b->map();
+            std::memset(p, 0, sz);
+            if (src && srcN) std::memcpy(p, src, std::min<uint64_t>(srcN, sz));
+            b->unmap();
+        }
+        return b;
+    };
+    d.sysBuf = mkUbo(kSys, sysc, hdr.sys_bytes);
+    d.boolBuf = mkUbo(kBool, boolc, hdr.bool_bytes);
+    d.fetchBuf = mkUbo(kFetch, fetch, hdr.fetch_bytes);
+    d.vsFloatBuf = mkUbo(kFloat, vsf, hdr.vs_float_bytes);
+    d.psFloatBuf = mkUbo(kFloat, psf, hdr.ps_float_bytes);
+    d.sharedBuf = c.device->createBuffer(RenderBufferDesc::UploadBuffer(kShared, RenderBufferFlag::STORAGE));
+    if (d.sharedBuf) {
+        void* p = d.sharedBuf->map();
+        std::memset(p, 0, kShared);
+        if (shared && hdr.shared_bytes) std::memcpy(p, shared, std::min<uint64_t>(hdr.shared_bytes, kShared));
+        d.sharedBuf->unmap();
+    }
+    if (!d.sysBuf || !d.boolBuf || !d.fetchBuf || !d.vsFloatBuf || !d.psFloatBuf || !d.sharedBuf)
+        return false;
+
+    const uint32_t nTex = hdr.texture_count;
+    const uint32_t nSamp = hdr.ps_sampler_count ? hdr.ps_sampler_count : 1u;
+    if (textured) {
+        auto mapFmt = [](uint32_t f) -> RenderFormat {
+            switch (f) {
+                case hc::kTexBC1: return RenderFormat::BC1_UNORM;
+                case hc::kTexBC2: return RenderFormat::BC2_UNORM;
+                case hc::kTexBC3: return RenderFormat::BC3_UNORM;
+                default: return RenderFormat::R8G8B8A8_UNORM;
+            }
+        };
+        auto up = c.queue->createCommandList();
+        auto fence = c.device->createCommandFence();
+        std::vector<std::unique_ptr<RenderBuffer>> stagings;
+        up->begin();
+        for (auto& t : texs) {
+            const RenderFormat rf = mapFmt(t.desc.tex_format);
+            auto tex = c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
+            auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.desc.data_bytes ? t.desc.data_bytes : 4u));
+            if (staging && t.desc.data_bytes) { void* p = staging->map(); std::memcpy(p, t.data, t.desc.data_bytes); staging->unmap(); }
+            if (tex && staging) {
+                up->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
+                up->copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.get(), 0, 0),
+                                      RenderTextureCopyLocation::PlacedFootprint(staging.get(), rf, t.desc.width, t.desc.height, 1, t.desc.width, 0));
+                up->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
+            }
+            auto view = tex ? tex->createTextureView(RenderTextureViewDesc::Texture2D(rf)) : nullptr;
+            d.textures.push_back(std::move(tex));
+            d.texViews.push_back(std::move(view));
+            stagings.push_back(std::move(staging));
+        }
+        up->end();
+        const RenderCommandList* cl = up.get();
+        c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
+        c.queue->waitForCommandFence(fence.get());
+        RenderSamplerDesc sd;
+        sd.minFilter = RenderFilter::LINEAR;
+        sd.magFilter = RenderFilter::LINEAR;
+        sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
+        d.sampler = c.device->createSampler(sd);
+        if (!d.sampler) return false;
+    }
+
+    auto bSet1 = [](RenderDescriptorSetBuilder& b) {
+        b.begin();
+        for (uint32_t i = 0; i <= 4; ++i) b.addConstantBuffer(i);
+        b.end();
+    };
+    auto bSet3 = [&](RenderDescriptorSetBuilder& b) {
+        b.begin();
+        for (uint32_t i = 0; i < nTex; ++i) b.addTexture(i);
+        for (uint32_t i = 0; i < nSamp; ++i) b.addSampler(nTex + i);
+        b.end();
+    };
+    RenderPipelineLayoutBuilder lb;
+    lb.begin(false, false);
+    { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); lb.addDescriptorSet(s); }  // set0
+    { RenderDescriptorSetBuilder s; bSet1(s); lb.addDescriptorSet(s); }                                       // set1
+    if (textured) {
+        { RenderDescriptorSetBuilder s; s.begin(); s.end(); lb.addDescriptorSet(s); }                         // set2 empty
+        { RenderDescriptorSetBuilder s; bSet3(s); lb.addDescriptorSet(s); }                                   // set3
+    }
+    lb.end();
+    d.layout = lb.create(c.device.get());
+    if (!d.layout) return false;
+
+    { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); d.set0 = s.create(c.device.get()); }
+    { RenderDescriptorSetBuilder s; bSet1(s); d.set1 = s.create(c.device.get()); }
+    if (!d.set0 || !d.set1) return false;
+    d.set0->setBuffer(0, d.sharedBuf.get(), kShared);
+    d.set1->setBuffer(0, d.sysBuf.get(), kSys);
+    d.set1->setBuffer(1, d.vsFloatBuf.get(), kFloat);
+    d.set1->setBuffer(2, d.psFloatBuf.get(), kFloat);
+    d.set1->setBuffer(3, d.boolBuf.get(), kBool);
+    d.set1->setBuffer(4, d.fetchBuf.get(), kFetch);
+    if (textured) {
+        RenderDescriptorSetBuilder s; bSet3(s); d.set3 = s.create(c.device.get());
+        if (!d.set3) return false;
+        for (uint32_t i = 0; i < nTex && i < d.textures.size(); ++i)
+            if (d.textures[i]) d.set3->setTexture(i, d.textures[i].get(), RenderTextureLayout::SHADER_READ, d.texViews[i].get());
+        for (uint32_t i = 0; i < nSamp; ++i) d.set3->setSampler(nTex + i, d.sampler.get());
+    }
+
+    RenderBlendDesc blend;
+    blend.blendEnabled = hdr.blend_enable != 0;
+    blend.srcBlend = toPlumeBlend(hdr.blend_src);
+    blend.dstBlend = toPlumeBlend(hdr.blend_dst);
+    blend.blendOp = toPlumeBlendOp(hdr.blend_op);
+    blend.srcBlendAlpha = toPlumeBlend(hdr.blend_src_a);
+    blend.dstBlendAlpha = toPlumeBlend(hdr.blend_dst_a);
+    blend.blendOpAlpha = toPlumeBlendOp(hdr.blend_op_a);
+    blend.renderTargetWriteMask = uint8_t(hdr.color_write_mask & 0xF);
+    auto topo = (hdr.topology == hc::kTopoTriangleStrip) ? RenderPrimitiveTopology::TRIANGLE_STRIP
+                                                         : RenderPrimitiveTopology::TRIANGLE_LIST;
+    RenderGraphicsPipelineDesc pd;
+    pd.pipelineLayout = d.layout.get();
+    pd.vertexShader = d.vs.get();
+    pd.pixelShader = d.ps.get();
+    pd.renderTargetFormat[0] = kSwapFormat;
+    pd.renderTargetBlend[0] = blend;
+    pd.renderTargetCount = 1;
+    pd.primitiveTopology = topo;
+    d.pipeline = c.device->createGraphicsPipeline(pd);
+    if (!d.pipeline) return false;
+    d.vertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
+    return true;
+}
+
+// C-5a: load the captured frame (highcut_frame.count -> highcut_frame_0..N-1.bin) into renderable
+// draws, once. Each file is a self-contained v3 packet.
+void LoadC5Frames(PlumeCtx& c) {
+    uint32_t count = 0;
+    if (FILE* cf = std::fopen("highcut_frame.count", "r")) {
+        if (std::fscanf(cf, "%u", &count) != 1) count = 0;
+        std::fclose(cf);
+    }
+    if (!count) { REXLOG_INFO("[highcut-C5] no highcut_frame.count — run _c5dump.ps1 first"); return; }
+    uint32_t built = 0, skipped = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "highcut_frame_%u.bin", i);
+        std::vector<uint8_t> bytes;
+        if (FILE* f = std::fopen(path, "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            long sz = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (sz > 0) { bytes.resize(size_t(sz)); if (std::fread(bytes.data(), 1, size_t(sz), f) != size_t(sz)) bytes.clear(); }
+            std::fclose(f);
+        }
+        if (bytes.empty()) { ++skipped; continue; }
+        RenderableDraw d;
+        if (BuildRenderableDraw(c, bytes, d)) { c.c5draws.push_back(std::move(d)); ++built; }
+        else ++skipped;
+    }
+    REXLOG_INFO("[highcut-C5] loaded {} renderable draws ({} skipped) of {} captured owned draws",
+                built, skipped, count);
+}
+
 void RenderClear(PlumeCtx& c) {
+    // C-5a: load the captured frame once, before touching the swapchain (resource creation +
+    // texture uploads use the queue, independent of the frame). Gated NHL_HIGHCUT_C5.
+    static const bool c5_mode = std::getenv("NHL_HIGHCUT_C5") != nullptr;
+    if (c5_mode && !c.c5loaded) { c.c5loaded = true; LoadC5Frames(c); }
     uint32_t idx = 0;
     if (c.swap->isEmpty() || !c.swap->acquireTexture(c.acquireSem.get(), &idx)) {
         c.swap->resize();
@@ -680,11 +947,26 @@ void RenderClear(PlumeCtx& c) {
     // readable signal that the plume render path is live before we feed it decoded guest draws.
     // C-1 bring-up triangle (vertex-colored) — kept as a "window alive" control alongside the
     // C-3b translated draw (solid orange), so both are visible in the plume window.
-    if (c.pipeline && c.vbuf) {
+    if (!c5_mode && c.pipeline && c.vbuf) {
         c.cmd->setGraphicsPipelineLayout(c.pipelineLayout.get());
         c.cmd->setPipeline(c.pipeline.get());
         c.cmd->setVertexBuffers(0, &c.vbView, 1, &c.inputSlot);
         c.cmd->drawInstanced(3, 1, 0, 0);
+    }
+
+    // C-5a: replay every captured owned draw of the frame into this one flat RT, in order, each
+    // with its own pipeline + per-draw blend. Viewport/scissor are the full swapchain (set above);
+    // each draw positions its geometry via its own ndc (baked into its SystemConstants). Per-surface
+    // RTs + Resolve=host-copy (correct render-to-texture composition) is C-5b.
+    if (c5_mode && !c.c5draws.empty()) {
+        for (auto& d : c.c5draws) {
+            c.cmd->setGraphicsPipelineLayout(d.layout.get());
+            c.cmd->setPipeline(d.pipeline.get());
+            c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);
+            c.cmd->setGraphicsDescriptorSet(d.set1.get(), 1);
+            if (d.textured) c.cmd->setGraphicsDescriptorSet(d.set3.get(), 3);
+            c.cmd->drawInstanced(d.vertexCount, 1, 0, 0);
+        }
     }
 
     // C-3b.1: draw the TRANSLATED Xenos VS pipeline with its descriptor sets bound. With zeroed

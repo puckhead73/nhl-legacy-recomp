@@ -1557,14 +1557,18 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // is procedurally trivial (no vfetch -> degenerate point). highcut_p3_vs.spv stays = draw 0 for
   // the existing C-2/C-3 path. Select which draw the plume bridge gets via NHL_HIGHCUT_XLAT_DRAW.
   bool p3_dump_data = false;  // C-3b.2: dump this draw's data packet (set when it's the selected draw)
-  // C-4: the selected draw's translated PIXEL shader + its texture/sampler interface, captured in
-  // the survey block and consumed by the packet dump below (after vpi). Empty => VS-only C-3 path.
+  // C-4: the selected draw's translated VS+PS + the PS texture/sampler interface, captured in the
+  // survey block and consumed by the packet dump below (after vpi). Empty => VS-only C-3 path.
+  std::vector<uint8_t> p3_vs_spirv;  // C-5a: masked VS dumped INLINE per draw (frame capture)
   std::vector<uint8_t> p3_ps_spirv;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
   uint32_t p3_ps_sampler_count = 0;
+  // C-5a: NHL_HIGHCUT_FRAME_CAPTURE dumps EVERY interesting owned draw of the frame (to
+  // highcut_frame_<idx>.bin) for the multi-draw plume replay, not just the C-4 single selected draw.
+  const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
-  if (std::getenv("NHL_HIGHCUT_XLAT_TEST")) {
+  if (std::getenv("NHL_HIGHCUT_XLAT_TEST") || frame_capture) {
     // C-4: only survey INTERESTING draws (a vfetch VS or a textured PS) — skip the many trivial
     // boot-overlay draws so textured menu draws are reached. (Bindings come from the SDK's shader
     // analysis, no translation needed for the pre-check.)
@@ -1572,7 +1576,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         (beta_current_vs_ && !beta_current_vs_->vertex_bindings().empty()) ||
         (beta_current_ps_ && !beta_current_ps_->texture_bindings().empty());
     const int p3_idx = p3_interesting ? highcut_p3_count.fetch_add(1) : -1;
-    if (p3_idx >= 0 && p3_idx < kP3MaxDraws) {
+    // Frame capture surveys EVERY interesting draw (no 32-draw cap); the C-4 single-draw survey caps.
+    if (p3_interesting && (frame_capture || (p3_idx >= 0 && p3_idx < kP3MaxDraws))) {
     namespace rg = rex::graphics;
     rg::SpirvShader p3_vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
                           beta_current_vs_->ucode_dwords(),
@@ -1617,11 +1622,13 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                 p3_idx, p3_vs.ucode_dword_count(), p3_reg_count, p3_vbinds, p3_vs_tex, p3_ps_tex,
                 p3_ok, p3_tr->is_valid(), p3_bin.size());
     if (p3_tr->is_valid() && !p3_bin.empty()) {
-      char p3_path[64];
-      std::snprintf(p3_path, sizeof(p3_path), "highcut_p3_vs_%03d.spv", p3_idx);
-      if (std::FILE* p3_f = std::fopen(p3_path, "wb")) {
-        std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
-        std::fclose(p3_f);
+      if (!frame_capture) {  // C-4 survey numbered dump (for selecting a draw); not needed per-frame
+        char p3_path[64];
+        std::snprintf(p3_path, sizeof(p3_path), "highcut_p3_vs_%03d.spv", p3_idx);
+        if (std::FILE* p3_f = std::fopen(p3_path, "wb")) {
+          std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
+          std::fclose(p3_f);
+        }
       }
       // Selected draw (default 0) feeds the plume bridge. C-4: re-translate the VS AND the PS with
       // the SHARED interpolator mask (the AND of VS-writes & PS-reads computed above) so their
@@ -1632,7 +1639,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         const char* s = std::getenv("NHL_HIGHCUT_XLAT_DRAW");
         return s ? int(std::strtol(s, nullptr, 10)) : 0;
       }();
-      if (p3_idx == p3_sel) {
+      // C-5a: in frame-capture mode EVERY interesting draw is fully translated + dumped (the masked
+      // VS goes INLINE in the per-draw packet); the C-4 path does this only for the selected draw.
+      if (p3_idx == p3_sel || frame_capture) {
         // VS, re-translated with the shared interpolator mask (a distinct modification value ->
         // its own translation slot; reuses p3_xlat, which is stateless between translations).
         rg::SpirvShaderTranslator::Modification vs_modw(
@@ -1645,14 +1654,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
             (vs_okw && vs_trw->is_valid() && !vs_trw->translated_binary().empty())
                 ? vs_trw->translated_binary()
                 : p3_bin;  // fall back to the default-mask VS if the masked retranslate failed
-        if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
-          std::fwrite(vs_binw.data(), 1, vs_binw.size(), p3_f);
-          std::fclose(p3_f);
+        p3_vs_spirv.assign(vs_binw.begin(), vs_binw.end());  // inline VS for the packet
+        if (!frame_capture) {  // C-4 single-draw bridge writes the shared .spv + in-memory publish
+          if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
+            std::fwrite(vs_binw.data(), 1, vs_binw.size(), p3_f);
+            std::fclose(p3_f);
+          }
+          HighcutPublishTranslatedVS(vs_binw.data(), vs_binw.size());
+          REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv (masked=0x{:X}) + bridge",
+                      p3_idx, interpolator_mask);
         }
-        HighcutPublishTranslatedVS(vs_binw.data(), vs_binw.size());
         p3_dump_data = true;  // also dump this draw's data packet (below, after vpi)
-        REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv (masked=0x{:X}) + bridge",
-                    p3_idx, interpolator_mask);
         // PS (C-4): translate the textured pixel shader from a FRESH SpirvShader so its SPIR-V and
         // its texture/sampler bindings come from one analysis, matching the dumped module exactly.
         if (eff_ps) {
@@ -1685,9 +1697,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
             p3_ps_spirv.assign(ps_bin.begin(), ps_bin.end());
             p3_ps_texbinds = p3_ps.GetTextureBindingsAfterTranslation();
             p3_ps_sampler_count = uint32_t(p3_ps.GetSamplerBindingsAfterTranslation().size());
-            if (std::FILE* psf = std::fopen("highcut_p3_ps.spv", "wb")) {
-              std::fwrite(ps_bin.data(), 1, ps_bin.size(), psf);
-              std::fclose(psf);
+            if (!frame_capture) {  // C-4 single-draw debug dump; the packet carries inline PS SPIR-V
+              if (std::FILE* psf = std::fopen("highcut_p3_ps.spv", "wb")) {
+                std::fwrite(ps_bin.data(), 1, ps_bin.size(), psf);
+                std::fclose(psf);
+              }
             }
           }
         }
@@ -2071,10 +2085,37 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.bool_bytes = kBoolLoopBytes;
     hdr.vs_float_bytes = uint32_t(vs_floats.size());
     hdr.ps_float_bytes = uint32_t(ps_floats.size());
+    hdr.vs_spirv_bytes = uint32_t(p3_vs_spirv.size());  // C-5a: inline masked VS (per-draw)
     hdr.ps_spirv_bytes = uint32_t(p3_ps_spirv.size());
     hdr.texture_count = uint32_t(tex_descs.size());
     hdr.ps_sampler_count = p3_ps_sampler_count;
-    if (std::FILE* pf = std::fopen("highcut_p3_draw.bin", "wb")) {
+    // C-5a: per-draw viewport (final vpi) so the plume replay places each draw correctly.
+    hdr.vp_x = float(vpi.xy_offset[0]);
+    hdr.vp_y = float(vpi.xy_offset[1]);
+    hdr.vp_w = float(vpi.xy_extent[0]);
+    hdr.vp_h = float(vpi.xy_extent[1]);
+    hdr.vp_zmin = vpi.z_min;
+    hdr.vp_zmax = vpi.z_max;
+    // C-5a: per-draw blend from RB_BLENDCONTROL0 (factors/ops = xenos enum values == PacketBlend*).
+    // Xenos has no explicit per-RT blend-enable; (One,Zero,Add) IS identity, so always enable and
+    // let the factors decide. NHL_BETA_NOBLEND forces copy for A/B.
+    const uint32_t bc0 = beta_noblend ? 0x00010001u
+                                      : (*register_file_)[beta_reg::kBlendControl[0]];
+    hdr.blend_enable = 1;
+    hdr.blend_src = (bc0 >> 0) & 0x1F;
+    hdr.blend_op = (bc0 >> 5) & 0x7;
+    hdr.blend_dst = (bc0 >> 8) & 0x1F;
+    hdr.blend_src_a = (bc0 >> 16) & 0x1F;
+    hdr.blend_op_a = (bc0 >> 21) & 0x7;
+    hdr.blend_dst_a = (bc0 >> 24) & 0x1F;
+    hdr.color_write_mask = 0xF;  // C-5a: write all channels (per-RT mask refinement deferred)
+    char pkt_path[64];
+    if (frame_capture) {
+      std::snprintf(pkt_path, sizeof(pkt_path), "highcut_frame_%u.bin", highcut_capture_idx_);
+    } else {
+      std::snprintf(pkt_path, sizeof(pkt_path), "highcut_p3_draw.bin");
+    }
+    if (std::FILE* pf = std::fopen(pkt_path, "wb")) {
       std::fwrite(&hdr, 1, sizeof(hdr), pf);
       std::fwrite(fetch_blob, 1, sizeof(fetch_blob), pf);
       std::fwrite(&spv_sys, 1, sizeof(spv_sys), pf);
@@ -2082,19 +2123,21 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       std::fwrite(bool_src, 1, kBoolLoopBytes, pf);
       if (hdr.vs_float_bytes) std::fwrite(vs_floats.data(), 1, hdr.vs_float_bytes, pf);
       if (hdr.ps_float_bytes) std::fwrite(ps_floats.data(), 1, hdr.ps_float_bytes, pf);
+      if (hdr.vs_spirv_bytes) std::fwrite(p3_vs_spirv.data(), 1, hdr.vs_spirv_bytes, pf);
       if (hdr.ps_spirv_bytes) std::fwrite(p3_ps_spirv.data(), 1, hdr.ps_spirv_bytes, pf);
       for (size_t i = 0; i < tex_descs.size(); ++i) {
         std::fwrite(&tex_descs[i], 1, sizeof(tex_descs[i]), pf);
         std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
       }
       std::fclose(pf);
-      REXLOG_INFO("[highcut-C4] dumped draw packet v2: verts={} topo={} vtx_size={} bool={} "
-                  "vs_float={} ps_float={} ps_spirv={} textures={} flags=0x{:X} "
-                  "ndc_scale=({},{},{}) ndc_offset=({},{},{})",
-                  hdr.vertex_count, hdr.topology, vtx_size, hdr.bool_bytes, hdr.vs_float_bytes,
-                  hdr.ps_float_bytes, hdr.ps_spirv_bytes, hdr.texture_count, spv_sys.flags,
-                  spv_sys.ndc_scale[0], spv_sys.ndc_scale[1], spv_sys.ndc_scale[2],
-                  spv_sys.ndc_offset[0], spv_sys.ndc_offset[1], spv_sys.ndc_offset[2]);
+      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) vs_spirv={} ps_spirv={} "
+                  "textures={} blend=src{}/dst{}/op{} flags=0x{:X} ndc_s=({},{}) ndc_o=({},{})",
+                  frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
+                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.vs_spirv_bytes, hdr.ps_spirv_bytes,
+                  hdr.texture_count, hdr.blend_src, hdr.blend_dst, hdr.blend_op, spv_sys.flags,
+                  spv_sys.ndc_scale[0], spv_sys.ndc_scale[1], spv_sys.ndc_offset[0],
+                  spv_sys.ndc_offset[1]);
+      if (frame_capture) ++highcut_capture_idx_;
     }
   }
 
@@ -5246,6 +5289,18 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
     beta_depth_cleared_ = false;
     beta_live_frame_req_bytes_ = 0;  // per-draw residency upload accounting resets per frame
     beta_live_frame_inv_bytes_ = 0;
+    // C-5a frame capture: write the count of owned draws dumped this frame (highcut_frame.count) so
+    // the plume replay knows how many highcut_frame_<N>.bin to load, then reset (next frame
+    // overwrites). The last fully-captured frame before exit is the one the replay sees.
+    if (std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") && highcut_capture_idx_ > 0) {
+      if (std::FILE* cf = std::fopen("highcut_frame.count", "w")) {
+        std::fprintf(cf, "%u\n", highcut_capture_idx_);
+        std::fclose(cf);
+      }
+      REXLOG_INFO("[highcut-C5] frame captured: {} owned draws -> highcut_frame.count",
+                  highcut_capture_idx_);
+    }
+    highcut_capture_idx_ = 0;
   }
 
   // Oracle RenderDoc bracket end (base path, no takeover).
