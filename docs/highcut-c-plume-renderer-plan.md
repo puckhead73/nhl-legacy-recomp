@@ -75,10 +75,32 @@ rexglue's live device (no shared-device risk). What the port concretely requires
 Port milestones: **P-1 DONE (2026-06-11)** — glslang 14.3.0 vendored (FetchContent, ENABLE_OPT/HLSL
 off), builds+links in the clang/MSVC toolchain, `spv::Builder` emits valid SPIR-V (magic 0x07230203),
 and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (probe:
-`gpu/hooks/highcut_spirv_probe.cpp`, gate `NHL_HIGHCUT_SPIRV_PROBE`). Original P-1 plan:
-**P-2** vendor+adapt the Xenia SPIR-V translator `.cc`, link against the SDK header, translate one
-analyzed `beta_current_vs_` → valid SPIR-V (byte-validate with spirv-val); **P-3** feed that SPIR-V
-to plume-Vulkan `createShader` + build a pipeline; then rejoin the C milestones below at C-3.
+`gpu/hooks/highcut_spirv_probe.cpp`, gate `NHL_HIGHCUT_SPIRV_PROBE`).
+
+- **P-2a DONE (2026-06-11)** — ported `gpu/spirv/spirv_builder.cc` (Xenia → `rex::graphics`,
+  mechanical namespace + include remap). Compiles clean.
+- **P-2b DONE (2026-06-11)** — ported the 5 `gpu/spirv/spirv_shader_translator*.cc`; all compile
+  clean and `SpirvShaderTranslator` LINKS (probe constructs one + calls
+  `GetDefaultVertexShaderModification`).
+  - **KEY CORRECTION to the "find the matching Xenia commit" premise:** there is **no** upstream
+    Xenia commit/branch whose SPIR-V translator matches the SDK header. The SDK's
+    `spirv_translator.h` is a **ReXGlue-enhanced kVersion-12** API (Tom Clay forward-ported the
+    feature set from Xenia's *DXBC* translator: tessellation, user clip planes, draw-resolution
+    scale, memexport-compute fallback, float24 depth modes). Upstream Xenia's SPIR-V translator —
+    including latest master `95a5c3e` — is **kVersion-6** and never reaches 12. So the bodies are
+    ported from upstream `95a5c3e` (kVersion-6) and **reconciled** against the kVersion-12 SDK
+    headers; the kVersion-12-only features are **NOT implemented** by these bodies (the core
+    ALU/fetch/control-flow/RB/memexport paths are identical across versions and port verbatim).
+  - **Reconciliation surface (tiny):** 4 files compiled clean as-is; the main `.cc` needed 4
+    spot-fixes — `CreateDepthOnlyFragmentShader` + `StoreResult` signature additions, a
+    `kOutputPerVertexMemberCount`→`…CountMax` rename, and glslang's `makeFunctionEntry` gaining a
+    `LinkageType` arg (passed `spv::LinkageTypeMax`). Plus 3 const data tables the SDK declares but
+    doesn't export (`ucode::kAluVectorOpcodeInfos`, `draw_util::kD3D10StandardSamplePositions{2x,4x}`)
+    supplied verbatim in `gpu/spirv/spirv_translator_tables.cc`.
+- **P-3 (next)** — translate one analyzed `beta_current_vs_` → valid SPIR-V (byte-validate with
+  spirv-val), gated `NHL_HIGHCUT_XLAT_TEST`, `is_new`-only so the live DXBC translation is never
+  overwritten. Then **C-2/C-3**: feed that SPIR-V to plume-Vulkan `createShader` + build a pipeline,
+  rejoining the C milestones below.
 
 ## Milestones (incremental, each independently testable)
 

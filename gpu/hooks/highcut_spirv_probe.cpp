@@ -19,6 +19,10 @@
 // Including the SDK header (Xenia's) is itself the compile test — it pulls in
 // <SPIRV/SpvBuilder.h> from the vendored glslang via the include path added in CMakeLists.
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
+// P-2b: the ported translator. Constructing one + calling a method below forces the
+// linker to resolve SpirvShaderTranslator (ctor, Features(bool), the virtual override,
+// and transitively the base ShaderTranslator helpers) — the P-2b linkage proof.
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
 
 extern "C" void HighcutSpirvProbe() {
     if (!std::getenv("NHL_HIGHCUT_SPIRV_PROBE")) {
@@ -35,4 +39,19 @@ extern "C" void HighcutSpirvProbe() {
     REXLOG_INFO("[highcut-P1] glslang spv::Builder OK: dumped {} SPIR-V words, magic=0x{:08X} "
                 "(expect 0x07230203); SDK spirv_builder.h compiled against vendored glslang 14.3.0",
                 uint32_t(words.size()), magic);
+
+    // P-2b: prove the ported SpirvShaderTranslator constructs + links. Features(true)
+    // selects the all-features (no Vulkan device) path; the ctor's later args default.
+    namespace rg = rex::graphics;
+    rg::SpirvShaderTranslator::Features features(/*all=*/true);
+    rg::SpirvShaderTranslator translator(features,
+                                         /*native_2x_msaa_with_attachments=*/false,
+                                         /*native_2x_msaa_no_attachments=*/false,
+                                         /*edram_fragment_shader_interlock=*/false);
+    const uint64_t default_vs_mod = translator.GetDefaultVertexShaderModification(
+        /*dynamic_addressable_register_count=*/0,
+        rg::Shader::HostVertexShaderType::kVertex);
+    REXLOG_INFO("[highcut-P2b] SpirvShaderTranslator linked: constructed OK, "
+                "GetDefaultVertexShaderModification(0)=0x{:016X}",
+                default_vs_mod);
 }

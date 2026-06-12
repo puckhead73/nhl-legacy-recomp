@@ -30,6 +30,17 @@ set(NHLLEGACY_SOURCES
     # High-cut path C (P-2): ported Xenia Xenos->SPIR-V translator (rex:: adaptation of the
     # source whose headers the SDK ships but whose .cc it does not). P-2a = the SpirvBuilder.
     gpu/spirv/spirv_builder.cc
+    # P-2b = the SpirvShaderTranslator. NOTE: the SDK's spirv_translator.h is a ReXGlue-enhanced
+    # kVersion-12 API (features forward-ported from Xenia's DXBC translator); these bodies are
+    # upstream Xenia 95a5c3e (kVersion-6), reconciled to compile/link against the SDK header.
+    # kVersion-12-only features are not implemented here. See docs/highcut-c-plume-renderer-plan.md.
+    gpu/spirv/spirv_shader_translator.cc
+    gpu/spirv/spirv_shader_translator_alu.cc
+    gpu/spirv/spirv_shader_translator_fetch.cc
+    gpu/spirv/spirv_shader_translator_memexport.cc
+    gpu/spirv/spirv_shader_translator_rb.cc
+    # Const data tables the SDK declares (ucode.h / util/draw.h) but doesn't export.
+    gpu/spirv/spirv_translator_tables.cc
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
