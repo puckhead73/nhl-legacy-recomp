@@ -27,6 +27,9 @@ set(NHLLEGACY_SOURCES
     gpu/hooks/plume_present.cpp
     # High-cut path C (P-1): glslang link/compile probe for the SPIR-V translator port.
     gpu/hooks/highcut_spirv_probe.cpp
+    # High-cut path C (P-2): ported Xenia Xenos->SPIR-V translator (rex:: adaptation of the
+    # source whose headers the SDK ships but whose .cc it does not). P-2a = the SpirvBuilder.
+    gpu/spirv/spirv_builder.cc
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
     # with per-file .dds -> .rx2 texture synthesis in the lower tree.
     src/union_device.cpp
