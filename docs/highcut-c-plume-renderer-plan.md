@@ -179,12 +179,23 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     `vk_layer_settings.txt` logging): **0 errors/VUID** — the descriptor sets match the shader and
     the draw is valid. Buffers are zero-filled here, so nothing visible renders (degenerate
     positions); this proves the bind+draw mechanics before real data.
-  - **C-3b.2 (NEXT — the actual geometry):** populate the buffers from the beta CP's decoded data —
-    system constants (NDC scale/offset, vertex_base_index; memcpy the now-layout-correct
-    `SystemConstants`), the 32 fetch constants (192 dwords from the register file), and the
-    shared-memory SSBO with the guest vertex bytes (rebased so the vfetch base offset indexes into
-    our SSBO). Bridge via a disk dump from `RenderBetaOwnedDraw` (like the `.spv`), since beta-
-    takeover + present don't co-run. Then the translated VS fetches + transforms real vertices.
+  - **C-3b.2 STARTED (2026-06-12): real vfetch draw identified.** Added a draw survey to the P-3
+    block (`NHL_HIGHCUT_XLAT_TEST`): translate the first 24 owned draws' VS, dump each to
+    `highcut_p3_vs_NNN.spv`, log per-draw `vfetch_bindings`/`tex_bindings`; `NHL_HIGHCUT_XLAT_DRAW=N`
+    selects which goes to `highcut_p3_vs.spv` + the plume bridge. **Finding:** the capture FRAME
+    matters — frame 0 (default) is a trivial dark-overlay draw (VS computes a degenerate point, NO
+    vfetch — confirmed in the disasm: position = `(0,0,0,1)`, no shared_memory access). With
+    `NHL_BETA_CAPTURE_FRAME=120` (a menu frame), draw#0 is a **real geometry VS** — `vfetch_bindings=1`,
+    27 ucode dwords, 8768-byte SPIR-V, 10 shared_memory/fetch_constant accesses, **spirv-val-clean**.
+    That is the C-3b.2 render target.
+  - **C-3b.2 REMAINING (the data plumbing — the core renderer work):** for the vfetch draw, fill the
+    C-3b.1 buffers with correct data: (1) **system constants** — NDC scale/offset, vertex_base_index,
+    vertex_index_endian, flags; building these correctly ≈ porting the CP's `UpdateSystemConstantValues`
+    (the hard part); (2) **fetch constants** — the 6-dword vfetch descriptor from the register file
+    (base addr, stride, format, endian); (3) **shared-memory SSBO** — the guest vertex bytes, REBASED
+    so the vfetch base offset indexes into our (small) SSBO. Bridge via disk dump from
+    `RenderBetaOwnedDraw`. Iterate against the C-3b.1 validation-clean harness + a readback/visual
+    check. This is multi-cycle (endianness, fetch format, NDC, rebasing all must be exact).
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

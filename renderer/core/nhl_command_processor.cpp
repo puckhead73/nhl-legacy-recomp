@@ -1549,8 +1549,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // never touching beta_current_vs_ (the live DXBC D3D12Shader), so the validated beta
   // path is byte-identical. The fresh shader owns its own translation slot, so there is
   // no clobber risk (is_new is always true). See docs/highcut-c-plume-renderer-plan.md.
-  static std::atomic_flag highcut_p3_done = ATOMIC_FLAG_INIT;
-  if (std::getenv("NHL_HIGHCUT_XLAT_TEST") && !highcut_p3_done.test_and_set()) {
+  // C-3b.2 draw survey: translate the VS of the first kP3MaxDraws owned draws, dump each to a
+  // numbered file, and log each one's vertex-binding count (the vfetch indicator) + ucode size,
+  // so a REAL geometry draw (one that fetches vertices) can be identified — the first owned draw
+  // is procedurally trivial (no vfetch -> degenerate point). highcut_p3_vs.spv stays = draw 0 for
+  // the existing C-2/C-3 path. Select which draw the plume bridge gets via NHL_HIGHCUT_XLAT_DRAW.
+  static std::atomic<int> highcut_p3_count{0};
+  constexpr int kP3MaxDraws = 24;
+  if (std::getenv("NHL_HIGHCUT_XLAT_TEST")) {
+    const int p3_idx = highcut_p3_count.fetch_add(1);
+    if (p3_idx < kP3MaxDraws) {
     namespace rg = rex::graphics;
     rg::SpirvShader p3_vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
                           beta_current_vs_->ucode_dwords(),
@@ -1576,24 +1584,33 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     rg::Shader::Translation* p3_tr = p3_vs.GetOrCreateTranslation(p3_mod, &p3_is_new);
     const bool p3_ok = p3_xlat.TranslateAnalyzedShader(*p3_tr);
     const auto& p3_bin = p3_tr->translated_binary();
-    uint32_t p3_magic = 0;
-    if (p3_bin.size() >= 4) std::memcpy(&p3_magic, p3_bin.data(), 4);
-    REXLOG_INFO("[highcut-P3] VS xlat: ucode_dwords={} reg_count={} hvst={} mod=0x{:016X} "
-                "is_new={} ok={} is_valid={} spirv_bytes={} magic=0x{:08X} (expect 0x07230203)",
-                p3_vs.ucode_dword_count(), p3_reg_count,
-                uint32_t(result.host_vertex_shader_type), p3_mod, p3_is_new, p3_ok,
-                p3_tr->is_valid(), p3_bin.size(), p3_magic);
+    const size_t p3_vbinds = p3_vs.vertex_bindings().size();
+    const size_t p3_tbinds = p3_vs.texture_bindings().size();
+    REXLOG_INFO("[highcut-P3] draw#{}: ucode_dwords={} reg_count={} vfetch_bindings={} "
+                "tex_bindings={} ok={} is_valid={} spirv_bytes={}",
+                p3_idx, p3_vs.ucode_dword_count(), p3_reg_count, p3_vbinds, p3_tbinds, p3_ok,
+                p3_tr->is_valid(), p3_bin.size());
     if (p3_tr->is_valid() && !p3_bin.empty()) {
-      if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
+      char p3_path[64];
+      std::snprintf(p3_path, sizeof(p3_path), "highcut_p3_vs_%03d.spv", p3_idx);
+      if (std::FILE* p3_f = std::fopen(p3_path, "wb")) {
         std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
         std::fclose(p3_f);
-        REXLOG_INFO("[highcut-P3] wrote {} bytes to highcut_p3_vs.spv (cwd) for spirv-val",
-                    p3_bin.size());
       }
-      // C-2: hand the SPIR-V to the plume Vulkan thread, which creates a shader module from it
-      // (the translate->plume shader bridge). No-op unless NHL_HIGHCUT_PRESENT runs the plume
-      // thread; the bytes are just dropped otherwise.
-      HighcutPublishTranslatedVS(p3_bin.data(), p3_bin.size());
+      // Selected draw (default 0) also goes to highcut_p3_vs.spv + the plume bridge.
+      static const int p3_sel = []() {
+        const char* s = std::getenv("NHL_HIGHCUT_XLAT_DRAW");
+        return s ? int(std::strtol(s, nullptr, 10)) : 0;
+      }();
+      if (p3_idx == p3_sel) {
+        if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
+          std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
+          std::fclose(p3_f);
+        }
+        HighcutPublishTranslatedVS(p3_bin.data(), p3_bin.size());
+        REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv + plume bridge", p3_idx);
+      }
+    }
     }
   }
 
