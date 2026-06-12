@@ -221,9 +221,18 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     the 460,800 half. Validation-clean. **C-3 (one real decoded guest draw, rendered correctly) is
     COMPLETE.**
 
-- **C-4 — textures (NEXT).** The C-3 draw has no textures (tex_bindings=0). Find a textured menu
-  draw (tex_bindings>0), translate its PS too, untile the guest texture (Xenos tiled → linear) into a
-  plume texture, bind sampler+SRV, render textured. Then C-5 (full frame), C-6 (takeover).
+- **C-4 — textures (STARTED 2026-06-12: target identified).** The survey now skips trivial
+  boot-overlay draws (only translates draws with a vfetch VS or a textured PS) and reports the PS
+  texture-binding count. In live mode it found **textured draws** — e.g. draw#22/#26/#30 have
+  `vfetch_bindings=1` + `ps_tex=1` (a real textured menu element; VS 8528 B). That is the C-4 render
+  target (select via `NHL_HIGHCUT_XLAT_DRAW`).
+  - **C-4 REMAINING (a large milestone):** (1) translate the PIXEL shader too (currently only the VS
+    is dumped; the textured PS samples a texture); (2) reflect the PS's texture + sampler descriptor
+    sets; (3) **untile the guest texture** (Xenos tiled → linear) into a plume texture — the hard
+    part (tiling/addressing math); the texture fetch constant (6-dword, the texture slot in
+    `regs[0x4800+slot*6]`) gives base/format/size; (4) create the plume texture + sampler + SRV,
+    bind them to the PS descriptor sets; (5) build a pipeline with VS + real PS + the full layout and
+    render textured. Then C-5 (full frame), C-6 (takeover).
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

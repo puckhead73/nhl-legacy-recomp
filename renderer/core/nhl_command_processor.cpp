@@ -1557,10 +1557,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // the existing C-2/C-3 path. Select which draw the plume bridge gets via NHL_HIGHCUT_XLAT_DRAW.
   bool p3_dump_data = false;  // C-3b.2: dump this draw's data packet (set when it's the selected draw)
   static std::atomic<int> highcut_p3_count{0};
-  constexpr int kP3MaxDraws = 24;
+  constexpr int kP3MaxDraws = 32;
   if (std::getenv("NHL_HIGHCUT_XLAT_TEST")) {
-    const int p3_idx = highcut_p3_count.fetch_add(1);
-    if (p3_idx < kP3MaxDraws) {
+    // C-4: only survey INTERESTING draws (a vfetch VS or a textured PS) — skip the many trivial
+    // boot-overlay draws so textured menu draws are reached. (Bindings come from the SDK's shader
+    // analysis, no translation needed for the pre-check.)
+    const bool p3_interesting =
+        (beta_current_vs_ && !beta_current_vs_->vertex_bindings().empty()) ||
+        (beta_current_ps_ && !beta_current_ps_->texture_bindings().empty());
+    const int p3_idx = p3_interesting ? highcut_p3_count.fetch_add(1) : -1;
+    if (p3_idx >= 0 && p3_idx < kP3MaxDraws) {
     namespace rg = rex::graphics;
     rg::SpirvShader p3_vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
                           beta_current_vs_->ucode_dwords(),
@@ -1596,11 +1602,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     const bool p3_ok = p3_xlat.TranslateAnalyzedShader(*p3_tr);
     const auto& p3_bin = p3_tr->translated_binary();
     const size_t p3_vbinds = p3_vs.vertex_bindings().size();
-    const size_t p3_tbinds = p3_vs.texture_bindings().size();
+    const size_t p3_vs_tex = p3_vs.texture_bindings().size();
+    // C-4: textures live in the PIXEL shader — report its texture-binding count so a textured menu
+    // draw can be found (the boot-overlay draws have none).
+    const size_t p3_ps_tex = beta_current_ps_ ? beta_current_ps_->texture_bindings().size() : 0;
     REXLOG_INFO("[highcut-P3] draw#{}: ucode_dwords={} reg_count={} vfetch_bindings={} "
-                "tex_bindings={} ok={} is_valid={} spirv_bytes={}",
-                p3_idx, p3_vs.ucode_dword_count(), p3_reg_count, p3_vbinds, p3_tbinds, p3_ok,
-                p3_tr->is_valid(), p3_bin.size());
+                "vs_tex={} ps_tex={} ok={} is_valid={} spirv_bytes={}",
+                p3_idx, p3_vs.ucode_dword_count(), p3_reg_count, p3_vbinds, p3_vs_tex, p3_ps_tex,
+                p3_ok, p3_tr->is_valid(), p3_bin.size());
     if (p3_tr->is_valid() && !p3_bin.empty()) {
       char p3_path[64];
       std::snprintf(p3_path, sizeof(p3_path), "highcut_p3_vs_%03d.spv", p3_idx);
