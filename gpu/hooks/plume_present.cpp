@@ -36,6 +36,7 @@
 
 #include <rex/logging.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -125,6 +126,18 @@ struct PlumeCtx {
     std::unique_ptr<RenderBuffer> xlatCounterBuf;
     std::unique_ptr<RenderDescriptorSet> xlatSet2;
     int xlatCounterReadsLeft = 4;  // read the count for the first few frames, then stop
+    // C-4: the TRANSLATED guest pixel shader + its sampled texture(s), rendered over the C-3 solid
+    // draw (the solid pass still writes the frag counter as the geometry proof; this pass samples
+    // the real texture for the visual proof). Built from the v2 draw packet's PS SPIR-V + textures.
+    std::unique_ptr<RenderShader> xlatTexPS;
+    std::unique_ptr<RenderPipelineLayout> xlatTexLayout;
+    std::unique_ptr<RenderPipeline> xlatTexPipeline;
+    std::unique_ptr<RenderBuffer> xlatVsFloatBuf, xlatPsFloatBuf;
+    std::vector<std::unique_ptr<RenderTexture>> xlatTextures;
+    std::vector<std::unique_ptr<RenderTextureView>> xlatTexViews;
+    std::unique_ptr<RenderSampler> xlatSampler;
+    std::unique_ptr<RenderDescriptorSet> xlatTexSet0, xlatTexSet1, xlatTexSet3;
+    bool xlatTexDrawReady = false;
     uint64_t frame = 0;
 };
 
@@ -251,6 +264,208 @@ bool Init(PlumeCtx& c) {
     }
     REXLOG_INFO("[highcut-plume] device + swapchain ready: {}x{}, {} buffers",
                 c.swap->getWidth(), c.swap->getHeight(), c.swap->getTextureCount());
+    return true;
+}
+
+// C-4: build the textured-draw pipeline from the v2 draw packet — the TRANSLATED guest PIXEL
+// shader plus its sampled guest texture(s) — reusing the C-3 constant/shared buffers. Renders the
+// real menu element textured (over the C-3 solid+counter pass). Returns true when ready. Requires
+// the C-3 buffers (xlatSharedBuf/Sys/Bool/Fetch) to already exist + be filled. Safe to call when
+// the packet has no PS (returns false; the C-3 solid path is unaffected). SPIRV backend only.
+bool CreateTexturedDraw(PlumeCtx& c) {
+    if (!c.xlatVS || !c.xlatSharedBuf || !c.xlatSysBuf || !c.xlatBoolBuf || !c.xlatFetchBuf)
+        return false;
+    const RenderShaderFormat fmt = c.ri->getCapabilities().shaderFormat;
+    if (fmt != RenderShaderFormat::SPIRV) return false;
+
+    FILE* pf = std::fopen("highcut_p3_draw.bin", "rb");
+    if (!pf) return false;
+    nhl::highcut::DrawPacketHeader hdr{};
+    if (std::fread(&hdr, 1, sizeof(hdr), pf) != sizeof(hdr) ||
+        hdr.magic != nhl::highcut::kDrawPacketMagic ||
+        hdr.version != nhl::highcut::kDrawPacketVersion || hdr.ps_spirv_bytes == 0 ||
+        hdr.texture_count == 0) {
+        std::fclose(pf);
+        return false;  // not a C-4 packet (VS-only / older version) — leave the C-3 path alone
+    }
+    // Skip fetch/sys/shared (already in the C-3 buffers); then read the rest in packet order.
+    std::fseek(pf, long(hdr.fetch_bytes + hdr.sys_bytes + hdr.shared_bytes), SEEK_CUR);
+    auto readVec = [&](uint32_t n) {
+        std::vector<uint8_t> v(n);
+        if (n && std::fread(v.data(), 1, n, pf) != n) v.clear();
+        return v;
+    };
+    std::vector<uint8_t> boolBlob = readVec(hdr.bool_bytes);
+    std::vector<uint8_t> vsFloat = readVec(hdr.vs_float_bytes);
+    std::vector<uint8_t> psFloat = readVec(hdr.ps_float_bytes);
+    std::vector<uint8_t> psSpirv = readVec(hdr.ps_spirv_bytes);
+    struct TexLoad { nhl::highcut::TexturePacketDesc d; std::vector<uint8_t> blob; };
+    std::vector<TexLoad> texs;
+    for (uint32_t i = 0; i < hdr.texture_count; ++i) {
+        TexLoad t{};
+        if (std::fread(&t.d, 1, sizeof(t.d), pf) != sizeof(t.d)) { texs.clear(); break; }
+        t.blob = readVec(t.d.data_bytes);
+        if (t.d.data_bytes && t.blob.empty()) { texs.clear(); break; }
+        texs.push_back(std::move(t));
+    }
+    std::fclose(pf);
+    if (psSpirv.empty() || texs.empty()) return false;
+
+    // Refresh the C-3 bool/loop UBO with the real constants (it was zero-filled at C-3b.1). 256 =
+    // the C-3 kBoolSize allocation.
+    if (!boolBlob.empty()) {
+        if (void* p = c.xlatBoolBuf->map()) {
+            std::memset(p, 0, 256);
+            std::memcpy(p, boolBlob.data(), std::min<size_t>(boolBlob.size(), 256));
+            c.xlatBoolBuf->unmap();
+        }
+    }
+    // VS / PS packed float-constant UBOs (set 1 bindings 1 and 2). >= 16 B so the CBV is valid.
+    auto mkFloatUbo = [&](const std::vector<uint8_t>& src) {
+        const uint64_t sz = std::max<uint64_t>(src.size(), 16);
+        auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
+        if (b) {
+            void* p = b->map();
+            std::memset(p, 0, sz);
+            if (!src.empty()) std::memcpy(p, src.data(), src.size());
+            b->unmap();
+        }
+        return b;
+    };
+    c.xlatVsFloatBuf = mkFloatUbo(vsFloat);
+    c.xlatPsFloatBuf = mkFloatUbo(psFloat);
+    if (!c.xlatVsFloatBuf || !c.xlatPsFloatBuf) return false;
+
+    // PS shader module.
+    c.xlatTexPS = c.device->createShader(psSpirv.data(), psSpirv.size(), "main", fmt);
+    if (!c.xlatTexPS) { REXLOG_ERROR("[highcut-C4] PS shader module create failed"); return false; }
+
+    // Create + upload each texture via a transient command list (the frame's c.cmd is mid-record).
+    auto mapFmt = [](uint32_t f) -> RenderFormat {
+        switch (f) {
+            case nhl::highcut::kTexBC1: return RenderFormat::BC1_UNORM;
+            case nhl::highcut::kTexBC2: return RenderFormat::BC2_UNORM;
+            case nhl::highcut::kTexBC3: return RenderFormat::BC3_UNORM;
+            default: return RenderFormat::R8G8B8A8_UNORM;
+        }
+    };
+    auto upCmd = c.queue->createCommandList();
+    auto upFence = c.device->createCommandFence();
+    std::vector<std::unique_ptr<RenderBuffer>> stagings;
+    c.xlatTextures.clear();
+    c.xlatTexViews.clear();
+    upCmd->begin();
+    for (auto& t : texs) {
+        const RenderFormat rf = mapFmt(t.d.tex_format);
+        auto tex = c.device->createTexture(RenderTextureDesc::Texture2D(t.d.width, t.d.height, 1, rf));
+        auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.blob.size()));
+        if (staging) { void* p = staging->map(); std::memcpy(p, t.blob.data(), t.blob.size()); staging->unmap(); }
+        if (tex && staging) {
+            upCmd->barriers(RenderBarrierStage::COPY,
+                            RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
+            RenderTextureCopyLocation dst = RenderTextureCopyLocation::Subresource(tex.get(), 0, 0);
+            // rowWidth is in PIXELS (plume derives the byte pitch from format) — our blob is tight
+            // (row_pitch = blocks_x * bytes_per_block), which matches width texels for both 8888/BCn.
+            RenderTextureCopyLocation src = RenderTextureCopyLocation::PlacedFootprint(
+                staging.get(), rf, t.d.width, t.d.height, 1, t.d.width, 0);
+            upCmd->copyTextureRegion(dst, src, 0, 0, 0, nullptr);
+            upCmd->barriers(RenderBarrierStage::GRAPHICS,
+                            RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
+        }
+        auto view = tex ? tex->createTextureView(RenderTextureViewDesc::Texture2D(rf)) : nullptr;
+        c.xlatTextures.push_back(std::move(tex));
+        c.xlatTexViews.push_back(std::move(view));
+        stagings.push_back(std::move(staging));
+    }
+    upCmd->end();
+    {
+        const RenderCommandList* cl = upCmd.get();
+        c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, upFence.get());
+        c.queue->waitForCommandFence(upFence.get());
+    }
+
+    // Sampler (bring-up: linear + clamp; honor the fetch constant's filter/clamp later).
+    RenderSamplerDesc sd;
+    sd.minFilter = RenderFilter::LINEAR;
+    sd.magFilter = RenderFilter::LINEAR;
+    sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
+    c.xlatSampler = c.device->createSampler(sd);
+    if (!c.xlatSampler) return false;
+
+    const uint32_t nTex = hdr.texture_count;
+    const uint32_t nSamp = hdr.ps_sampler_count ? hdr.ps_sampler_count : 1u;
+
+    // Pipeline layout = the union of the VS sets + the PS texture/sampler set (the SPIR-V hardcodes
+    // these set numbers; the translator puts pixel textures on set 3, samplers after the images):
+    //   set 0: shared memory (byte-address buffer @ 0)
+    //   set 1: constants @ 0(sys),1(vs-float),2(ps-float),3(bool/loop),4(fetch) — superset; an
+    //          unused binding bound to a valid buffer is allowed
+    //   set 2: vertex textures — EMPTY here (placeholder so pixel textures land on set 3)
+    //   set 3: PS textures @ 0..nTex-1, PS samplers @ nTex..nTex+nSamp-1
+    auto buildSet1 = [](RenderDescriptorSetBuilder& b) {
+        b.begin();
+        for (uint32_t i = 0; i <= 4; ++i) b.addConstantBuffer(i);
+        b.end();
+    };
+    auto buildSet3 = [&](RenderDescriptorSetBuilder& b) {
+        b.begin();
+        for (uint32_t i = 0; i < nTex; ++i) b.addTexture(i);
+        for (uint32_t i = 0; i < nSamp; ++i) b.addSampler(nTex + i);
+        b.end();
+    };
+    RenderDescriptorSetBuilder ls0, ls1, ls2, ls3;
+    ls0.begin(); ls0.addByteAddressBuffer(0); ls0.end();
+    buildSet1(ls1);
+    ls2.begin(); ls2.end();  // empty vertex-texture set
+    buildSet3(ls3);
+    RenderPipelineLayoutBuilder lb;
+    lb.begin(/*isLocal=*/false, /*allowInputLayout=*/false);
+    lb.addDescriptorSet(ls0);
+    lb.addDescriptorSet(ls1);
+    lb.addDescriptorSet(ls2);
+    lb.addDescriptorSet(ls3);
+    lb.end();
+    c.xlatTexLayout = lb.create(c.device.get());
+    if (!c.xlatTexLayout) { REXLOG_ERROR("[highcut-C4] textured pipeline layout create failed"); return false; }
+
+    // Descriptor sets 0/1/3 (set 2 is empty — no object created/bound).
+    { RenderDescriptorSetBuilder b; b.begin(); b.addByteAddressBuffer(0); b.end(); c.xlatTexSet0 = b.create(c.device.get()); }
+    { RenderDescriptorSetBuilder b; buildSet1(b); c.xlatTexSet1 = b.create(c.device.get()); }
+    { RenderDescriptorSetBuilder b; buildSet3(b); c.xlatTexSet3 = b.create(c.device.get()); }
+    if (!c.xlatTexSet0 || !c.xlatTexSet1 || !c.xlatTexSet3) {
+        REXLOG_ERROR("[highcut-C4] textured descriptor set create failed");
+        return false;
+    }
+    c.xlatTexSet0->setBuffer(0, c.xlatSharedBuf.get(), 1u << 16);
+    c.xlatTexSet1->setBuffer(0, c.xlatSysBuf.get(), 2048);
+    c.xlatTexSet1->setBuffer(1, c.xlatVsFloatBuf.get(), std::max<uint64_t>(vsFloat.size(), 16));
+    c.xlatTexSet1->setBuffer(2, c.xlatPsFloatBuf.get(), std::max<uint64_t>(psFloat.size(), 16));
+    c.xlatTexSet1->setBuffer(3, c.xlatBoolBuf.get(), 256);
+    c.xlatTexSet1->setBuffer(4, c.xlatFetchBuf.get(), 768);
+    for (uint32_t i = 0; i < nTex && i < c.xlatTextures.size(); ++i) {
+        if (c.xlatTextures[i])
+            c.xlatTexSet3->setTexture(i, c.xlatTextures[i].get(), RenderTextureLayout::SHADER_READ,
+                                      c.xlatTexViews[i].get());
+    }
+    for (uint32_t i = 0; i < nSamp; ++i) c.xlatTexSet3->setSampler(nTex + i, c.xlatSampler.get());
+
+    auto topo = (hdr.topology == nhl::highcut::kTopoTriangleStrip)
+                    ? RenderPrimitiveTopology::TRIANGLE_STRIP
+                    : RenderPrimitiveTopology::TRIANGLE_LIST;
+    RenderGraphicsPipelineDesc pd;
+    pd.pipelineLayout = c.xlatTexLayout.get();
+    pd.vertexShader = c.xlatVS.get();
+    pd.pixelShader = c.xlatTexPS.get();
+    pd.renderTargetFormat[0] = kSwapFormat;
+    pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    pd.renderTargetCount = 1;
+    pd.primitiveTopology = topo;
+    c.xlatTexPipeline = c.device->createGraphicsPipeline(pd);
+    if (!c.xlatTexPipeline) { REXLOG_ERROR("[highcut-C4] textured graphics pipeline create failed"); return false; }
+
+    c.xlatTexDrawReady = true;
+    REXLOG_INFO("[highcut-C4] textured pipeline READY: nTex={} nSamp={} ps_spirv={} verts={} topo={}",
+                nTex, nSamp, uint32_t(psSpirv.size()), c.xlatVertexCount, hdr.topology);
     return true;
 }
 
@@ -443,6 +658,10 @@ void RenderClear(PlumeCtx& c) {
                                 } else {
                                     REXLOG_INFO("[highcut-C3b] no draw packet — buffers zeroed (mechanics only)");
                                 }
+                                // C-4: if the packet carries a translated PS + texture(s), build the
+                                // textured pipeline (samples the real guest texture). No-op for a
+                                // VS-only (C-3) packet — the solid+counter path above is unaffected.
+                                CreateTexturedDraw(c);
                             } else {
                                 REXLOG_ERROR("[highcut-C3b] descriptor buffer/set creation failed");
                             }
@@ -486,6 +705,19 @@ void RenderClear(PlumeCtx& c) {
         c.cmd->setGraphicsDescriptorSet(c.xlatSet0.get(), 0);
         c.cmd->setGraphicsDescriptorSet(c.xlatSet1.get(), 1);
         c.cmd->setGraphicsDescriptorSet(c.xlatSet2.get(), 2);
+        c.cmd->drawInstanced(c.xlatVertexCount, 1, 0, 0);
+    }
+
+    // C-4: draw the same geometry with the TRANSLATED guest PIXEL shader, sampling the real guest
+    // texture — over the C-3 solid pass (whose frag counter already proved the geometry). This is
+    // the textured menu element; bind sets 0 (shared) / 1 (constants) / 3 (textures+samplers). Set
+    // 2 (vertex textures) is an empty layout slot, so nothing is bound there.
+    if (c.xlatTexDrawReady) {
+        c.cmd->setGraphicsPipelineLayout(c.xlatTexLayout.get());
+        c.cmd->setPipeline(c.xlatTexPipeline.get());
+        c.cmd->setGraphicsDescriptorSet(c.xlatTexSet0.get(), 0);
+        c.cmd->setGraphicsDescriptorSet(c.xlatTexSet1.get(), 1);
+        c.cmd->setGraphicsDescriptorSet(c.xlatTexSet3.get(), 3);
         c.cmd->drawInstanced(c.xlatVertexCount, 1, 0, 0);
     }
 

@@ -226,13 +226,40 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
   texture-binding count. In live mode it found **textured draws** — e.g. draw#22/#26/#30 have
   `vfetch_bindings=1` + `ps_tex=1` (a real textured menu element; VS 8528 B). That is the C-4 render
   target (select via `NHL_HIGHCUT_XLAT_DRAW`).
-  - **C-4 REMAINING (a large milestone):** (1) translate the PIXEL shader too (currently only the VS
-    is dumped; the textured PS samples a texture); (2) reflect the PS's texture + sampler descriptor
-    sets; (3) **untile the guest texture** (Xenos tiled → linear) into a plume texture — the hard
-    part (tiling/addressing math); the texture fetch constant (6-dword, the texture slot in
-    `regs[0x4800+slot*6]`) gives base/format/size; (4) create the plume texture + sampler + SRV,
-    bind them to the PS descriptor sets; (5) build a pipeline with VS + real PS + the full layout and
-    render textured. Then C-5 (full frame), C-6 (takeover).
+  - **C-4 IMPLEMENTED (2026-06-12) — build-clean, runtime-verify pending.** The full textured path
+    is coded + compiles (`_build_beta.bat` → BUILD_EXIT=0); what remains is a LIVE run that reaches a
+    textured menu draw to produce the v2 packet + visually confirm the sample. What was built:
+    - **PS translation (CP side, `nhl_command_processor.cpp` survey block).** For the selected draw,
+      the VS AND PS are re-translated with the SHARED interpolator mask (`vs_writes & ps_reads`, set
+      on `SpirvShaderTranslator::Modification.{vertex,pixel}.interpolator_mask`; PS also gets
+      `param_gen_*` from `param_gen_pos`). Both dump (`highcut_p3_vs.spv` masked, `highcut_p3_ps.spv`).
+    - **Descriptor reflection.** The PS's texture/sampler interface comes from `p3_ps`'s
+      `GetTextureBindingsAfterTranslation()` (→ `SpirvShader::TextureBinding{fetch_constant,dimension,
+      is_signed}`) + `GetSamplerBindingsAfterTranslation()`. Translator descriptor scheme (from
+      `spirv_translator.h`): set0=shared-mem, set1=constants{0 sys,1 vs-float,2 ps-float,3 bool/loop,
+      4 fetch}, set2=vertex-tex, **set3=pixel textures(0..N-1) then samplers(N..N+M-1)**.
+    - **Untile (CP side).** Per PS texture binding, parse the 6-dword `xe_gpu_texture_fetch_t` at
+      `regs[0x4800+slot*6]`, untile 2D 8888/DXT1/2_3/4_5 via `texture_util::GetTiledOffset2D` in BLOCK
+      space (`FormatInfo` block dims/bpb), endian-swap (`xenos::GpuSwap`; 32-bit for 8888, 16-bit for
+      BCn), → a LINEAR blob. Exotic/non-2D/absent → 2×2 magenta placeholder (path still runs).
+    - **v2 packet (`highcut_draw_packet.h`).** Adds bool/loop, packed VS+PS float constants (packed
+      per `GetPackedFloatConstantIndex`, matching the SPIR-V UBO), PS SPIR-V blob, and N
+      `TexturePacketDesc` + untiled texel blobs (+ `ps_sampler_count`). SystemConstants now carries
+      **`color_exp_bias = exp2(RB_COLOR_INFO.color_exp_bias)`** (else PS `oC0 = color*exp_bias` → all
+      black) + alpha-pass-all (else the PS kills every fragment).
+    - **Plume side (`plume_present.cpp::CreateTexturedDraw`).** Loads the v2 packet, creates the PS
+      module, creates+uploads each plume `RenderTexture` (staging→`copyTextureRegion`, COPY_DEST→
+      SHADER_READ) + a `RenderTextureView` + a LINEAR/CLAMP sampler, builds the superset pipeline
+      layout (sets 0/1/2-empty/3), fills set1 floats (binding 1/2) + refreshes bool, binds set3
+      textures+sampler, creates the VS+PS pipeline, and draws **over** the C-3 solid+counter pass (so
+      the counter still proves geometry; the textured pass is the visual). Gated `NHL_HIGHCUT_C3`.
+    - **Verify recipe.** Dump (live, reach a textured menu draw):
+      `NHL_BACKEND=beta NHL_BETA_TAKEOVER=1 NHL_BETA_LIVE=1 NHL_HIGHCUT_XLAT_TEST=1 NHL_HIGHCUT_XLAT_DRAW=22`
+      → writes `highcut_p3_{vs,ps}.spv` + `highcut_p3_draw.bin`. Render:
+      `NHL_HIGHCUT_PRESENT=1 NHL_HIGHCUT_C3=full` (add the validation layer env). Done = textured menu
+      element visible in the plume window + 0 VUID. **Open risks** (no test feedback yet): 8888
+      channel order (R8G8B8A8 vs swap to BGRA) + the fetch-constant swizzle are unapplied; DXT endian
+      is best-effort; param-gen interpolator pairing; the empty set2 layout slot. Then C-5, C-6.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest

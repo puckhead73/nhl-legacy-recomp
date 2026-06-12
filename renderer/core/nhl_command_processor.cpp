@@ -28,6 +28,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include "gpu/hooks/highcut_draw_packet.h"  // C-3b.2 draw-data bridge
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/pipeline/texture/info.h>  // C-4: FormatInfo (block dims / bytes-per-block)
 #include <rex/string/buffer.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -1556,6 +1557,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // is procedurally trivial (no vfetch -> degenerate point). highcut_p3_vs.spv stays = draw 0 for
   // the existing C-2/C-3 path. Select which draw the plume bridge gets via NHL_HIGHCUT_XLAT_DRAW.
   bool p3_dump_data = false;  // C-3b.2: dump this draw's data packet (set when it's the selected draw)
+  // C-4: the selected draw's translated PIXEL shader + its texture/sampler interface, captured in
+  // the survey block and consumed by the packet dump below (after vpi). Empty => VS-only C-3 path.
+  std::vector<uint8_t> p3_ps_spirv;
+  std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
+  uint32_t p3_ps_sampler_count = 0;
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
   if (std::getenv("NHL_HIGHCUT_XLAT_TEST")) {
@@ -1617,19 +1623,74 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
         std::fclose(p3_f);
       }
-      // Selected draw (default 0) also goes to highcut_p3_vs.spv + the plume bridge.
+      // Selected draw (default 0) feeds the plume bridge. C-4: re-translate the VS AND the PS with
+      // the SHARED interpolator mask (the AND of VS-writes & PS-reads computed above) so their
+      // SPIR-V I/O signatures match — otherwise pipeline linking on plume fails. The numbered
+      // survey dump above keeps the default-mask VS (unchanged); only the bridge gets the masked
+      // pair. With no PS bound, the bridge still gets the masked VS (the solid-PS C-3 path).
       static const int p3_sel = []() {
         const char* s = std::getenv("NHL_HIGHCUT_XLAT_DRAW");
         return s ? int(std::strtol(s, nullptr, 10)) : 0;
       }();
       if (p3_idx == p3_sel) {
+        // VS, re-translated with the shared interpolator mask (a distinct modification value ->
+        // its own translation slot; reuses p3_xlat, which is stateless between translations).
+        rg::SpirvShaderTranslator::Modification vs_modw(
+            p3_xlat.GetDefaultVertexShaderModification(p3_reg_count, p3_hvst));
+        vs_modw.vertex.interpolator_mask = interpolator_mask;
+        bool vs_new = false;
+        rg::Shader::Translation* vs_trw = p3_vs.GetOrCreateTranslation(vs_modw.value, &vs_new);
+        const bool vs_okw = p3_xlat.TranslateAnalyzedShader(*vs_trw);
+        const auto& vs_binw =
+            (vs_okw && vs_trw->is_valid() && !vs_trw->translated_binary().empty())
+                ? vs_trw->translated_binary()
+                : p3_bin;  // fall back to the default-mask VS if the masked retranslate failed
         if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
-          std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
+          std::fwrite(vs_binw.data(), 1, vs_binw.size(), p3_f);
           std::fclose(p3_f);
         }
-        HighcutPublishTranslatedVS(p3_bin.data(), p3_bin.size());
-        p3_dump_data = true;  // C-3b.2: also dump this draw's data packet (below, after vpi)
-        REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv + plume bridge", p3_idx);
+        HighcutPublishTranslatedVS(vs_binw.data(), vs_binw.size());
+        p3_dump_data = true;  // also dump this draw's data packet (below, after vpi)
+        REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv (masked=0x{:X}) + bridge",
+                    p3_idx, interpolator_mask);
+        // PS (C-4): translate the textured pixel shader from a FRESH SpirvShader so its SPIR-V and
+        // its texture/sampler bindings come from one analysis, matching the dumped module exactly.
+        if (eff_ps) {
+          rg::SpirvShader p3_ps(eff_ps->type(), eff_ps->ucode_data_hash(), eff_ps->ucode_dwords(),
+                                eff_ps->ucode_dword_count(), std::endian::native);
+          rex::string::StringBuffer ps_disasm;
+          p3_ps.AnalyzeUcode(ps_disasm);
+          const uint32_t ps_num_reg = register_file_->Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg;
+          const uint32_t ps_reg_count = p3_ps.GetDynamicAddressableRegisterCount(ps_num_reg);
+          rg::SpirvShaderTranslator::Modification ps_modw(
+              p3_xlat.GetDefaultPixelShaderModification(ps_reg_count));
+          ps_modw.pixel.interpolator_mask = interpolator_mask;
+          // Param-gen: if the PS consumes the generated pixel position/point input (param_gen_pos
+          // valid), enable it at that interpolator slot so the I/O layout matches the VS pairing.
+          if (param_gen_pos != UINT32_MAX) {
+            ps_modw.pixel.param_gen_enable = 1;
+            ps_modw.pixel.param_gen_interpolator = param_gen_pos & 0xF;
+            ps_modw.pixel.param_gen_point =
+                primitive_type == xenos::PrimitiveType::kPointList ? 1 : 0;
+          }
+          bool ps_new = false;
+          rg::Shader::Translation* ps_trw = p3_ps.GetOrCreateTranslation(ps_modw.value, &ps_new);
+          const bool ps_okw = p3_xlat.TranslateAnalyzedShader(*ps_trw);
+          const auto& ps_bin = ps_trw->translated_binary();
+          REXLOG_INFO("[highcut-P3] PS translate: ok={} valid={} bytes={} tex_binds={} samp_binds={}",
+                      ps_okw, ps_trw->is_valid(), ps_bin.size(),
+                      p3_ps.GetTextureBindingsAfterTranslation().size(),
+                      p3_ps.GetSamplerBindingsAfterTranslation().size());
+          if (ps_okw && ps_trw->is_valid() && !ps_bin.empty()) {
+            p3_ps_spirv.assign(ps_bin.begin(), ps_bin.end());
+            p3_ps_texbinds = p3_ps.GetTextureBindingsAfterTranslation();
+            p3_ps_sampler_count = uint32_t(p3_ps.GetSamplerBindingsAfterTranslation().size());
+            if (std::FILE* psf = std::fopen("highcut_p3_ps.spv", "wb")) {
+              std::fwrite(ps_bin.data(), 1, ps_bin.size(), psf);
+              std::fclose(psf);
+            }
+          }
+        }
       }
     }
     }
@@ -1823,8 +1884,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       // Rebase: zero the address field (bits 2..31) of dword_0 in the UBO copy, keep type bits.
       fetch_blob[vb.fetch_constant * 2] &= 0x3u;
     }
-    // System constants (SPIR-V layout): NDC transform + vertex index params. flags=0 (no
-    // perspective divide) is the 2D-menu starting point; iterate if geometry is wrong.
+    // System constants (SPIR-V layout): NDC transform + vertex index params + (C-4) the
+    // PS-critical fields. color_exp_bias MUST be set or the PS's final `oC0 = color * exp_bias`
+    // multiplies every pixel to 0 (the long-hunted all-black textured output); alpha test is set
+    // ALWAYS-PASS for bring-up (a disabled alpha test must pass all 3 comparisons, else the PS
+    // kills every fragment). flags otherwise 0 (no perspective divide) is the 2D-menu start.
     rg::SpirvShaderTranslator::SystemConstants spv_sys{};
     for (int i = 0; i < 3; ++i) {
       spv_sys.ndc_scale[i] = vpi.ndc_scale[i];
@@ -1834,9 +1898,132 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     spv_sys.vertex_index_endian = result.host_shader_index_endian;
     spv_sys.vertex_index_min = register_file_->Get<reg::VGT_MIN_VTX_INDX>().min_indx;
     spv_sys.vertex_index_max = register_file_->Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+    spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfLess |
+                     rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfEqual |
+                     rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfGreater;
+    {
+      const int32_t guest_exp_bias = register_file_->Get<reg::RB_COLOR_INFO>().color_exp_bias;
+      const float color_scale = std::exp2f(float(guest_exp_bias));
+      for (int i = 0; i < 4; ++i) spv_sys.color_exp_bias[i] = color_scale;
+    }
     // Shared-memory (vertex) bytes from guest RAM at the rebased range.
     const uint8_t* vtx_src =
         vtx_size ? memory_->TranslatePhysical<const uint8_t*>(vtx_base) : nullptr;
+
+    // Bool/loop constants (8 bool + 32 loop dwords at 0x4900) — the b/loop UBO (set1 binding 3).
+    const uint8_t* bool_src = reinterpret_cast<const uint8_t*>(&regs[0x4900]);
+    constexpr uint32_t kBoolLoopBytes = 40 * 4;
+
+    // Packed float constants (ascending storage index, matching GetPackedFloatConstantIndex). The
+    // PS reads its bank from register 0x4400 (c256+), the VS from 0x4000 (c0+).
+    auto pack_floats = [&](rg::Shader* sh, bool pixel) -> std::vector<uint8_t> {
+      std::vector<uint8_t> out;
+      if (!sh) return out;
+      const uint32_t reg_base = pixel ? 0x4400u : 0x4000u;
+      const auto& crm = sh->constant_register_map();
+      for (uint32_t i = 0; i < 4; ++i) {
+        uint64_t bits = crm.float_bitmap[i];
+        while (bits) {
+          const uint32_t s = i * 64u + uint32_t(std::countr_zero(bits));
+          bits &= bits - 1;
+          const uint8_t* src = reinterpret_cast<const uint8_t*>(&regs[reg_base + s * 4]);
+          out.insert(out.end(), src, src + 16);
+        }
+      }
+      return out;
+    };
+    const std::vector<uint8_t> vs_floats = pack_floats(beta_current_vs_, false);
+    const std::vector<uint8_t> ps_floats = pack_floats(eff_ps, true);
+
+    // C-4: untile each PS texture binding into a LINEAR blob + a TexturePacketDesc. Xenos textures
+    // are tiled in 32x32-block tiles; GetTiledOffset2D (the texture cache's own addresser) gives
+    // the per-block byte offset. Bring-up handles 2D 8888 + DXT1/2_3/4_5; anything else gets a 2x2
+    // magenta placeholder so the bind/sample path still runs (and is visibly wrong if reached).
+    std::vector<nhl::highcut::TexturePacketDesc> tex_descs;
+    std::vector<std::vector<uint8_t>> tex_blobs;
+    for (const auto& tb : p3_ps_texbinds) {
+      const uint32_t slot = tb.fetch_constant;
+      xenos::xe_gpu_texture_fetch_t tf{};
+      std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
+      nhl::highcut::TexturePacketDesc td{};
+      td.fetch_slot = slot;
+      td.is_signed = tb.is_signed ? 1u : 0u;
+      const uint32_t width = uint32_t(tf.size_2d.width) + 1;
+      const uint32_t height = uint32_t(tf.size_2d.height) + 1;
+      const xenos::TextureFormat fmt = tf.format;
+      const rg::FormatInfo* fi = rg::FormatInfo::Get(fmt);
+      uint32_t pfmt = UINT32_MAX;
+      switch (fmt) {
+        case xenos::TextureFormat::k_8_8_8_8: pfmt = nhl::highcut::kTexRGBA8; break;
+        case xenos::TextureFormat::k_DXT1:    pfmt = nhl::highcut::kTexBC1; break;
+        case xenos::TextureFormat::k_DXT2_3:  pfmt = nhl::highcut::kTexBC2; break;
+        case xenos::TextureFormat::k_DXT4_5:  pfmt = nhl::highcut::kTexBC3; break;
+        default: break;
+      }
+      const uint32_t tex_base = uint32_t(tf.base_address) << 12;
+      const bool ok2d = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked;
+      const uint8_t* guest =
+          (tex_base && memory_) ? memory_->TranslatePhysical<const uint8_t*>(tex_base) : nullptr;
+      if (pfmt == UINT32_MAX || !fi || !ok2d || !guest || !width || !height || width > 8192 ||
+          height > 8192) {
+        td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
+        td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4;
+        std::vector<uint8_t> blob(td.data_bytes);
+        for (size_t i = 0; i < blob.size(); i += 4) {
+          blob[i] = 255; blob[i + 1] = 0; blob[i + 2] = 255; blob[i + 3] = 255;  // magenta
+        }
+        REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 magenta",
+                    slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base);
+        tex_descs.push_back(td); tex_blobs.push_back(std::move(blob));
+        continue;
+      }
+      const uint32_t bw = fi->block_width, bh = fi->block_height, bpb = fi->bytes_per_block();
+      uint32_t bpb_log2 = 0;
+      for (uint32_t v = bpb; v > 1; v >>= 1) ++bpb_log2;
+      const uint32_t blocks_x = (width + bw - 1) / bw;
+      const uint32_t blocks_y = (height + bh - 1) / bh;
+      uint32_t pitch_texels = tf.pitch ? (uint32_t(tf.pitch) << 5) : ((width + 31u) & ~31u);
+      uint32_t pitch_blocks = pitch_texels / bw;
+      if (pitch_blocks < blocks_x) pitch_blocks = blocks_x;
+      std::vector<uint8_t> blob(size_t(blocks_y) * blocks_x * bpb);
+      for (uint32_t by = 0; by < blocks_y; ++by) {
+        for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+          size_t src;
+          if (tf.tiled) {
+            src = size_t(uint32_t(rg::texture_util::GetTiledOffset2D(
+                int32_t(bx), int32_t(by), pitch_blocks, bpb_log2)));
+          } else {
+            src = (size_t(by) * pitch_blocks + bx) * bpb;
+          }
+          std::memcpy(&blob[(size_t(by) * blocks_x + bx) * bpb], guest + src, bpb);
+        }
+      }
+      // Endian: 8888 -> per-texel 32-bit swap; BCn -> 16-bit swap (DXT endpoint/index words).
+      const xenos::Endian end = xenos::Endian(tf.endianness);
+      if (end != xenos::Endian::kNone) {
+        if (pfmt == nhl::highcut::kTexRGBA8) {
+          for (size_t i = 0; i + 4 <= blob.size(); i += 4) {
+            uint32_t v; std::memcpy(&v, &blob[i], 4);
+            v = xenos::GpuSwap(v, end);
+            std::memcpy(&blob[i], &v, 4);
+          }
+        } else {
+          for (size_t i = 0; i + 2 <= blob.size(); i += 2) {
+            uint16_t v; std::memcpy(&v, &blob[i], 2);
+            v = xenos::GpuSwap(v, end);
+            std::memcpy(&blob[i], &v, 2);
+          }
+        }
+      }
+      td.width = width; td.height = height; td.tex_format = pfmt;
+      td.row_pitch_bytes = blocks_x * bpb; td.data_bytes = uint32_t(blob.size());
+      REXLOG_INFO("[highcut-C4] tex slot={} {}x{} fmt={} pfmt={} tiled={} endian={} pitch_blk={} "
+                  "blob={} is_signed={}",
+                  slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
+                  pitch_blocks, td.data_bytes, td.is_signed);
+      tex_descs.push_back(td); tex_blobs.push_back(std::move(blob));
+    }
+
     REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
                 "index_count(param)={} idx_type={}",
                 uint32_t(result.guest_primitive_type), uint32_t(result.host_primitive_type),
@@ -1858,17 +2045,30 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.fetch_bytes = sizeof(fetch_blob);
     hdr.sys_bytes = sizeof(spv_sys);
     hdr.shared_bytes = vtx_src ? vtx_size : 0u;
+    hdr.bool_bytes = kBoolLoopBytes;
+    hdr.vs_float_bytes = uint32_t(vs_floats.size());
+    hdr.ps_float_bytes = uint32_t(ps_floats.size());
+    hdr.ps_spirv_bytes = uint32_t(p3_ps_spirv.size());
+    hdr.texture_count = uint32_t(tex_descs.size());
+    hdr.ps_sampler_count = p3_ps_sampler_count;
     if (std::FILE* pf = std::fopen("highcut_p3_draw.bin", "wb")) {
       std::fwrite(&hdr, 1, sizeof(hdr), pf);
       std::fwrite(fetch_blob, 1, sizeof(fetch_blob), pf);
       std::fwrite(&spv_sys, 1, sizeof(spv_sys), pf);
       if (hdr.shared_bytes) std::fwrite(vtx_src, 1, hdr.shared_bytes, pf);
+      std::fwrite(bool_src, 1, kBoolLoopBytes, pf);
+      if (hdr.vs_float_bytes) std::fwrite(vs_floats.data(), 1, hdr.vs_float_bytes, pf);
+      if (hdr.ps_float_bytes) std::fwrite(ps_floats.data(), 1, hdr.ps_float_bytes, pf);
+      if (hdr.ps_spirv_bytes) std::fwrite(p3_ps_spirv.data(), 1, hdr.ps_spirv_bytes, pf);
+      for (size_t i = 0; i < tex_descs.size(); ++i) {
+        std::fwrite(&tex_descs[i], 1, sizeof(tex_descs[i]), pf);
+        std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
+      }
       std::fclose(pf);
-      REXLOG_INFO("[highcut-C3b2] dumped draw packet: verts={} topo={} vtx_base=0x{:X} "
-                  "vtx_size={} ndc_scale=({},{}) ndc_offset=({},{}) base_idx={}",
-                  hdr.vertex_count, hdr.topology, vtx_base, vtx_size, spv_sys.ndc_scale[0],
-                  spv_sys.ndc_scale[1], spv_sys.ndc_offset[0], spv_sys.ndc_offset[1],
-                  spv_sys.vertex_base_index);
+      REXLOG_INFO("[highcut-C4] dumped draw packet v2: verts={} topo={} vtx_size={} bool={} "
+                  "vs_float={} ps_float={} ps_spirv={} textures={}",
+                  hdr.vertex_count, hdr.topology, vtx_size, hdr.bool_bytes, hdr.vs_float_bytes,
+                  hdr.ps_float_bytes, hdr.ps_spirv_bytes, hdr.texture_count);
     }
   }
 
