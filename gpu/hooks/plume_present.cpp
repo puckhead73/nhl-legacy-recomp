@@ -48,6 +48,7 @@
 
 #include "plume_render_interface.h"
 #include "plume_render_interface_builders.h"  // C-3a: descriptor-set / pipeline-layout builders
+#include "highcut_draw_packet.h"              // C-3b.2: decoded-draw data bridge
 
 // High-cut C-1: embedded bring-up triangle shaders (compiled by plume's shader cmake into
 // ${CMAKE_BINARY_DIR}/shaders, which is on the include path). SPIRV for the Vulkan backend
@@ -119,6 +120,7 @@ struct PlumeCtx {
     std::unique_ptr<RenderBuffer> xlatSysBuf, xlatBoolBuf, xlatFetchBuf, xlatSharedBuf;
     std::unique_ptr<RenderDescriptorSet> xlatSet0, xlatSet1;
     bool xlatDrawReady = false;
+    uint32_t xlatVertexCount = 3;  // C-3b.2: real vertex count from the draw packet (else 3)
     uint64_t frame = 0;
 };
 
@@ -386,7 +388,35 @@ void RenderClear(PlumeCtx& c) {
                                 c.xlatSet1->setBuffer(1, c.xlatBoolBuf.get(), kBoolSize);
                                 c.xlatSet1->setBuffer(2, c.xlatFetchBuf.get(), kFetchSize);
                                 c.xlatDrawReady = true;
-                                REXLOG_INFO("[highcut-C3b] descriptor buffers + sets created (zeroed) — draw enabled");
+
+                                // C-3b.2: load the decoded-draw packet and fill the buffers with
+                                // REAL data (system + fetch constants, shared-memory vertex bytes).
+                                // If absent, the buffers stay zeroed (C-3b.1 mechanics-only).
+                                if (FILE* pf = std::fopen("highcut_p3_draw.bin", "rb")) {
+                                    nhl::highcut::DrawPacketHeader hdr{};
+                                    if (std::fread(&hdr, 1, sizeof(hdr), pf) == sizeof(hdr) &&
+                                        hdr.magic == nhl::highcut::kDrawPacketMagic) {
+                                        auto fillBuf = [&](RenderBuffer* b, uint64_t cap, uint32_t n) {
+                                            if (!b || !n) return;
+                                            std::vector<uint8_t> tmp(n);
+                                            if (std::fread(tmp.data(), 1, n, pf) != n) return;
+                                            void* p = b->map();
+                                            std::memcpy(p, tmp.data(), n < cap ? n : cap);
+                                            b->unmap();
+                                        };
+                                        fillBuf(c.xlatFetchBuf.get(), kFetchSize, hdr.fetch_bytes);
+                                        fillBuf(c.xlatSysBuf.get(), kSysSize, hdr.sys_bytes);
+                                        fillBuf(c.xlatSharedBuf.get(), kSharedSize, hdr.shared_bytes);
+                                        c.xlatVertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
+                                        REXLOG_INFO("[highcut-C3b2] filled buffers from packet: verts={} "
+                                                    "fetch={} sys={} shared={} prim={}",
+                                                    hdr.vertex_count, hdr.fetch_bytes, hdr.sys_bytes,
+                                                    hdr.shared_bytes, hdr.prim_type);
+                                    }
+                                    std::fclose(pf);
+                                } else {
+                                    REXLOG_INFO("[highcut-C3b] no draw packet — buffers zeroed (mechanics only)");
+                                }
                             } else {
                                 REXLOG_ERROR("[highcut-C3b] descriptor buffer/set creation failed");
                             }
@@ -405,6 +435,8 @@ void RenderClear(PlumeCtx& c) {
     // C-1: draw the bring-up triangle over the clear — proves plume rasterizes real geometry
     // (vertex buffer + pipeline + draw), not just clears. The vertex-colored triangle is the
     // readable signal that the plume render path is live before we feed it decoded guest draws.
+    // C-1 bring-up triangle (vertex-colored) — kept as a "window alive" control alongside the
+    // C-3b translated draw (solid orange), so both are visible in the plume window.
     if (c.pipeline && c.vbuf) {
         c.cmd->setGraphicsPipelineLayout(c.pipelineLayout.get());
         c.cmd->setPipeline(c.pipeline.get());
@@ -421,7 +453,7 @@ void RenderClear(PlumeCtx& c) {
         c.cmd->setPipeline(c.xlatPipeline.get());
         c.cmd->setGraphicsDescriptorSet(c.xlatSet0.get(), 0);
         c.cmd->setGraphicsDescriptorSet(c.xlatSet1.get(), 1);
-        c.cmd->drawInstanced(3, 1, 0, 0);
+        c.cmd->drawInstanced(c.xlatVertexCount, 1, 0, 0);
     }
 
     c.cmd->barriers(RenderBarrierStage::NONE,

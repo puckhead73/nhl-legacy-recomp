@@ -26,6 +26,7 @@
 // High-cut path C, P-3: the ported Xenos->SPIR-V translator + its SpirvShader subclass.
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include "gpu/hooks/highcut_draw_packet.h"  // C-3b.2 draw-data bridge
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/string/buffer.h>
 #include <rex/logging.h>
@@ -1554,6 +1555,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // so a REAL geometry draw (one that fetches vertices) can be identified — the first owned draw
   // is procedurally trivial (no vfetch -> degenerate point). highcut_p3_vs.spv stays = draw 0 for
   // the existing C-2/C-3 path. Select which draw the plume bridge gets via NHL_HIGHCUT_XLAT_DRAW.
+  bool p3_dump_data = false;  // C-3b.2: dump this draw's data packet (set when it's the selected draw)
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 24;
   if (std::getenv("NHL_HIGHCUT_XLAT_TEST")) {
@@ -1608,6 +1610,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           std::fclose(p3_f);
         }
         HighcutPublishTranslatedVS(p3_bin.data(), p3_bin.size());
+        p3_dump_data = true;  // C-3b.2: also dump this draw's data packet (below, after vpi)
         REXLOG_INFO("[highcut-P3] selected draw#{} -> highcut_p3_vs.spv + plume bridge", p3_idx);
       }
     }
@@ -1779,6 +1782,65 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
     }
   }
+
+  // C-3b.2: dump this draw's data packet (system + fetch constants + shared-memory vertex bytes)
+  // for the plume thread, so the translated Xenos VS can fetch + transform real vertices. Only
+  // for the selected survey draw; gated by NHL_HIGHCUT_XLAT_TEST (p3_dump_data). vpi is final here.
+  if (p3_dump_data && beta_current_vs_ && memory_) {
+    namespace rg = rex::graphics;
+    const uint32_t* regs = register_file_->values;
+    // Fetch constants: the full 192-dword fetch register space -> the shader's uvec4[48] UBO.
+    // REBASE the vertex fetch slot's base address to 0 so the VS indexes our SSBO from offset 0.
+    uint32_t fetch_blob[192];
+    std::memcpy(fetch_blob, &regs[0x4800], sizeof(fetch_blob));
+    uint32_t vtx_base = 0, vtx_size = 0;
+    if (!beta_current_vs_->vertex_bindings().empty()) {
+      const auto& vb = beta_current_vs_->vertex_bindings()[0];
+      xenos::xe_gpu_vertex_fetch_t f{};
+      f.dword_0 = regs[0x4800 + vb.fetch_constant * 2];
+      f.dword_1 = regs[0x4800 + vb.fetch_constant * 2 + 1];
+      vtx_base = f.address << 2;
+      vtx_size = f.size << 2;
+      if (vtx_size > 16u * 0x100000u) vtx_size = 16u * 0x100000u;
+      // Rebase: zero the address field (bits 2..31) of dword_0 in the UBO copy, keep type bits.
+      fetch_blob[vb.fetch_constant * 2] &= 0x3u;
+    }
+    // System constants (SPIR-V layout): NDC transform + vertex index params. flags=0 (no
+    // perspective divide) is the 2D-menu starting point; iterate if geometry is wrong.
+    rg::SpirvShaderTranslator::SystemConstants spv_sys{};
+    for (int i = 0; i < 3; ++i) {
+      spv_sys.ndc_scale[i] = vpi.ndc_scale[i];
+      spv_sys.ndc_offset[i] = vpi.ndc_offset[i];
+    }
+    spv_sys.vertex_base_index = register_file_->Get<reg::VGT_INDX_OFFSET>().indx_offset;
+    spv_sys.vertex_index_endian = result.host_shader_index_endian;
+    spv_sys.vertex_index_min = register_file_->Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+    spv_sys.vertex_index_max = register_file_->Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+    // Shared-memory (vertex) bytes from guest RAM at the rebased range.
+    const uint8_t* vtx_src =
+        vtx_size ? memory_->TranslatePhysical<const uint8_t*>(vtx_base) : nullptr;
+    nhl::highcut::DrawPacketHeader hdr{};
+    hdr.magic = nhl::highcut::kDrawPacketMagic;
+    hdr.version = nhl::highcut::kDrawPacketVersion;
+    hdr.vertex_count = result.host_draw_vertex_count;
+    hdr.prim_type = uint32_t(primitive_type);
+    hdr.fetch_bytes = sizeof(fetch_blob);
+    hdr.sys_bytes = sizeof(spv_sys);
+    hdr.shared_bytes = vtx_src ? vtx_size : 0u;
+    if (std::FILE* pf = std::fopen("highcut_p3_draw.bin", "wb")) {
+      std::fwrite(&hdr, 1, sizeof(hdr), pf);
+      std::fwrite(fetch_blob, 1, sizeof(fetch_blob), pf);
+      std::fwrite(&spv_sys, 1, sizeof(spv_sys), pf);
+      if (hdr.shared_bytes) std::fwrite(vtx_src, 1, hdr.shared_bytes, pf);
+      std::fclose(pf);
+      REXLOG_INFO("[highcut-C3b2] dumped draw packet: verts={} prim={} vtx_base=0x{:X} "
+                  "vtx_size={} ndc_scale=({},{}) ndc_offset=({},{}) base_idx={}",
+                  hdr.vertex_count, hdr.prim_type, vtx_base, vtx_size, spv_sys.ndc_scale[0],
+                  spv_sys.ndc_scale[1], spv_sys.ndc_offset[0], spv_sys.ndc_offset[1],
+                  spv_sys.vertex_base_index);
+    }
+  }
+
   D3D12_VIEWPORT vp{};
   vp.MinDepth = vpi.z_min;
   vp.MaxDepth = vpi.z_max;

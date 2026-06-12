@@ -188,14 +188,25 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     `NHL_BETA_CAPTURE_FRAME=120` (a menu frame), draw#0 is a **real geometry VS** — `vfetch_bindings=1`,
     27 ucode dwords, 8768-byte SPIR-V, 10 shared_memory/fetch_constant accesses, **spirv-val-clean**.
     That is the C-3b.2 render target.
-  - **C-3b.2 REMAINING (the data plumbing — the core renderer work):** for the vfetch draw, fill the
-    C-3b.1 buffers with correct data: (1) **system constants** — NDC scale/offset, vertex_base_index,
-    vertex_index_endian, flags; building these correctly ≈ porting the CP's `UpdateSystemConstantValues`
-    (the hard part); (2) **fetch constants** — the 6-dword vfetch descriptor from the register file
-    (base addr, stride, format, endian); (3) **shared-memory SSBO** — the guest vertex bytes, REBASED
-    so the vfetch base offset indexes into our (small) SSBO. Bridge via disk dump from
-    `RenderBetaOwnedDraw`. Iterate against the C-3b.1 validation-clean harness + a readback/visual
-    check. This is multi-cycle (endianness, fetch format, NDC, rebasing all must be exact).
+  - **C-3b.2 DATA PATH DONE (2026-06-12): real decoded draw rendered through the translated VS,
+    validation-clean.** A self-describing draw packet (`gpu/hooks/highcut_draw_packet.h`,
+    `highcut_p3_draw.bin`) is dumped from `RenderBetaOwnedDraw` and loaded by the plume thread:
+    - **fetch constants** — the full 192-dword fetch register space (`regs[0x4800]`) → the shader's
+      `uvec4[48]` UBO, with the vertex fetch slot's base address REBASED to 0.
+    - **system constants** — a `SpirvShaderTranslator::SystemConstants` built from `vpi.ndc_scale/offset`,
+      `VGT_INDX_OFFSET`/`VGT_*_VTX_INDX`, `result.host_shader_index_endian`; flags=0 (no-perspective
+      2D start). (The struct is public + the C-3a layout fix makes member offsets correct.)
+    - **shared-memory SSBO** — the guest vertex bytes (`memory_->TranslatePhysical(f.address<<2)`,
+      `f.size<<2`), placed at SSBO offset 0 to match the rebased fetch address.
+    Verified: the selected menu-frame draw (3 verts, 28-byte stride, Xenos RectangleList,
+    ndc 640×360) loads + binds + draws every frame, **0 validation errors**, runs stable (no crash,
+    presents continuously). The full chain guest-draw-decode → ported translator → plume render is
+    green end to end.
+  - **C-3b.2 REMAINING:** (a) **objective pixel confirmation** — a readback to count rendered pixels;
+    the swapchain lacks `TRANSFER_SRC`, so this needs an offscreen RT (render xlat → offscreen →
+    readback + blit to swapchain). (b) **correctness iteration** — RectangleList drawn as TRIANGLE_LIST
+    (3 of 4 corners → partial rect; add the 4th vertex / strip), and verify vfetch endianness/format
+    + NDC produce the right on-screen shape. The validation-clean harness is in place to iterate on.
 - **C-4 — textures.** Untile guest tiled textures → plume textures; samplers; bind. *Done = a
   textured menu draw.*
 - **C-5 — full frame, flat multi-pass.** All draws of a frame; per-surface flat plume RTs; guest
