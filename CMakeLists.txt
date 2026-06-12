@@ -3,7 +3,8 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(nhllegacy LANGUAGES CXX)
+# C is enabled for the plume shader-embed (.c blobs from plume_file_to_c); CXX is the project.
+project(nhllegacy LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +56,20 @@ rexglue_setup_target(nhllegacy)
 # standalone gpu/smoke build.
 add_subdirectory(third_party/plume ${CMAKE_BINARY_DIR}/plume_build)
 target_link_libraries(nhllegacy PRIVATE plume d3d12 dxgi dxguid)
+
+# High-cut C-1: compile the bring-up triangle shader to SPIR-V (+DXIL) via plume's own
+# dxc-fetch + embed cmake. Generates ${CMAKE_BINARY_DIR}/shaders/triangle{Vert,Frag}.hlsl.
+# spirv.h (blobs triangle{Vert,Frag}BlobSPIRV) and adds the embedded .c to nhllegacy +
+# ${CMAKE_BINARY_DIR} to its include path, so gpu/hooks/plume_present.cpp can render real
+# geometry (proves plume's pipeline/vertex-buffer/draw path beyond the H-2 clears). The
+# REAL path-C engine generates SPIR-V at runtime from Xenos ucode via the SDK
+# SpirvShaderTranslator; this hardcoded triangle is bring-up only.
+include(third_party/plume/examples/cmake/PlumeShaders.cmake)
+plume_shaders_init()
+plume_compile_vertex_shader(nhllegacy
+    "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleVert VSMain)
+plume_compile_pixel_shader(nhllegacy
+    "${CMAKE_CURRENT_SOURCE_DIR}/gpu/hooks/shaders/triangle.hlsl" triangleFrag PSMain)
 
 # snappy (for .xtr trace decompression in the in-host replay mode). Statically
 # linked into rexruntime.dll but not re-exported, so link it directly; lib name

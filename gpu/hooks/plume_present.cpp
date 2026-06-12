@@ -46,6 +46,14 @@
 
 #include "plume_render_interface.h"
 
+// High-cut C-1: embedded bring-up triangle shaders (compiled by plume's shader cmake into
+// ${CMAKE_BINARY_DIR}/shaders, which is on the include path). SPIRV for the Vulkan backend
+// (the in-process default), DXIL for the d3d12 test backend.
+#include "shaders/triangleVert.hlsl.spirv.h"
+#include "shaders/triangleFrag.hlsl.spirv.h"
+#include "shaders/triangleVert.hlsl.dxil.h"
+#include "shaders/triangleFrag.hlsl.dxil.h"
+
 namespace plume {
 std::unique_ptr<RenderInterface> CreateD3D12Interface();
 std::unique_ptr<RenderInterface> CreateVulkanInterface();
@@ -84,6 +92,14 @@ struct PlumeCtx {
     std::unique_ptr<RenderCommandSemaphore> acquireSem;
     std::vector<std::unique_ptr<RenderCommandSemaphore>> releaseSems;
     std::vector<std::unique_ptr<RenderFramebuffer>> fbs;
+    // C-1 geometry: minimal triangle pipeline + vertex buffer (proves the plume render path).
+    std::unique_ptr<RenderPipelineLayout> pipelineLayout;
+    std::unique_ptr<RenderShader> vs;
+    std::unique_ptr<RenderShader> ps;
+    std::unique_ptr<RenderPipeline> pipeline;
+    std::unique_ptr<RenderBuffer> vbuf;
+    RenderVertexBufferView vbView;
+    RenderInputSlot inputSlot;
     uint64_t frame = 0;
 };
 
@@ -124,6 +140,63 @@ void CreateFramebuffers(PlumeCtx& c) {
     }
 }
 
+// C-1: build the triangle pipeline (shaders + input layout) and its vertex buffer. This is
+// the smallest geometry render that proves plume's pipeline/vertex-buffer/draw path works in
+// the in-process Vulkan setup — the foundation the real CP-decode -> plume bridge builds on.
+bool CreateTriangle(PlumeCtx& c) {
+    RenderPipelineLayoutDesc layoutDesc;
+    layoutDesc.allowInputLayout = true;
+    c.pipelineLayout = c.device->createPipelineLayout(layoutDesc);
+
+    const RenderShaderFormat fmt = c.ri->getCapabilities().shaderFormat;
+    if (fmt == RenderShaderFormat::SPIRV) {
+        c.vs = c.device->createShader(triangleVertBlobSPIRV, sizeof(triangleVertBlobSPIRV), "VSMain", fmt);
+        c.ps = c.device->createShader(triangleFragBlobSPIRV, sizeof(triangleFragBlobSPIRV), "PSMain", fmt);
+    } else if (fmt == RenderShaderFormat::DXIL) {
+        c.vs = c.device->createShader(triangleVertBlobDXIL, sizeof(triangleVertBlobDXIL), "VSMain", fmt);
+        c.ps = c.device->createShader(triangleFragBlobDXIL, sizeof(triangleFragBlobDXIL), "PSMain", fmt);
+    } else {
+        REXLOG_ERROR("[highcut-plume] unsupported shader format {}", int(fmt));
+        return false;
+    }
+
+    // Vertex layout: POSITION (float3) + COLOR (float4), matching triangle.hlsl.
+    c.inputSlot = RenderInputSlot(0, sizeof(float) * 7);
+    const RenderInputElement inputElements[] = {
+        RenderInputElement("POSITION", 0, 0, RenderFormat::R32G32B32_FLOAT, 0, 0),
+        RenderInputElement("COLOR", 0, 1, RenderFormat::R32G32B32A32_FLOAT, 0, sizeof(float) * 3),
+    };
+    RenderGraphicsPipelineDesc pd;
+    pd.inputSlots = &c.inputSlot;
+    pd.inputSlotsCount = 1;
+    pd.inputElements = inputElements;
+    pd.inputElementsCount = 2;
+    pd.pipelineLayout = c.pipelineLayout.get();
+    pd.vertexShader = c.vs.get();
+    pd.pixelShader = c.ps.get();
+    pd.renderTargetFormat[0] = kSwapFormat;
+    pd.renderTargetBlend[0] = RenderBlendDesc::Copy();
+    pd.renderTargetCount = 1;
+    pd.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+    c.pipeline = c.device->createGraphicsPipeline(pd);
+    if (!c.pipeline) { REXLOG_ERROR("[highcut-plume] triangle pipeline create failed"); return false; }
+
+    // A large centered triangle in NDC, vertex-colored, so it's unmistakable on screen.
+    const float verts[] = {
+        0.0f,  0.6f, 0.0f,   1.0f, 0.0f, 0.0f, 1.0f,  // top    (red)
+       -0.6f, -0.6f, 0.0f,   0.0f, 1.0f, 0.0f, 1.0f,  // left   (green)
+        0.6f, -0.6f, 0.0f,   0.0f, 0.0f, 1.0f, 1.0f,  // right  (blue)
+    };
+    c.vbuf = c.device->createBuffer(RenderBufferDesc::VertexBuffer(sizeof(verts), RenderHeapType::UPLOAD));
+    if (!c.vbuf) { REXLOG_ERROR("[highcut-plume] triangle vbuf create failed"); return false; }
+    void* p = c.vbuf->map();
+    std::memcpy(p, verts, sizeof(verts));
+    c.vbuf->unmap();
+    c.vbView = RenderVertexBufferView(c.vbuf.get(), sizeof(verts));
+    REXLOG_INFO("[highcut-plume] C-1 triangle pipeline + vertex buffer ready (fmt={})", int(fmt));
+    return true;
+}
+
 bool Init(PlumeCtx& c) {
     const char* backend = g_useD3D12 ? "D3D12" : "Vulkan";
     c.hwnd = CreatePlumeWindow();
@@ -140,6 +213,9 @@ bool Init(PlumeCtx& c) {
     c.cmd = c.queue->createCommandList();
     c.acquireSem = c.device->createCommandSemaphore();
     CreateFramebuffers(c);
+    if (!CreateTriangle(c)) {
+        REXLOG_ERROR("[highcut-plume] triangle setup failed — falling back to clear-only");
+    }
     REXLOG_INFO("[highcut-plume] device + swapchain ready: {}x{}, {} buffers",
                 c.swap->getWidth(), c.swap->getHeight(), c.swap->getTextureCount());
     return true;
@@ -166,6 +242,16 @@ void RenderClear(PlumeCtx& c) {
     // Animated clear so the plume window is obviously alive and synced to the game.
     const float t = (c.frame % 120) / 120.0f;
     c.cmd->clearColor(0, RenderColor(0.1f, t, 0.2f + 0.3f * t, 1.0f));
+
+    // C-1: draw the bring-up triangle over the clear — proves plume rasterizes real geometry
+    // (vertex buffer + pipeline + draw), not just clears. The vertex-colored triangle is the
+    // readable signal that the plume render path is live before we feed it decoded guest draws.
+    if (c.pipeline && c.vbuf) {
+        c.cmd->setGraphicsPipelineLayout(c.pipelineLayout.get());
+        c.cmd->setPipeline(c.pipeline.get());
+        c.cmd->setVertexBuffers(0, &c.vbView, 1, &c.inputSlot);
+        c.cmd->drawInstanced(3, 1, 0, 0);
+    }
 
     c.cmd->barriers(RenderBarrierStage::NONE,
                     RenderTextureBarrier(tex, RenderTextureLayout::PRESENT));
