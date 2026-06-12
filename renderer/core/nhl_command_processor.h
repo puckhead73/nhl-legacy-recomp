@@ -15,6 +15,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -137,6 +138,33 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   uint32_t beta_takeover_draw_seen_ = 0;  // total takeover draws seen (for NHL_BETA_MAX_DRAW)
   bool beta_ucode_dumped_ = false;        // dump textured VS/PS ucode disasm once
   void FinalizeBetaTakeoverCapture();
+  // Live continuous rendering (NHL_BETA_LIVE): present our offscreen RT to the window
+  // each frame via the SDK presenter (RefreshGuestOutput -> copy beta RT into the
+  // presenter's output resource). When set, IssueDraw renders EVERY frame (not just the
+  // capture frame) and IssueSwap presents + resets per-frame state instead of dumping a PNG.
+  bool beta_live_ = false;
+  // Live takeover latch: once armed (by NHL_BETA_LIVE_START_FRAME, or the F10 hotkey when
+  // NHL_BETA_LIVE_HOTKEY is set), beta renders every frame. F10 lets the user boot the real
+  // game past the (dynamic) intro video to a static menu and pick the takeover moment by eye
+  // -- fixed frame numbers are unreliable (boot timing is non-deterministic + beta slows it).
+  bool beta_live_active_ = false;
+  bool beta_f11_prev_down_ = false;  // F11 screenshot hotkey edge-detect
+  // F11 in live also dumps beta's OFFSCREEN RT directly (beta_owned_draw.png) -- ground
+  // truth for what beta actually rendered, vs the presenter capture (live_frame.png) which
+  // shows the base frontbuffer. Armed on F11, consumed by the next frame's capture record.
+  bool beta_live_rt_dump_pending_ = false;
+  // Live PER-DRAW residency accounting: sum of guest bytes RequestRange'd this frame (an
+  // upper bound -- counts every requested byte, not just the dirty pages the SDK actually
+  // uploads). A single frame's real (dirty) upload must stay under the ~20MB SDK upload ring,
+  // since beta cannot flush mid-recording in live (the game owns the queue submission). Reset
+  // to 0 each frame in IssueSwap; used to warn when a frame approaches the ring (deadlock risk).
+  uint32_t beta_live_frame_req_bytes_ = 0;
+  // Per-frame FORCED-upload bytes (vertex/index ranges we MemoryInvalidationCallback before
+  // RequestRange, i.e. guaranteed uploads, not write-watch-skipped). This is the real ring
+  // pressure floor; if it nears ~20MB on a heavy frame, the forced re-upload may deadlock.
+  uint32_t beta_live_frame_inv_bytes_ = 0;
+  bool beta_live_ring_warned_ = false;  // one-shot guard for the per-frame ring-approach warning
+  void PresentBetaLiveFrame();
   // Renders (or, in bring-up, clears) the owned draw into our offscreen RT.
   void RenderBetaOwnedDraw(rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
                            rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info);
@@ -238,6 +266,16 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   };
   std::map<uint32_t, FlatResolveTex> beta_flat_resolves_;  // resolve dest addr -> host copy
   void BetaFlatResolve();  // capture the offscreen RT into the resolve dest's host texture
+  // NHL_BETA_FLAT_DUMP: per-resolve snapshots of each flat-resolve host texture, written at
+  // capture finalize (GPU idle) as flatresolve_<seq>_<dest>.png — to see which resolve dest
+  // actually holds the player vs comes up empty (the multi-pass RTT bifurcation).
+  struct FlatResolveDump {
+    uint32_t dest = 0;
+    uint32_t seq = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  };
+  std::vector<FlatResolveDump> beta_flat_dumps_;
+  void WriteBetaFlatResolveDumps();
   // D3D12 debug-layer message queue (when NHL_BETA_D3D12_DEBUG); drained to the log
   // to capture the exact validation error.
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> beta_info_queue_;
@@ -346,6 +384,12 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> beta_edramdump_heap_;
   Microsoft::WRL::ComPtr<ID3D12Resource> beta_edramdump_dst_;       // default-heap UAV target
   Microsoft::WRL::ComPtr<ID3D12Resource> beta_edramdump_readback_;  // CPU-mappable copy
+  // LIVE present (NHL_BETA_LIVE): compute copy of our RGBA8 offscreen RT into the presenter's
+  // R10G10B10A2 UAV output (CopyResource can't convert formats). Lazy-created.
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> beta_present_rootsig_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> beta_present_pso_;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> beta_present_heap_;
+  bool EnsureBetaPresentPipeline();
   // NHL_BETA_FAKETEX isolation: a known solid-red texture bound in place of the real
   // untiled texture. If textured draws turn red, the bind/sample/blend/geometry path
   // is correct and only the untiled CONTENT is the issue; if still black, the problem
@@ -354,6 +398,24 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   Microsoft::WRL::ComPtr<ID3D12Resource> beta_fake_tex_upload_;
   bool beta_fake_tex_ready_ = false;
   void EnsureBetaFakeTexture();
+  // VS-texture CPU-upload path (NHL_BETA_NO_VSTEX_CPU to disable): linear
+  // k_32_32_32_32_FLOAT textures sampled by the VERTEX shader (the create-player
+  // bone-matrix palette) load as ZERO through the SDK texture cache on our owned
+  // path (binding valid, source resident — content never arrives; the base path
+  // loads the same texture fine, so it's a beta-usage interaction we can't see
+  // into the prebuilt SDK to fix). For these we build the host texture ourselves:
+  // R32G32B32A32_FLOAT Texture2DArray filled from guest RAM with the k8in32 swap,
+  // re-uploaded when a trace write touches the backing range.
+  struct BetaVsTexEntry {
+    Microsoft::WRL::ComPtr<ID3D12Resource> tex;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool ready = false;
+    bool dirty = false;  // trace rewrote the guest range since the last upload
+  };
+  std::unordered_map<uint32_t, BetaVsTexEntry> beta_vstex_subs_;
+  BetaVsTexEntry* EnsureBetaVsTexSub(uint32_t guest_base, uint32_t width, uint32_t height);
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT beta_rt_footprint_{};
   uint64_t beta_rt_total_bytes_ = 0;
   uint32_t beta_rt_width_ = 0;   // internal (supersampled) RT width

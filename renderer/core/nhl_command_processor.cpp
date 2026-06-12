@@ -24,6 +24,7 @@
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/logging.h>
+#include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 #include <rex/ui/presenter.h>
@@ -313,6 +314,9 @@ bool NhlD3D12CommandProcessor::BuildBetaCaches() {
   }
   REXLOG_INFO("[nhl-beta] 1/5 D3D12SharedMemory initialized (buffer={})",
               static_cast<const void*>(beta_shared_memory_->GetBuffer()));
+  if (beta_shared_memory_->GetBuffer()) {
+    beta_shared_memory_->GetBuffer()->SetName(L"beta_shared_memory");  // debug-layer identity
+  }
 
   // 2. Render-target cache — the reused EDRAM emulation. Force the HOST render-
   //    target (RTV/DSV) path instead of the base's ROV path: on the host-RT path
@@ -545,6 +549,43 @@ bool NhlD3D12CommandProcessor::EnsureBetaDepthTarget() {
               beta_rt_width_, beta_rt_height_, beta_depth_xenos_fmt_, uint32_t(res_fmt),
               uint32_t(dsv_fmt), beta_msaa_, beta_depth_clear_);
   return true;
+}
+
+void NhlD3D12CommandProcessor::WriteBetaFlatResolveDumps() {
+  // NHL_BETA_FLAT_DUMP: write each recorded per-resolve host-texture snapshot to
+  // flatresolve_<seq>_<dest>.png. Called at capture finalize (GPU idle), so every
+  // recorded readback copy has retired. Same layout as DumpBetaOffscreenTarget
+  // (plain RGBA8, row-pitch from beta_rt_footprint_, no tiling / no channel swap).
+  if (beta_flat_dumps_.empty()) return;
+  const uint32_t w = beta_rt_width_, h = beta_rt_height_;
+  const uint32_t row_pitch = beta_rt_footprint_.Footprint.RowPitch;
+  for (auto& fd : beta_flat_dumps_) {
+    void* mapped = nullptr;
+    D3D12_RANGE rr{0, static_cast<SIZE_T>(beta_rt_total_bytes_)};
+    if (!fd.readback || FAILED(fd.readback->Map(0, &rr, &mapped)) || !mapped) {
+      REXLOG_ERROR("[nhl-beta] flat-dump: Map failed for dest=0x{:X}", fd.dest);
+      continue;
+    }
+    const uint8_t* base = static_cast<const uint8_t*>(mapped);
+    std::vector<uint8_t> tight(static_cast<size_t>(w) * h * 4);
+    uint64_t nz = 0;
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint8_t* srow = base + static_cast<size_t>(y) * row_pitch;
+      uint8_t* drow = tight.data() + static_cast<size_t>(y) * w * 4;
+      std::memcpy(drow, srow, static_cast<size_t>(w) * 4);
+      for (uint32_t x = 0; x < w; ++x) {
+        if (drow[x * 4] | drow[x * 4 + 1] | drow[x * 4 + 2]) ++nz;
+      }
+    }
+    D3D12_RANGE wr{0, 0};
+    fd.readback->Unmap(0, &wr);
+    char path[80];
+    std::snprintf(path, sizeof(path), "flatresolve_%02u_%08X.png", fd.seq, fd.dest);
+    nhl::replay::WritePng(path, w, h, tight.data());
+    REXLOG_INFO("[nhl-beta] flat-dump: wrote {} (dest=0x{:X} nzRGB={}/{})", path, fd.dest, nz,
+                uint64_t(w) * h);
+  }
+  beta_flat_dumps_.clear();
 }
 
 void NhlD3D12CommandProcessor::DumpBetaOffscreenTarget(const char* path) {
@@ -976,6 +1017,113 @@ void NhlD3D12CommandProcessor::EnsureBetaFakeTexture() {
   REXLOG_INFO("[nhl-beta] fake-tex: 8x8 solid-red texture created + uploaded (NHL_BETA_FAKETEX)");
 }
 
+NhlD3D12CommandProcessor::BetaVsTexEntry* NhlD3D12CommandProcessor::EnsureBetaVsTexSub(
+    uint32_t guest_base, uint32_t width, uint32_t height) {
+  if (!memory_ || !width || !height) {
+    return nullptr;
+  }
+  BetaVsTexEntry& e = beta_vstex_subs_[guest_base];
+  if (e.ready && !e.dirty) {
+    return &e;
+  }
+  const uint8_t* guest = memory_->TranslatePhysical<const uint8_t*>(guest_base);
+  if (!guest) {
+    REXLOG_ERROR("[nhl-beta] vstex-sub: TranslatePhysical(0x{:X}) failed", guest_base);
+    return nullptr;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC td{};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = width;
+  td.Height = height;
+  td.DepthOrArraySize = 1;
+  td.MipLevels = 1;
+  td.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  td.SampleDesc.Count = 1;
+  const bool fresh = !e.tex;
+  if (fresh) {
+    e.width = width;
+    e.height = height;
+    D3D12_HEAP_PROPERTIES hp_default{};
+    hp_default.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device->CreateCommittedResource(&hp_default, D3D12_HEAP_FLAG_NONE, &td,
+                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&e.tex)))) {
+      REXLOG_ERROR("[nhl-beta] vstex-sub: create texture failed (0x{:X})", guest_base);
+      beta_vstex_subs_.erase(guest_base);
+      return nullptr;
+    }
+  }
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+  UINT rows = 0;
+  UINT64 row_size = 0, total = 0;
+  device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_size, &total);
+  if (!e.upload) {
+    D3D12_HEAP_PROPERTIES hp_upload{};
+    hp_upload.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = total;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device->CreateCommittedResource(&hp_upload, D3D12_HEAP_FLAG_NONE, &bd,
+                                               D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                               IID_PPV_ARGS(&e.upload)))) {
+      REXLOG_ERROR("[nhl-beta] vstex-sub: create upload failed (0x{:X})", guest_base);
+      beta_vstex_subs_.erase(guest_base);
+      return nullptr;
+    }
+  }
+  // NOTE: re-filling the upload buffer assumes any previously recorded copy from it
+  // has executed (true for the one-capture-frame flow: the dirtying trace write lands
+  // before the frame's first VS-textured draw).
+  uint8_t* mapped = nullptr;
+  D3D12_RANGE none{0, 0};
+  e.upload->Map(0, &none, reinterpret_cast<void**>(&mapped));
+  const uint32_t row_bytes = width * 16;  // float4 texels, linear guest layout
+  uint64_t nz_words = 0;
+  for (uint32_t y = 0; y < height; ++y) {
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(guest + size_t(y) * row_bytes);
+    uint32_t* d = reinterpret_cast<uint32_t*>(mapped + fp.Footprint.RowPitch * y);
+    for (uint32_t w = 0; w < width * 4; ++w) {
+      const uint32_t v = s[w];
+      d[w] = _byteswap_ulong(v);  // guest endian=2 (k8in32): swap bytes within each dword
+      if (v) ++nz_words;
+    }
+  }
+  e.upload->Unmap(0, nullptr);
+  d3d12::DeferredCommandList& dcl = GetDeferredCommandList();
+  if (!fresh) {
+    PushTransitionBarrier(e.tex.Get(),
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COPY_DEST);
+    SubmitBarriers();
+  }
+  D3D12_TEXTURE_COPY_LOCATION dst{};
+  dst.pResource = e.tex.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src{};
+  src.pResource = e.upload.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint = fp;
+  dcl.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  PushTransitionBarrier(e.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  SubmitBarriers();
+  e.ready = true;
+  e.dirty = false;
+  REXLOG_INFO("[nhl-beta] vstex-sub: {}x{} float4 texture built from guest 0x{:X} "
+              "({} non-zero dwords) {}",
+              width, height, guest_base, nz_words, fresh ? "created+uploaded" : "re-uploaded");
+  return &e;
+}
+
 namespace {
 D3D_PRIMITIVE_TOPOLOGY HostPrimToD3DTopology(uint32_t host_prim) {
   switch (host_prim) {
@@ -1013,11 +1161,40 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
   }
   const uint32_t dest = ri.copy_dest_base;
   if (!dest) return;
+  if (std::getenv("NHL_BETA_FLAT_DUMP") || std::getenv("NHL_BETA_FLAT_DIAG")) {
+    REXLOG_INFO("[nhl-beta] flat-resolve src #{}: dest=0x{:X} is_depth={} color_orig_base={} "
+                "depth_orig_base={} color_edram_base={} depth_edram_base={} src_wxh=({}x{}) "
+                "edram_off_div8=({},{}) dest_off_div8=({},{}) dest_pitch={}",
+                uint32_t(beta_flat_dumps_.size()), dest, uint32_t(ri.IsCopyingDepth()),
+                ri.color_original_base, ri.depth_original_base,
+                uint32_t(ri.color_edram_info.base_tiles), uint32_t(ri.depth_edram_info.base_tiles),
+                uint32_t(ri.coordinate_info.width_div_8) * 8, uint32_t(ri.height_div_8) * 8,
+                uint32_t(ri.coordinate_info.edram_offset_x_div_8),
+                uint32_t(ri.coordinate_info.edram_offset_y_div_8),
+                uint32_t(ri.copy_dest_coordinate_info.offset_x_div_8),
+                uint32_t(ri.copy_dest_coordinate_info.offset_y_div_8),
+                uint32_t(ri.copy_dest_coordinate_info.pitch_aligned_div_32) * 32);
+  }
   // NHL_BETA_FLAT_KEEPFIRST: a dest can be resolved multiple times per frame; if a later
   // resolve's scratch is empty it would overwrite a good earlier capture. Keep the first.
   if (std::getenv("NHL_BETA_FLAT_KEEPFIRST")) {
     auto exist = beta_flat_resolves_.find(dest);
     if (exist != beta_flat_resolves_.end() && exist->second.tex) return;
+  }
+  // DEPTH resolves (shadow/depth-map captures, is_depth=1) must NOT snapshot the COLOR
+  // RT: when the guest resolves depth to the SAME dest as a color image (the player
+  // composite 0x1AF09000 is resolved twice), the depth-as-color copy OVERWRITES the
+  // good color capture — the composite then shows the player as the green depth
+  // encoding instead of its shaded color. Skip the color snapshot for depth resolves
+  // (the dest keeps its latest COLOR capture); still treat it as a pass boundary for
+  // the per-pass depth clear below. NHL_BETA_FLAT_DEPTH_COPY restores the old copy.
+  if (ri.IsCopyingDepth() && !std::getenv("NHL_BETA_FLAT_DEPTH_COPY")) {
+    if (beta_depth_enabled_ && beta_depth_ready_ && beta_dsv_heap_) {
+      GetDeferredCommandList().D3DClearDepthStencilView(
+          beta_dsv_heap_->GetCPUDescriptorHandleForHeapStart(),
+          D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, beta_depth_clear_, 0, 0, nullptr);
+    }
+    return;
   }
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   auto& fr = beta_flat_resolves_[dest];
@@ -1060,8 +1237,53 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
   dcl.D3DCopyResource(fr.tex.Get(), beta_offscreen_rt_.Get());
   barrier(beta_offscreen_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
           D3D12_RESOURCE_STATE_RENDER_TARGET);
-  barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  // NHL_BETA_FLAT_DUMP: snapshot THIS resolve's captured host texture into a readback buffer
+  // (recorded into the same submission; written at capture finalize once the GPU is idle).
+  // Lets us see, per resolve event, what landed in the dest the composite samples — the
+  // decisive "does the player rasterize / which surface holds it" test, free of shared-RT
+  // overwrite ambiguity. The host tex is plain RGBA8 (offscreen RT copy), so the readback +
+  // PNG write mirror DumpBetaOffscreenTarget exactly (no tiling, no channel swap).
+  if (std::getenv("NHL_BETA_FLAT_DUMP")) {
+    ID3D12Resource* rb = nullptr;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = beta_rt_total_bytes_;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                  IID_PPV_ARGS(&rb)))) {
+      barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      D3D12_TEXTURE_COPY_LOCATION ddst{};
+      ddst.pResource = rb;
+      ddst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      ddst.PlacedFootprint = beta_rt_footprint_;
+      D3D12_TEXTURE_COPY_LOCATION dsrc{};
+      dsrc.pResource = fr.tex.Get();
+      dsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dsrc.SubresourceIndex = 0;
+      dcl.D3DCopyTextureRegion(&ddst, 0, 0, 0, &dsrc, nullptr);
+      barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      FlatResolveDump fd;
+      fd.dest = dest;
+      fd.seq = uint32_t(beta_flat_dumps_.size());  // ascending resolve-event index
+      fd.readback.Attach(rb);
+      beta_flat_dumps_.push_back(std::move(fd));
+    } else {
+      barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+  } else {
+    barrier(fr.tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  }
   fr.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   // NOTE: do NOT clear the scratch here — the final composite pass renders into it and is
   // what we dump. Clearing after the frontbuffer resolve wiped the final frame to black.
@@ -1443,6 +1665,40 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   draw_util::ViewportInfo vpi{};
   draw_util::GetHostViewportInfo(*register_file_, 1, 1, true, x_max, y_max, false, ndc, false,
                                  false, false, vpi);
+  // FLAT un-fold (NHL_BETA_FLAT): scene_04's arena renders a guest viewport WIDER than the
+  // surface pitch — PA_CL_VPORT_XSCALE=640 → window width 2*640=1280 — into a surface_pitch=640
+  // EDRAM surface, relying on EDRAM address wrap. GetHostViewportInfo CROPS the X extent to
+  // surface_pitch (640) regardless of the big x_max above (Y stays uncropped — the proven
+  // asymmetry) and sets ndc_scale_x=2.0 to squish the 1280-wide projection into 640 → the fold.
+  // On a FLAT host RT there is NO EDRAM wrap, so we render at the TRUE logical width: recompute
+  // the X viewport straight from the guest VPORT registers (un-cropped) and reset X ndc to
+  // identity. scene_02's player (XSCALE=320 → width 640 ≤ pitch 640) is never cropped, so the
+  // `logical_w > extent` gate makes this a no-op there (and for any draw that already fits).
+  if (flat_mode && vport_xform && !edram && !std::getenv("NHL_BETA_NO_UNFOLD")) {
+    auto reg_f = [&](uint32_t idx) -> float {
+      const uint32_t u = (*register_file_)[idx];
+      float f;
+      std::memcpy(&f, &u, sizeof(f));
+      return f;
+    };
+    const float xs_raw = reg_f(0x210F);  // PA_CL_VPORT_XSCALE
+    const float xscale = xs_raw < 0.0f ? -xs_raw : xs_raw;
+    const float xoffset = reg_f(0x2110);  // PA_CL_VPORT_XOFFSET
+    const uint32_t logical_w = uint32_t(2.0f * xscale + 0.5f);
+    LONG l = LONG((xoffset - xscale) + 0.5f);  // window-space left edge of the guest viewport
+    if (l < 0) l = 0;
+    if (logical_w > vpi.xy_extent[0] && uint32_t(l) < beta_rt_width_) {
+      const uint32_t w = std::min(logical_w, beta_rt_width_ - uint32_t(l));
+      vpi.xy_offset[0] = uint32_t(l);
+      vpi.xy_extent[0] = w;
+      vpi.ndc_scale[0] = 1.0f;
+      vpi.ndc_offset[0] = 0.0f;
+      if (std::getenv("NHL_BETA_DEPTH_DIAG")) {
+        REXLOG_INFO("[nhl-beta] UNFOLD #{}: pitch-cropped X {} -> logical {} (vp x={} w={})",
+                    beta_takeover_rendered_, x_max == 8192 ? guest_w : x_max, logical_w, l, w);
+      }
+    }
+  }
   D3D12_VIEWPORT vp{};
   vp.MinDepth = vpi.z_min;
   vp.MaxDepth = vpi.z_max;
@@ -1835,8 +2091,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     return va;
   };
   const uint32_t* regs = &(*register_file_)[0];
+  if (std::getenv("NHL_BETA_LIVE_TRACE"))
+    REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-const-upload (cur_sub={} completed_sub={})",
+                sub, GetCompletedSubmission());
   const D3D12_GPU_VIRTUAL_ADDRESS va_fetch = upload(&regs[0x4800], 32 * 6 * 4);     // fetch consts
-  const D3D12_GPU_VIRTUAL_ADDRESS va_bool = upload(&regs[0x4900], 16 * 4);          // bool/loop
+  // Bool/loop constants are 8 bool dwords (0x4900..0x4907) + 32 loop dwords
+  // (0x4908..0x4927) = 40 dwords; the translator's b1 cbuffer is declared that size.
+  // Uploading fewer leaves the tail reading ZERO (D3D12 OOB CBV reads), which makes
+  // any VS that drives its skinning loop from a high loop constant run 0 iterations
+  // => position (0,0,0,0) => every triangle degenerate => the 3D player never
+  // rasterizes a single pixel (the scene_02 create-player bug).
+  const D3D12_GPU_VIRTUAL_ADDRESS va_bool = upload(&regs[0x4900], 40 * 4);          // bool/loop
   D3D12_GPU_VIRTUAL_ADDRESS va_sys = upload(&sys, sizeof(sys));
   // Float constants are TIGHTLY PACKED per shader, NOT the full 512-entry array.
   // The DXBC translator emits float-constant reads against a per-stage CBV that
@@ -1846,8 +2111,18 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // indices makes a shader reading non-contiguous constants pull the WRONG values
   // (a wrong WVP => degenerate vertex positions => the textured draws don't
   // rasterize at all). VS and PS have independent float_bitmaps => separate CBVs.
-  auto pack_floats = [&](rex::graphics::Shader* sh) -> D3D12_GPU_VIRTUAL_ADDRESS {
+  // Xenos splits the 512-entry float constant file per stage: VERTEX constants
+  // index from register 0x4000 (c0..c255), PIXEL constants from 0x4400 (c256..c511)
+  // — the PS's "c0" is file entry 256 (Xenia UpdateBindings reads the pixel pack
+  // from SHADER_CONSTANT_256_X). Reading both stages from 0x4000 fed the PS the
+  // VS bank: the create-player post-grade PS then saw a view-matrix row as its
+  // grain tint and 0.5 as its grain remap => the constant-green player.
+  auto pack_floats = [&](rex::graphics::Shader* sh,
+                         bool pixel_stage) -> D3D12_GPU_VIRTUAL_ADDRESS {
     alignas(16) static thread_local float packed[256 * 4];
+    // NHL_BETA_PS_BANK_OLD: A/B toggle back to the (wrong) shared-bank read.
+    static const bool ps_bank_old = std::getenv("NHL_BETA_PS_BANK_OLD") != nullptr;
+    const uint32_t reg_base = (pixel_stage && !ps_bank_old) ? 0x4400 : 0x4000;
     uint32_t n = 0;
     if (sh) {
       const auto& crm = sh->constant_register_map();
@@ -1856,7 +2131,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         while (bits) {
           const uint32_t s = i * 64 + uint32_t(std::countr_zero(bits));
           bits &= bits - 1;
-          std::memcpy(&packed[n * 4], &regs[0x4000 + s * 4], 16);
+          std::memcpy(&packed[n * 4], &regs[reg_base + s * 4], 16);
           ++n;
         }
       }
@@ -1867,8 +2142,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     }
     return upload(packed, size_t(n) * 16);
   };
-  const D3D12_GPU_VIRTUAL_ADDRESS va_floats_vs = pack_floats(beta_current_vs_);
-  const D3D12_GPU_VIRTUAL_ADDRESS va_floats_ps = pack_floats(eff_ps);
+  const D3D12_GPU_VIRTUAL_ADDRESS va_floats_vs = pack_floats(beta_current_vs_, false);
+  const D3D12_GPU_VIRTUAL_ADDRESS va_floats_ps = pack_floats(eff_ps, true);
+  if (std::getenv("NHL_BETA_LIVE_TRACE"))
+    REXLOG_INFO("[nhl-beta] LIVE-TRACE: post-const-upload");
 
   // Shared-memory SRV (so the VS can pull vertices). Make a broad range resident,
   // then write the raw SRV into the CP's GLOBAL bindful view heap (below). CRITICAL:
@@ -1891,10 +2168,15 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // re-upload — see the pipeline-state-desync fix; a per-draw REUP was tried and
   // confirmed unnecessary.)
   if (beta_shmem && first_draw) {
-    // Default 512 MB: the menu's cloud textures are fetched from guest addresses up to
-    // ~0x1B39_5000 (~433 MB), so the whole sampled range must be made resident. Override
-    // with NHL_BETA_SHMEM_MB (e.g. smaller for isolation, larger for big scenes).
-    uint32_t shmem_bytes = 512u * 0x100000u;
+    // Default 512 MB (replay): the menu's cloud textures are fetched from guest addresses
+    // up to ~0x1B39_5000 (~433 MB), so the whole sampled range must be made resident.
+    // LIVE caps at 16 MB by default: the SDK upload ring is ~20 MB, and a single
+    // RequestRange above it deadlocks in live (mid-recording flush while the game owns
+    // the queue -- measured threshold: 20 MB sustains, 24 MB hangs). Live re-uploads a
+    // capped range every frame, so textures fetched above the cap stay black (the menu's
+    // high-memory clouds reach ~433 MB -- those need the ring-capacity fix). Proven:
+    // 16 MB sustains 1000+ live frames. Override with NHL_BETA_SHMEM_MB.
+    uint32_t shmem_bytes = (beta_live_ ? 16u : 512u) * 0x100000u;
     if (const char* mb = std::getenv("NHL_BETA_SHMEM_MB")) {
       shmem_bytes = uint32_t(std::strtoul(mb, nullptr, 10)) * 0x100000u;
     }
@@ -1910,36 +2192,66 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // populated) into the buffer. This is REQUIRED (not optional): our beta shared
     // memory never sees the trace's mem-write invalidations, so without it RequestRange
     // skips the upload and every texture untiles black.
-    beta_shared_memory_->MemoryInvalidationCallback(0, shmem_bytes, false);
-    const bool rr = beta_shared_memory_->RequestRange(0, shmem_bytes);
+    static const bool live_trace = std::getenv("NHL_BETA_LIVE_TRACE") != nullptr;
+    bool rr = false;
+    if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-RequestRange({} MB)", shmem_bytes / 0x100000);
+    if (beta_live_) {
+      // LIVE now uses PER-DRAW residency (the block further below makes each draw's
+      // vertex/index/texture ranges resident with CURRENT data right before it draws).
+      // The old first-draw-only broad RequestRange is GONE: it could not feed the game's
+      // DYNAMIC geometry (vertex/index buffers at rolling addresses, ~122 new addresses/
+      // frame) -- load-once never refreshed overwritten data and the one-frame defer fed
+      // last frame's now-wrong addresses, so the menu/gameplay rendered "purple + chaotic
+      // flashing geometry". Per-draw residency replaces it; nothing to upload here for live.
+      (void)shmem_bytes;
+    } else {
+      // REPLAY: simulated TracePlaybackWroteMemory writes never trip beta's watches, so the
+      // SDK thinks the pages are clean and skips the upload (-> textures untile black). Mark
+      // the whole range CPU-modified first to force the copy.
+      beta_shared_memory_->MemoryInvalidationCallback(0, shmem_bytes, false);
+      rr = beta_shared_memory_->RequestRange(0, shmem_bytes);
+    }
+    if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: post-RequestRange (rr={})", rr);
     NotifyQueueOperationsDoneDirectly();
+    if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: post-NotifyQueueOps");
+    // (Live texture/vertex residency is now per-draw -- see the block before RequestTextures
+    // below. The old first-draw-only deferred drain of beta_live_tex_wanted_ is gone: it
+    // loaded ranges ONE FRAME LATE and ONCE, which cannot follow dynamic geometry.)
     if (std::getenv("NHL_BETA_BIND_DIAG") && memory_ && first_draw) {
       // Does guest RAM actually hold texture data at draw time? Scan it (sampled).
       // If mostly zero -> the trace didn't populate guest RAM (data missing upstream);
       // if substantially non-zero -> our shared-memory upload / untile is the problem.
-      uint64_t nonzero = 0, sampled = 0;
-      uint32_t first_nz = UINT32_MAX, last_nz = 0;
-      for (uint32_t a = 0; a < shmem_bytes; a += 4096) {
-        uint8_t* p = memory_->TranslatePhysical<uint8_t*>(a);
-        if (!p) continue;
-        ++sampled;
-        if (p[0] || p[64] || p[1024] || p[2048]) {  // sample a few bytes in the page
-          ++nonzero;
-          if (a < first_nz) first_nz = a;
-          last_nz = a;
-        }
-      }
-      REXLOG_INFO("[nhl-beta] GUEST-RAM scan: {}/{} sampled pages non-zero ({:.1f}%), "
-                  "data span [0x{:X}..0x{:X}]",
-                  nonzero, sampled, sampled ? 100.0 * nonzero / sampled : 0.0, first_nz, last_nz);
-      // Decisive probe: copy 4 KB out of OUR shared-memory GPU buffer at the first
-      // populated guest address, to confirm RequestRange actually uploaded the high-
-      // memory texture pages (not just low memory). Recorded here so it reads what
-      // the upload just wrote, before UseForReading flips the buffer to read state.
-      // Allow probing a SPECIFIC guest address (e.g. a vertex-fetch base) to verify the
-      // 2nd vertex attribute is resident in OUR buffer, not just the texture region.
+      // Scan a WIDE range (default 512 MB, NHL_BETA_SCAN_MB) independent of the resident
+      // cap -- the game's textures live at HIGH guest addresses, not in the low capped
+      // range, so we must scan past shmem_bytes to find where real data is.
+      uint32_t scan_bytes = 512u * 0x100000u;
+      if (const char* sm = std::getenv("NHL_BETA_SCAN_MB"))
+        scan_bytes = uint32_t(std::strtoul(sm, nullptr, 10)) * 0x100000u;
+      uint32_t first_nz = UINT32_MAX;
+      // A SPECIFIC probe address skips the scan entirely (reading high guest RAM hangs --
+      // high physical pages read pathologically slow / protected). Use a known texture
+      // address, e.g. NHL_BETA_PROBE_ADDR=0x17193000 (a menu cloud texture).
       if (const char* pa = std::getenv("NHL_BETA_PROBE_ADDR")) {
         first_nz = uint32_t(std::strtoul(pa, nullptr, 0));
+      } else {
+        if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-scan({} MB)", scan_bytes / 0x100000);
+        // Coarse scan: step 64 KB, read ONE byte per step (the fine scan over high guest
+        // RAM hung). Enough to locate where the game's data lives.
+        uint64_t nonzero = 0, sampled = 0;
+        uint32_t last_nz = 0;
+        for (uint32_t a = 0; a < scan_bytes; a += 0x10000) {
+          uint8_t* p = memory_->TranslatePhysical<uint8_t*>(a);
+          if (!p) continue;
+          ++sampled;
+          if (p[0]) {
+            ++nonzero;
+            if (a < first_nz) first_nz = a;
+            last_nz = a;
+          }
+        }
+        REXLOG_INFO("[nhl-beta] GUEST-RAM scan: {}/{} sampled pages non-zero ({:.1f}%), "
+                    "data span [0x{:X}..0x{:X}]",
+                    nonzero, sampled, sampled ? 100.0 * nonzero / sampled : 0.0, first_nz, last_nz);
       }
       if (first_nz != UINT32_MAX) {
         beta_shmem_probe_addr_ = first_nz;
@@ -1960,6 +2272,21 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                                           IID_PPV_ARGS(&beta_shmem_probe_buf_));
         }
         if (beta_shmem_probe_buf_) {
+          // Make the (possibly HIGH-memory) probe page resident with a SMALL targeted
+          // RequestRange (64 KB fits the ring -> no deadlock), since the main capped
+          // RequestRange(0,16MB) above never touched it. In NO_INVALIDATE mode we do NOT
+          // invalidate it first: if RequestRange still uploads it, the game's real writes
+          // must have dirtied beta's page via physical write-watches => option (c) works.
+          const uint32_t probe_page = beta_shmem_probe_addr_ & ~0xFFFFu;
+          if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-probe-RequestRange(@0x{:X})", probe_page);
+          // Diagnostic A/B: NHL_BETA_PROBE_INVALIDATE forces the invalidation (control);
+          // default (live) relies on write-watches.
+          if (std::getenv("NHL_BETA_PROBE_INVALIDATE")) {
+            beta_shared_memory_->MemoryInvalidationCallback(probe_page, 0x10000, false);
+          }
+          beta_shared_memory_->RequestRange(probe_page, 0x10000);
+          NotifyQueueOperationsDoneDirectly();  // ack the new high tile's mapping queue op
+          if (live_trace) REXLOG_INFO("[nhl-beta] LIVE-TRACE: post-probe-RequestRange");
           beta_shared_memory_->UseAsCopySource();  // COPY_DEST(after upload) -> COPY_SOURCE
           GetDeferredCommandList().D3DCopyBufferRegion(beta_shmem_probe_buf_.Get(), 0,
                                                        beta_shared_memory_->GetBuffer(),
@@ -1968,7 +2295,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         }
       }
     }
-    beta_shared_memory_->UseForReading();
+    // REPLAY transitions to the read state here (single broad upload above is complete).
+    // LIVE does NOT: each draw re-uploads its own dynamic ranges and flips to read state
+    // itself in the per-draw residency block, so a read transition here would just be
+    // undone by the next per-draw RequestRange (-> COPY_DEST) anyway.
+    if (!beta_live_) beta_shared_memory_->UseForReading();
     if (first_draw) {
       REXLOG_INFO("[nhl-beta] owned-draw: RequestRange(0,{} MB) -> {} | trace mem-writes mirrored to "
                   "beta caches: {} writes / {} MB (0 => override not firing -> textures stay black)",
@@ -2019,6 +2350,130 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       beta_tex ? (beta_current_vs_->GetUsedTextureMaskAfterTranslation() |
                   (beta_current_ps_ ? beta_current_ps_->GetUsedTextureMaskAfterTranslation() : 0u))
                : 0u;
+  // PER-DRAW RESIDENCY (live, ungated): make THIS draw's vertex, index, and texture guest
+  // ranges resident with CURRENT data right before it draws, then flip the shared-memory
+  // buffer to the read state the IA/VS + the texture untile read from. This is the dynamic-
+  // geometry model and replaces the old "discover-at-draw, load-NEXT-frame, load-once"
+  // scheme: the game rewrites vertex/index buffers at ROLLING addresses every frame
+  // (~122 new addresses/frame), so a load-once cache went stale and a one-frame defer fed
+  // last frame's now-wrong addresses -> "purple + chaotic flashing geometry". RequestRange
+  // uploads ONLY pages the game's physical write-watches marked dirty (live writes trip
+  // them -- no invalidation needed), so static content (textures) uploads once and stays
+  // resident while this frame's dynamic meshes re-upload exactly their changed pages.
+  // Mirrors the base CP UpdateBindings order: RequestRange -> UseForReading -> RequestTextures.
+  if (beta_live_ && beta_shmem) {
+    static const bool live_trace2 = std::getenv("NHL_BETA_LIVE_TRACE") != nullptr;
+    // DECISIVE TEST / FIX: write-watch reliance was only ever PROVEN for one texture page.
+    // If the game's DYNAMIC vertex/index writes do NOT trip beta's watches, RequestRange
+    // treats those pages as clean and skips the upload -> the VS/IA reads STALE shared-memory
+    // bytes -> geometry rasterizes but mis-positioned ("purple + chaotic flickering"). The
+    // replay path (which renders this exact menu perfectly) FORCE-invalidates before upload.
+    // So force-invalidate the SMALL vertex+index ranges each draw before RequestRange: that
+    // copies CURRENT guest RAM unconditionally. It's ring-safe because these ranges are tiny
+    // (a few KB each) and dynamic anyway. Textures are NOT force-invalidated (their 6MB
+    // windows would blow the ~20MB ring); they stay on write-watch reliance (and are static,
+    // so first-upload suffices). Toggle off with NHL_BETA_NO_VTX_INVALIDATE to A/B test.
+    static const bool vtx_invalidate = std::getenv("NHL_BETA_NO_VTX_INVALIDATE") == nullptr;
+    // Don't force-upload a suspiciously large "vertex" range (a bad vfetch decode caps at
+    // 16MB): re-uploading that every draw would approach the ring. Only invalidate sane sizes.
+    uint32_t vtx_inv_max = 2u * 0x100000u;
+    if (const char* m = std::getenv("NHL_BETA_VTX_INV_MAX_MB")) vtx_inv_max = uint32_t(std::strtoul(m, nullptr, 10)) * 0x100000u;
+    static const bool vtx_diag = std::getenv("NHL_BETA_VTX_DIAG") != nullptr;
+    uint32_t req_bytes = 0, inv_ranges = 0, inv_bytes = 0;
+    auto request = [&](uint32_t base, uint32_t size, bool invalidate) {
+      if (!base || base >= 512u * 0x100000u || !size) return;
+      size = std::min(size, 512u * 0x100000u - base);
+      if (invalidate && vtx_invalidate && size <= vtx_inv_max) {
+        beta_shared_memory_->MemoryInvalidationCallback(base, size, false);
+        ++inv_ranges;
+        inv_bytes += size;
+      }
+      beta_shared_memory_->RequestRange(base, size);
+      req_bytes += size;
+    };
+    // Vertices: the VS pulls vertex data from shared memory via vfetch constants; without
+    // these resident the VS reads zeros -> degenerate triangles -> nothing rasterizes. The
+    // vfetch constant gives the EXACT byte range (address<<2, size<<2).
+    uint32_t vtx0_base = 0, vtx0_size = 0;
+    if (beta_current_vs_) {
+      for (const auto& vb : beta_current_vs_->vertex_bindings()) {
+        xenos::xe_gpu_vertex_fetch_t f{};
+        f.dword_0 = regs[0x4800 + vb.fetch_constant * 2];
+        f.dword_1 = regs[0x4800 + vb.fetch_constant * 2 + 1];
+        uint32_t size = f.size << 2;
+        if (size > 16u * 0x100000u) size = 16u * 0x100000u;  // ring-safe cap (bad-decode guard)
+        if (!vtx0_base) { vtx0_base = f.address << 2; vtx0_size = size; }
+        request(f.address << 2, size, /*invalidate=*/true);
+      }
+    }
+    // Index buffer (guest DMA only): the draw reads indices straight from shared memory at
+    // guest_base; kHostConverted/kHostBuiltin index buffers live in host-owned buffers, not
+    // shared memory, so they need no residency. The IndexBufferInfo gives the exact range.
+    if (result.index_buffer_type ==
+            rex::graphics::PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA &&
+        index_buffer_info) {
+      request(index_buffer_info->guest_base, uint32_t(index_buffer_info->length),
+              /*invalidate=*/true);
+    }
+    // VTX_DIAG: does guest RAM (CPU side) even hold vertex data at the decoded base? If nz=0
+    // here, the address decode is wrong or the game wrote the verts elsewhere (residency can't
+    // help); if nz>0, the data is present and the question is whether our upload delivers it.
+    if (vtx_diag && vtx0_base && memory_ && beta_takeover_rendered_ < 48) {
+      uint32_t nz = 0;
+      const uint8_t* vp = memory_->TranslatePhysical<const uint8_t*>(vtx0_base);
+      if (vp) for (int b = 0; b < 256; ++b) if (vp[b]) ++nz;
+      REXLOG_INFO("[nhl-beta] VTX-DIAG #{} vbinds={} vtx0=0x{:X} size={} guestRAM-nz={}/256 "
+                  "idx_type={} host_vtx={} vport={}",
+                  beta_takeover_rendered_,
+                  beta_current_vs_ ? uint32_t(beta_current_vs_->vertex_bindings().size()) : 0u,
+                  vtx0_base, vtx0_size, nz, uint32_t(result.index_buffer_type),
+                  result.host_draw_vertex_count, vport_xform ? 1 : 0);
+    }
+    // Textures (PS + VS, PRE-translation bindings -- the after-translation used mask is 0 on
+    // many live draws so don't gate on it): SDK GetTextureTotalSize/FormatInfo::Get are
+    // unexported, so use a fixed window -- the game's textures are packed contiguously so any
+    // over-read lands in adjacent texture data (safe; a raw high-RAM scan HANGS). The untile
+    // reads these from shared memory.
+    uint32_t win = 6u * 0x100000u;
+    if (const char* w = std::getenv("NHL_BETA_TEX_WIN_MB")) win = uint32_t(std::strtoul(w, nullptr, 10)) * 0x100000u;
+    auto request_tex = [&](auto* sh) {
+      if (!sh) return;
+      for (const auto& tb : sh->texture_bindings()) {
+        xenos::xe_gpu_texture_fetch_t tf{};
+        std::memcpy(&tf, &regs[0x4800 + tb.fetch_constant * 6], 6 * 4);
+        const uint32_t base = uint32_t(tf.base_address) << 12;
+        const uint32_t tw = uint32_t(tf.size_2d.width) + 1, th = uint32_t(tf.size_2d.height) + 1;
+        if (tw < 2 || tw > 8192 || th < 2 || th > 8192) continue;  // not a 2D texture fetch
+        request(base, win, /*invalidate=*/false);  // textures: write-watch (6MB window blows ring if forced)
+      }
+    };
+    request_tex(eff_ps);
+    request_tex(beta_current_vs_);
+    // Commit the uploads, then transition to the read state for the IA/VS fetch + the untile.
+    NotifyQueueOperationsDoneDirectly();
+    beta_shared_memory_->UseForReading();
+    // HARD CONSTRAINT WATCH: a single FRAME's total dirty upload must stay under the SDK
+    // upload ring (~20 MB) -- beta cannot flush mid-recording in live (the game owns the
+    // queue submission; a RequestRange whose dirty payload exceeds the ring deadlocks). Per-
+    // draw residency spreads it and RequestRange skips clean pages, so steady state only
+    // moves this frame's dynamic deltas. The accumulator is an UPPER BOUND (it counts every
+    // requested byte, not just dirty ones); if it nears the ring on a heavy frame, that is
+    // the deadlock risk to investigate. Reset per frame in IssueSwap.
+    beta_live_frame_req_bytes_ += req_bytes;
+    if (req_bytes && beta_live_frame_req_bytes_ > 18u * 0x100000u && !beta_live_ring_warned_) {
+      beta_live_ring_warned_ = true;
+      REXLOG_WARN("[nhl-beta] LIVE per-draw residency: frame requested {} MB (> ~18 MB) -- "
+                  "approaching the ~20 MB upload ring; a heavier frame may deadlock the flush",
+                  beta_live_frame_req_bytes_ / 0x100000);
+    }
+    beta_live_frame_inv_bytes_ += inv_bytes;
+    if (live_trace2 && req_bytes && beta_takeover_rendered_ < 64) {
+      REXLOG_INFO("[nhl-beta] LIVE-TRACE: perdraw-resident #{} req={} KB inv={} ranges/{} KB "
+                  "(frame total req {} KB, forced-upload {} KB)",
+                  beta_takeover_rendered_, req_bytes / 1024, inv_ranges, inv_bytes / 1024,
+                  beta_live_frame_req_bytes_ / 1024, beta_live_frame_inv_bytes_ / 1024);
+    }
+  }
   if (used_tex_mask) {
     // CRITICAL: invalidate the texture cache's per-slot binding sync before resolving.
     // The cache caches which guest texture each fetch-constant slot maps to and only
@@ -2029,8 +2484,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // the flag) — clouds/UI all rendered the flag. Marking all 32 slots dirty forces
     // RequestTextures to re-read the current draw's fetch constants; unchanged textures
     // stay cached by content hash, so this only re-resolves bindings, not data.
+    if (std::getenv("NHL_BETA_LIVE_TRACE")) REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-RequestTextures(mask=0x{:X})", used_tex_mask);
     beta_texture_cache_->TextureFetchConstantsWritten(0, 31);
     beta_texture_cache_->RequestTextures(used_tex_mask);
+    if (std::getenv("NHL_BETA_LIVE_TRACE")) REXLOG_INFO("[nhl-beta] LIVE-TRACE: post-RequestTextures");
   }
   if (edram_rov) {
     uint32_t textures_resolution_scaled = 0;
@@ -2135,7 +2592,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   D3D12_GPU_DESCRIPTOR_HANDLE tex_table_vs{0}, tex_table_ps{0}, samp_table_vs{0}, samp_table_ps{0};
   const bool beta_faketex = std::getenv("NHL_BETA_FAKETEX") != nullptr;
   if (beta_faketex && ps_tex_n) EnsureBetaFakeTexture();
-  auto write_tex_table = [&](const auto& tbs, D3D12_GPU_DESCRIPTOR_HANDLE& out) {
+  auto write_tex_table = [&](const auto& tbs, D3D12_GPU_DESCRIPTOR_HANDLE& out,
+                             bool is_vertex_stage) {
     if (tbs.empty() || !view_ok) return;
     out.ptr = view_gpu.ptr + UINT64(view_off) * view_inc;
     static const bool flat_sub = std::getenv("NHL_BETA_FLAT") != nullptr;
@@ -2166,6 +2624,124 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           continue;
         }
       }
+      // VS-texture CPU-upload path: linear k_32_32_32_32_FLOAT 2D textures sampled by
+      // the vertex shader (the create-player skinning palette) load as ZERO through
+      // the SDK cache on our owned path — bind a CPU-built copy instead (see
+      // EnsureBetaVsTexSub). The shader declares texture2dARRAY, so the SRV must be
+      // TEXTURE2DARRAY (a plain TEXTURE2D SRV samples as zero — the FAKETEX pitfall).
+      static const bool no_vstex_cpu = std::getenv("NHL_BETA_NO_VSTEX_CPU") != nullptr;
+      if (is_vertex_stage && !no_vstex_cpu) {
+        xenos::xe_gpu_texture_fetch_t btf{};
+        std::memcpy(&btf, &regs[0x4800 + tbs[i].fetch_constant * 6], 24);
+        const uint32_t bbase = uint32_t(btf.base_address) << 12;
+        if (bbase && uint32_t(btf.format) == uint32_t(xenos::TextureFormat::k_32_32_32_32_FLOAT) &&
+            !btf.tiled && uint32_t(btf.dimension) == uint32_t(xenos::DataDimension::k2DOrStacked) &&
+            !btf.stacked) {
+          BetaVsTexEntry* e = EnsureBetaVsTexSub(bbase, uint32_t(btf.size_2d.width) + 1,
+                                                 uint32_t(btf.size_2d.height) + 1);
+          if (e && e->ready) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sd.Texture2DArray.MipLevels = 1;
+            sd.Texture2DArray.ArraySize = 1;
+            GetD3D12Provider().GetDevice()->CreateShaderResourceView(e->tex.Get(), &sd, h);
+            continue;
+          }
+        }
+      }
+      // PS-texture diagnostics + missing-texture transparency mitigation. The scene_04
+      // glass / end-netting forward pass derives its output ALPHA from a texture
+      // (PS: oC0.w = tf0.a) whose guest data is absent in this trace; beta renders the
+      // missing texture as white-opaque, turning the transparent glass into an opaque
+      // wall over the near ice. NHL_BETA_PSTEX_DIAG logs each PS texture's binding
+      // state; NHL_BETA_PS_TRANSP_RANGE=lo-hi binds a NULL SRV (samples (0,0,0,0) ->
+      // alpha 0) for PS textures of draws in [lo,hi], so the geometry renders transparent.
+      if (!is_vertex_stage) {
+        if (std::getenv("NHL_BETA_PSTEX_DIAG")) {
+          xenos::xe_gpu_texture_fetch_t df{};
+          std::memcpy(&df, &regs[0x4800 + tbs[i].fetch_constant * 6], 24);
+          const uint32_t dbase = uint32_t(df.base_address) << 12;
+          uint32_t dnz = 0;
+          if (memory_ && dbase) {
+            const uint8_t* dp = memory_->TranslatePhysical<const uint8_t*>(dbase);
+            if (dp) for (int b = 0; b < 4096; ++b) if (dp[b]) ++dnz;
+          }
+          REXLOG_INFO("[nhl-beta] pstex #{} slot{} fc={} base=0x{:X} {}x{} fmt={} "
+                      "host_swizzle=0x{:X} guest-RAM nz={}/4096",
+                      beta_takeover_rendered_, uint32_t(i), tbs[i].fetch_constant, dbase,
+                      uint32_t(df.size_2d.width) + 1, uint32_t(df.size_2d.height) + 1,
+                      uint32_t(df.format),
+                      beta_texture_cache_->GetActiveTextureHostSwizzle(tbs[i].fetch_constant), dnz);
+        }
+        // Missing-texture transparency (OPT-IN: NHL_BETA_MISSING_TRANSP=1; or
+        // NHL_BETA_PS_TRANSP_RANGE=lo-hi forces a draw range). An ALPHA-BLENDED 3D draw whose
+        // sampled texture's guest data is ABSENT this frame (nz=0) gets a NULL SRV (samples
+        // (0,0,0,0) -> alpha 0) instead of the texture cache's stale content. The scene_04
+        // rink glass / end-netting derive their coverage alpha from such a texture
+        // (PS: oC0.w = tf0.a); with stale white cache content beta drew them as an opaque wall
+        // over the near ice — this flag makes them transparent, restoring the near-ice view.
+        //
+        // WHY OPT-IN (not default): nz=0 in CPU guest RAM does NOT reliably mean "missing".
+        // A texture loaded earlier in the trace whose source page was later freed also reads
+        // nz=0 yet has VALID cached content (e.g. scene_02's create-player equipment thumbnails
+        // — same vte=0x43F/blended/nz=0/ext signature as the glass). beta cannot tell stale
+        // garbage from valid-cached without inspecting the cached texels, so forcing transparent
+        // would wrongly blank those. Default-off keeps every validated scene byte-identical;
+        // enable for gameplay (scene_04) where the glass/netting trace-gap dominates. The real
+        // fix is capture-side: a warm-texture capture provides the glass/netting alpha texture.
+        bool force_transp = false;
+        if (const char* rg = std::getenv("NHL_BETA_PS_TRANSP_RANGE")) {
+          char* dash = nullptr;
+          const unsigned long lo = std::strtoul(rg, &dash, 10);
+          const unsigned long hi = (dash && *dash) ? std::strtoul(dash + 1, nullptr, 10) : lo;
+          force_transp = beta_takeover_rendered_ >= uint32_t(lo) &&
+                         beta_takeover_rendered_ <= uint32_t(hi);
+        } else if (std::getenv("NHL_BETA_MISSING_TRANSP")) {
+          const uint32_t blend0 = (*register_file_)[0x2201];  // RB_BLENDCONTROL0
+          const bool blended = ((blend0 >> 8) & 0x1Fu) != 0u;  // color_dst_blend != ZERO
+          if (blended && vport_xform) {  // 3D transparency geometry only
+            xenos::xe_gpu_texture_fetch_t df{};
+            std::memcpy(&df, &regs[0x4800 + tbs[i].fetch_constant * 6], 24);
+            const uint32_t dbase = uint32_t(df.base_address) << 12;
+            if (dbase && memory_) {
+              const uint8_t* dp = memory_->TranslatePhysical<const uint8_t*>(dbase);
+              if (dp) {
+                bool absent = true;
+                for (int b = 0; b < 4096; ++b) {
+                  if (dp[b]) { absent = false; break; }  // present textures early-out cheaply
+                }
+                force_transp = absent;
+              }
+            }
+          }
+        }
+        if (force_transp) {
+          // NHL_BETA_PS_SHOW: bind the solid-RED fake texture (alpha 255 -> opaque) instead
+          // of null, so the affected geometry shows its SHAPE in red (verification: confirm
+          // the forced-transparent draws really are the rink glass panes + end nets).
+          if (std::getenv("NHL_BETA_PS_SHOW")) {
+            EnsureBetaFakeTexture();
+            if (beta_fake_tex_ready_) {
+              D3D12_SHADER_RESOURCE_VIEW_DESC sr{};
+              sr.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+              sr.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              sr.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              sr.Texture2D.MipLevels = 1;
+              GetD3D12Provider().GetDevice()->CreateShaderResourceView(beta_fake_tex_.Get(), &sr, h);
+              continue;
+            }
+          }
+          D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+          sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+          sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+          sd.Texture2D.MipLevels = 1;
+          GetD3D12Provider().GetDevice()->CreateShaderResourceView(nullptr, &sd, h);  // null -> 0
+          continue;
+        }
+      }
       if (beta_faketex && beta_fake_tex_ready_) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
         sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2192,10 +2768,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   if (std::getenv("NHL_BETA_BIND_DIAG")) {
     REXLOG_INFO("[nhl-beta] bind#{}: ps_tex={} ps_samp={} vs_tex={} vs_samp={} -> idx(tp={} sp={} "
                 "tv={} sv={}) total={} rast_done={} ncm=0x{:X} used_tex_mask=0x{:X} "
-                "ps_used_mask=0x{:X}",
+                "ps_used_mask=0x{:X} submission={} frame_open={}",
                 beta_takeover_rendered_, ps_tex_n, ps_samp_n, vs_texs.size(), vs_samps.size(),
                 idx_tex_ps, idx_samp_ps, idx_tex_vs, idx_samp_vs, next_param, rast_done, ncm,
-                used_tex_mask, eff_ps ? eff_ps->GetUsedTextureMaskAfterTranslation() : 0u);
+                used_tex_mask, eff_ps ? eff_ps->GetUsedTextureMaskAfterTranslation() : 0u,
+                GetCurrentSubmission(), GetCurrentFrame());
     // Geometry/blend/alpha state for textured draws (only): is the textured draw set
     // up to actually put visible color on screen, or is it culled / alpha-killed /
     // zero-blended / mis-transformed?
@@ -2255,9 +2832,61 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                       uint32_t(tf.mip_address) << 12, tex_nz);
         }
       }
+      // VS texture identity (same decode as the PS loop above): the create-player VS
+      // skins through a BONE-MATRIX texture fetched in the vertex shader (tf16). If its
+      // guest data is absent/zero at draw time, the skinning matrix is 0 => all verts
+      // collapse => zero rasterized pixels with every other state correct.
+      if (beta_current_vs_) {
+        for (const auto& tb : beta_current_vs_->texture_bindings()) {
+          const uint32_t fc6 = 0x4800 + tb.fetch_constant * 6;
+          xenos::xe_gpu_texture_fetch_t tf{};
+          std::memcpy(&tf, &regs[fc6], 6 * 4);
+          const uint32_t tex_base = uint32_t(tf.base_address) << 12;
+          // Scan the FULL texture extent (the bone arena may be zero-padded at its base
+          // with the live pose matrices at a higher offset): nonzero bytes + first/last
+          // nonzero offset across width*height*8B (k_16_16_16_16_FLOAT).
+          uint32_t tex_nz = 0;
+          uint32_t first_nz_off = UINT32_MAX, last_nz_off = 0;
+          const uint32_t scan_bytes =
+              (uint32_t(tf.size_2d.width) + 1) * (uint32_t(tf.size_2d.height) + 1) * 8;
+          if (memory_ && tex_base) {
+            const uint8_t* tram = memory_->TranslatePhysical<const uint8_t*>(tex_base);
+            if (tram) {
+              for (uint32_t i = 0; i < scan_bytes; ++i) {
+                if (tram[i]) {
+                  ++tex_nz;
+                  if (i < first_nz_off) first_nz_off = i;
+                  last_nz_off = i;
+                }
+              }
+            }
+          }
+          // host_swizzle == XE_GPU_TEXTURE_SWIZZLE_0000 (0) means the cache has NO
+          // valid binding for this slot (rejected fetch constant / failed resolve)
+          // => WriteActiveTextureBindfulSRV writes a NULL SRV => samples read zero.
+          const uint32_t host_swiz = beta_texture_cache_->GetActiveTextureHostSwizzle(tb.fetch_constant);
+          REXLOG_INFO("[nhl-beta]   VS-tex#{} fc={} base=0x{:X} {}x{} fmt={} swizzle=0x{:X} "
+                      "tiled={} endian={} pitch={} stacked={} dim={} host_swizzle=0x{:X} "
+                      "raw_fc=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] DRAW-TIME guest-RAM "
+                      "nz={}/{} first_nz=0x{:X} last_nz=0x{:X}",
+                      beta_takeover_rendered_, tb.fetch_constant, tex_base,
+                      uint32_t(tf.size_2d.width) + 1, uint32_t(tf.size_2d.height) + 1,
+                      uint32_t(tf.format), uint32_t(tf.swizzle), uint32_t(tf.tiled),
+                      uint32_t(tf.endianness), uint32_t(tf.pitch), uint32_t(tf.stacked),
+                      uint32_t(tf.dimension), host_swiz, regs[fc6], regs[fc6 + 1], regs[fc6 + 2],
+                      regs[fc6 + 3], regs[fc6 + 4], regs[fc6 + 5], tex_nz, scan_bytes,
+                      first_nz_off == UINT32_MAX ? 0 : first_nz_off, last_nz_off);
+        }
+      }
       // Dump the textured VS/PS ucode disassembly once so the fetch + transform
       // instructions can be inspected offline (why the verts may be degenerate).
-      if (!beta_ucode_dumped_) {
+      // NHL_BETA_UCODE_DRAW=<rendered idx> selects WHICH textured draw to dump
+      // (default: the first one).
+      static const char* ucode_draw_env = std::getenv("NHL_BETA_UCODE_DRAW");
+      const bool ucode_this_draw =
+          !ucode_draw_env ||
+          beta_takeover_rendered_ == uint32_t(std::strtoul(ucode_draw_env, nullptr, 10));
+      if (!beta_ucode_dumped_ && ucode_this_draw) {
         beta_ucode_dumped_ = true;
         FILE* f = std::fopen("beta_textured_ucode.txt", "w");
         if (f) {
@@ -2360,13 +2989,23 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                       v[3]);
         }
       }
+      // Skinning-texcoord constants (create-player VS): c44/c248/c255 scale the bone
+      // indices into tf16 texel coords. Zero c248/c255 => every fetch lands on texel
+      // (0,0) => zero matrix => collapsed verts. Also report whether the bitmap covers
+      // them (a missing bit = the packed CBV omits them = translator reads other slots).
+      for (uint32_t s : {44u, 248u, 255u}) {
+        const float* v = reinterpret_cast<const float*>(&regs[0x4000 + s * 4]);
+        const bool in_bitmap = (vs_crm.float_bitmap[s / 64] >> (s % 64)) & 1;
+        REXLOG_INFO("[nhl-beta]     c[{}]=({:.6f},{:.6f},{:.6f},{:.6f}) in_bitmap={}", s, v[0],
+                    v[1], v[2], v[3], in_bitmap);
+      }
     }
   }
-  if (idx_tex_ps != kUnavail) write_tex_table(ps_texs, tex_table_ps);
+  if (idx_tex_ps != kUnavail) write_tex_table(ps_texs, tex_table_ps, /*is_vertex_stage=*/false);
   if (idx_samp_ps != kUnavail) {
     write_samp_table(eff_ps->GetSamplerBindingsAfterTranslation(), samp_table_ps);
   }
-  if (idx_tex_vs != kUnavail) write_tex_table(vs_texs, tex_table_vs);
+  if (idx_tex_vs != kUnavail) write_tex_table(vs_texs, tex_table_vs, /*is_vertex_stage=*/true);
   if (idx_samp_vs != kUnavail) write_samp_table(vs_samps, samp_table_vs);
 
   // NHL_BETA_VTX_DUMP=<draw_index>: ground-truth decode of this draw's vertex
@@ -2565,6 +3204,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     const bool want_zen = ze[0] == '1';
     if (want_zen != (ndc.z_enable != 0)) skip_this = true;
   }
+  if (first_draw && std::getenv("NHL_BETA_LIVE_TRACE")) REXLOG_INFO("[nhl-beta] LIVE-TRACE: pre-D3DDraw (vtx={})", result.host_draw_vertex_count);
   if (!std::getenv("NHL_BETA_NODRAW") && !skip_untex && !skip_this) {
     using PP = rex::graphics::PrimitiveProcessor;
     if (result.index_buffer_type == PP::kNone) {
@@ -2657,8 +3297,170 @@ void NhlD3D12CommandProcessor::FinalizeBetaTakeoverCapture() {
   PushTransitionBarrier(beta_offscreen_rt_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_RENDER_TARGET);
   SubmitBarriers();
+  // GPU-side ground truth for the offscreen-RT path too (was EDRAM-only): copy the
+  // NHL_BETA_GPUDUMP guest addresses out of OUR shared-memory buffer at end of frame.
+  RecordBetaGpuDumps();
   beta_capture_pending_ = true;
   beta_capture_submission_ = GetCurrentSubmission();
+}
+
+bool NhlD3D12CommandProcessor::EnsureBetaPresentPipeline() {
+  if (beta_present_pso_) {
+    return true;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  if (!device) {
+    return false;
+  }
+  // Compute copy: read our RGBA8 RT (normalized float4), write the presenter's UAV output
+  // (whatever its format is — R10G10B10A2, RGBA8, ... — the typed-UAV store converts).
+  static const char kCS[] =
+      "Texture2D<float4> src : register(t0);\n"
+      "RWTexture2D<float4> dst : register(u0);\n"
+      "[numthreads(8,8,1)]\n"
+      "void main(uint3 id : SV_DispatchThreadID){\n"
+      "  uint w,h; dst.GetDimensions(w,h);\n"
+      "  if (id.x<w && id.y<h) dst[id.xy] = src[int2(id.xy)];\n"
+      "}\n";
+  Microsoft::WRL::ComPtr<ID3DBlob> cs, err;
+  if (FAILED(D3DCompile(kCS, sizeof(kCS) - 1, "beta_present_cs", nullptr, nullptr, "main", "cs_5_0",
+                        0, 0, &cs, &err))) {
+    REXLOG_ERROR("[nhl-beta] present CS compile failed: {}",
+                 err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
+    return false;
+  }
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  ranges[0].NumDescriptors = 1;
+  ranges[0].OffsetInDescriptorsFromTableStart = 0;
+  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+  ranges[1].NumDescriptors = 1;
+  ranges[1].OffsetInDescriptorsFromTableStart = 1;
+  D3D12_ROOT_PARAMETER rp{};
+  rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rp.DescriptorTable.NumDescriptorRanges = 2;
+  rp.DescriptorTable.pDescriptorRanges = ranges;
+  rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC rsd{};
+  rsd.NumParameters = 1;
+  rsd.pParameters = &rp;
+  Microsoft::WRL::ComPtr<ID3DBlob> rsb, rse;
+  if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rsb, &rse)) ||
+      FAILED(device->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(),
+                                         IID_PPV_ARGS(&beta_present_rootsig_)))) {
+    REXLOG_ERROR("[nhl-beta] present root signature failed");
+    return false;
+  }
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+  pd.pRootSignature = beta_present_rootsig_.Get();
+  pd.CS.pShaderBytecode = cs->GetBufferPointer();
+  pd.CS.BytecodeLength = cs->GetBufferSize();
+  if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&beta_present_pso_)))) {
+    REXLOG_ERROR("[nhl-beta] present PSO failed");
+    beta_present_rootsig_.Reset();
+    return false;
+  }
+  D3D12_DESCRIPTOR_HEAP_DESC hd{};
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+  hd.NumDescriptors = 2;
+  hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&beta_present_heap_)))) {
+    REXLOG_ERROR("[nhl-beta] present descriptor heap failed");
+    return false;
+  }
+  return true;
+}
+
+void NhlD3D12CommandProcessor::PresentBetaLiveFrame() {
+  // Live present (NHL_BETA_LIVE): show our offscreen RT in the window every frame via the SDK
+  // presenter. RefreshGuestOutput hands the refresher the presenter's UAV output texture; a
+  // compute shader copies our RGBA8 RT into it (CopyResource can't convert RGBA8 -> the
+  // presenter's R10G10B10A2). One-shot DIRECT-queue list, fence-synced. Runs AFTER base
+  // IssueSwap's EndSubmission, so our beta draws have executed and the RT is rendered.
+  if (!graphics_system_ || !beta_offscreen_rt_ || !EnsureBetaPresentPipeline()) {
+    return;
+  }
+  auto* presenter = graphics_system_->presenter();
+  if (!presenter) {
+    return;
+  }
+  ID3D12Device* device = GetD3D12Provider().GetDevice();
+  ID3D12CommandQueue* queue = GetD3D12Provider().GetDirectQueue();
+  if (!device || !queue) {
+    return;
+  }
+  ID3D12Resource* src = beta_offscreen_rt_.Get();
+  const uint32_t w = beta_rt_width_ ? beta_rt_width_ : 1280u;
+  const uint32_t h = beta_rt_height_ ? beta_rt_height_ : 720u;
+  presenter->RefreshGuestOutput(
+      w, h, w, h,
+      [this, device, queue, src, w, h](rex::ui::Presenter::GuestOutputRefreshContext& ctx) -> bool {
+        ctx.SetIs8bpc(true);  // our RT is 8-bit-per-channel RGBA
+        ID3D12Resource* out =
+            static_cast<rex::ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(ctx)
+                .resource_uav_capable();
+        if (!out) {
+          return false;
+        }
+        const UINT inc =
+            device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu0 =
+            beta_present_heap_->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu0;
+        cpu1.ptr += inc;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(src, &srv, cpu0);
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+        uav.Format = out->GetDesc().Format;  // the presenter's actual output format
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(out, nullptr, &uav, cpu1);
+
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&alloc))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(),
+                                            nullptr, IID_PPV_ARGS(&list)))) {
+          return false;
+        }
+        // src: RENDER_TARGET (last draw left it bound) -> SRV; out: COMMON -> UAV.
+        D3D12_RESOURCE_BARRIER b[2] = {};
+        b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b[0].Transition.pResource = src;
+        b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        b[1] = b[0];
+        b[1].Transition.pResource = out;
+        b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        list->ResourceBarrier(2, b);
+        ID3D12DescriptorHeap* heaps[] = {beta_present_heap_.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootSignature(beta_present_rootsig_.Get());
+        list->SetPipelineState(beta_present_pso_.Get());
+        list->SetComputeRootDescriptorTable(
+            0, beta_present_heap_->GetGPUDescriptorHandleForHeapStart());
+        list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        std::swap(b[0].Transition.StateBefore, b[0].Transition.StateAfter);  // src -> RENDER_TARGET
+        std::swap(b[1].Transition.StateBefore, b[1].Transition.StateAfter);  // out -> COMMON
+        list->ResourceBarrier(2, b);
+        if (FAILED(list->Close())) {
+          return false;
+        }
+        ID3D12CommandList* lists[] = {list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        if (SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
+          queue->Signal(fence.Get(), 1);
+          for (int i = 0; i < 4000 && fence->GetCompletedValue() < 1; ++i) Sleep(1);
+        }
+        return true;
+      });
 }
 
 void NhlD3D12CommandProcessor::CaptureBetaEdramSwap() {
@@ -3418,6 +4220,13 @@ bool NhlD3D12CommandProcessor::SetupContext() {
       // Phase 5: NHL_BETA_EDRAM routes the owned draw through the RT cache (multi-pass /
       // resolve-aware) instead of the single offscreen RTV. Cached once here.
       beta_edram_enabled_ = std::getenv("NHL_BETA_EDRAM") != nullptr;
+      // NHL_BETA_LIVE: render EVERY frame and present our RT to the window (continuous
+      // interactive rendering), instead of the single-capture-frame -> PNG validation flow.
+      beta_live_ = std::getenv("NHL_BETA_LIVE") != nullptr;
+      if (beta_live_) {
+        REXLOG_INFO("[nhl-beta] LIVE mode: every frame rendered by our backend + presented "
+                    "via the SDK presenter (no capture-frame gate, no PNG readback)");
+      }
       REXLOG_INFO("[nhl-beta] TAKEOVER mode (EDRAM multi-pass={}): IssueDraw will NOT delegate to "
                   "base; our backend renders the frame into the already-open submission (no base "
                   "draws -> no command-list contamination)",
@@ -3466,6 +4275,14 @@ void NhlD3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint3
   }
   ++beta_trace_writes_seen_;
   beta_trace_write_bytes_ += length;
+  // VS-texture CPU-upload path: a trace write over a substituted texture's backing
+  // range means its host copy is stale — re-upload at the next bind.
+  for (auto& [sub_base, sub] : beta_vstex_subs_) {
+    const uint64_t sub_bytes = uint64_t(sub.width) * sub.height * 16;
+    if (sub_base < base_ptr + length && base_ptr < sub_base + sub_bytes) {
+      sub.dirty = true;
+    }
+  }
   // Diagnostic: does the trace EVER deliver the bytes for a specific guest address?
   // Set NHL_BETA_WATCH_ADDR=0x17193000 to log every trace memory write that covers it.
   // If a black texture's base is never logged across the whole replay, the trace simply
@@ -3484,9 +4301,27 @@ void NhlD3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint3
           }
         }
       }
-      REXLOG_INFO("[nhl-beta] WATCH 0x{:X} COVERED by trace write [0x{:X}+0x{:X}); "
-                  "guest-RAM nz={}/256 after write",
-                  watch, base_ptr, length, nz);
+      // Bone-arena double-buffer fingerprint: per-frame nz at row 3 (+0x2400) and
+      // row 6 (+0x4800) of the watched texture (3072B rows, k_16_16_16_16_FLOAT).
+      // If the populated window ALTERNATES between frames, the game double-buffers
+      // the matrix arena and a stale (pre-write) texture is what a frame's draws
+      // actually need.
+      uint32_t nz_r3 = 0, nz_r6 = 0;
+      if (memory_) {
+        if (const uint8_t* p3 = memory_->TranslatePhysical<const uint8_t*>(watch + 0x2400)) {
+          for (int i = 0; i < 256; ++i) {
+            if (p3[i]) ++nz_r3;
+          }
+        }
+        if (const uint8_t* p6 = memory_->TranslatePhysical<const uint8_t*>(watch + 0x4800)) {
+          for (int i = 0; i < 256; ++i) {
+            if (p6[i]) ++nz_r6;
+          }
+        }
+      }
+      REXLOG_INFO("[nhl-beta] WATCH 0x{:X} COVERED by trace write [0x{:X}+0x{:X}); frame={} "
+                  "guest-RAM nz={}/256 row3_nz={}/256 row6_nz={}/256 after write",
+                  watch, base_ptr, length, frame_index_, nz, nz_r3, nz_r6);
     }
   }
 }
@@ -3579,25 +4414,59 @@ bool NhlD3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, ui
   // our backend; no-op the rest (return true so the front-end keeps walking the
   // frame). Output is captured via the offscreen RT readback at IssueSwap.
   if (beta_takeover_) {
+    // LIVE deferred takeover (NHL_BETA_LIVE_START_FRAME=N): let the BASE path render+present
+    // the boot/loading frames normally, then start owned rendering at frame N. Taking over
+    // from frame 0 stalls the game's loading phase (which depends on base GPU work at load
+    // time), so deferring past the boot is needed for live-game rendering. Default 0 = no
+    // defer (replay/validation takes over immediately).
+    if (beta_live_ && !beta_live_active_) {
+      // Arm the takeover by fixed frame (NHL_BETA_LIVE_START_FRAME, default 0 = immediate --
+      // used by replay/automated runs) OR the F10 hotkey when NHL_BETA_LIVE_HOTKEY is set.
+      // Interactive use: boot the real game, skip/wait through the dynamic intro VIDEO to a
+      // static menu by eye, then press F10. Fixed frames can't reliably land on the menu
+      // (boot timing is non-deterministic and beta's overhead slows it -> a fixed frame may
+      // still be mid-video, where the per-frame-changing video texture renders black/green).
+      static const bool hotkey_only = std::getenv("NHL_BETA_LIVE_HOTKEY") != nullptr;
+      static const uint32_t live_start = []() -> uint32_t {
+        const char* f = std::getenv("NHL_BETA_LIVE_START_FRAME");
+        return f ? uint32_t(std::strtoul(f, nullptr, 10)) : 0u;
+      }();
+      constexpr int kVkF10 = 0x79;
+      const bool f10 = (GetAsyncKeyState(kVkF10) & 0x8000) != 0;
+      if ((!hotkey_only && frame_index_ >= live_start) || f10) {
+        beta_live_active_ = true;
+        REXLOG_INFO("[nhl-beta] LIVE takeover ACTIVE at frame {} (via {})", frame_index_,
+                    f10 ? "F10 hotkey" : "start frame");
+      } else {
+        const bool ok0 = d3d12::D3D12CommandProcessor::IssueDraw(
+            primitive_type, index_count, index_buffer_info, major_mode_explicit);
+        if (ok0) ++draws_ok_this_frame_;
+        return ok0;
+      }
+    }
     // We capture ONE frame for parity validation. Once it's dumped, stop doing owned
     // draws entirely: on a multi-frame streaming trace the base closes/reopens the
     // submission between frames, so a post-capture RenderBetaOwnedDraw would call
     // GetDeferredCommandList() with no submission open (assert submission_open_,
     // command_processor.h:72). No-op every later draw — the frame we needed is saved.
-    if (beta_capture_done_) {
-      return true;
-    }
-    // NHL_BETA_CAPTURE_FRAME=N: capture frame N instead of frame 0 (streaming traces
-    // often open on a dark transition/montage frame — frame 0 of gameplay is a fullscreen
-    // dark overlay, useless for parity). Defer ALL owned rendering until frame N: since
-    // nothing renders before it, beta_takeover_rendered_ stays 0, so frame N's first draw
-    // triggers the one-time RT clear and its IssueSwap finalizes the capture.
-    static const uint32_t capture_frame = []() -> uint32_t {
-      const char* f = std::getenv("NHL_BETA_CAPTURE_FRAME");
-      return f ? uint32_t(std::strtoul(f, nullptr, 10)) : 0u;
-    }();
-    if (frame_index_ != capture_frame) {
-      return true;
+    // LIVE mode renders EVERY frame (continuous interactive rendering); the
+    // capture-frame gate below is the validation flow (render one frame -> PNG).
+    if (!beta_live_) {
+      if (beta_capture_done_) {
+        return true;
+      }
+      // NHL_BETA_CAPTURE_FRAME=N: capture frame N instead of frame 0 (streaming traces
+      // often open on a dark transition/montage frame — frame 0 of gameplay is a fullscreen
+      // dark overlay, useless for parity). Defer ALL owned rendering until frame N: since
+      // nothing renders before it, beta_takeover_rendered_ stays 0, so frame N's first draw
+      // triggers the one-time RT clear and its IssueSwap finalizes the capture.
+      static const uint32_t capture_frame = []() -> uint32_t {
+        const char* f = std::getenv("NHL_BETA_CAPTURE_FRAME");
+        return f ? uint32_t(std::strtoul(f, nullptr, 10)) : 0u;
+      }();
+      if (frame_index_ != capture_frame) {
+        return true;
+      }
     }
     // Render every draw into our offscreen RT (accumulating); the per-frame copy
     // is recorded in FinalizeBetaTakeoverCapture() at IssueSwap. No base draws =>
@@ -3933,7 +4802,15 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
   // Record our once-per-frame capture copy into the still-open submission BEFORE the base
   // closes it (base IssueSwap calls EndSubmission/ExecuteCommandLists). EDRAM mode reads the
   // resolved frontbuffer guest texture; the offscreen-RTV path copies our accumulated RT.
-  if (beta_takeover_) {
+  // LIVE mode skips this — it presents directly from the RT after the base swap instead.
+  if (beta_takeover_ && (!beta_live_ || beta_live_rt_dump_pending_)) {
+    // In live, F11 arms a one-shot direct dump of beta's offscreen RT (ground truth for
+    // what beta rendered). Reset the capture latch so a repeat F11 can re-dump.
+    if (beta_live_) {
+      beta_capture_pending_ = false;
+      beta_capture_done_ = false;
+      beta_live_rt_dump_pending_ = false;
+    }
     if (beta_edram_enabled_) {
       CaptureBetaEdramSwap();
     } else {
@@ -3942,6 +4819,31 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
   }
 
   d3d12::D3D12CommandProcessor::IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+
+  // LIVE mode: present our just-rendered RT to the window, then reset per-frame state so the
+  // next frame re-clears the RT + re-BeginFrame's the beta caches (gated on first_draw, i.e.
+  // beta_takeover_rendered_ == 0). The base IssueSwap above already EndSubmission'd our draws.
+  if (beta_takeover_ && beta_live_) {
+    // NHL_BETA_NO_PRESENT: skip the present to isolate whether its one-shot DIRECT-queue
+    // command list + fence wait is what deadlocks the per-frame ring/pool recycle.
+    if (beta_takeover_rendered_ > 0 && !std::getenv("NHL_BETA_NO_PRESENT")) {
+      PresentBetaLiveFrame();
+    }
+    // Option-(c) probe dump (one-shot, self-gates on pending_). PresentBetaLiveFrame's
+    // fence-wait above guarantees the probe-copy submission (an earlier submission) has
+    // completed, so the readback is valid. Logs whether RequestRange populated our buffer
+    // -- decisive for whether live write-watches fired (see NHL_BETA_LIVE_NO_INVALIDATE).
+    if (beta_shmem_probe_pending_) DumpBetaSharedMemoryProbe();
+    // Reset per-frame state. With beta_takeover_rendered_ back to 0, the downstream
+    // capture-mode 4s device poll (gated on >0) and PNG dump (gated on capture-pending,
+    // never set in live) are both skipped, while frame_index_++ / NHL_SHOT still run.
+    beta_takeover_rendered_ = 0;
+    beta_takeover_draw_seen_ = 0;
+    beta_takeover_cleared_ = false;
+    beta_depth_cleared_ = false;
+    beta_live_frame_req_bytes_ = 0;  // per-draw residency upload accounting resets per frame
+    beta_live_frame_inv_bytes_ = 0;
+  }
 
   // Oracle RenderDoc bracket end (base path, no takeover).
   if (!beta_takeover_ && beta_renderdoc_ && beta_rdoc_capturing_) {
@@ -3989,6 +4891,8 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
       // resolve to 1X + copy to readback on a one-shot list before mapping.
       ResolveBetaMsaaToReadback();
       DumpBetaOffscreenTarget("beta_owned_draw.png");
+      WriteBetaGpuDumps();  // GPU-side ground truth for NHL_BETA_GPUDUMP addresses
+      WriteBetaFlatResolveDumps();  // NHL_BETA_FLAT_DUMP: per-resolve host-texture snapshots
       if (std::getenv("NHL_BETA_DEPTH_DIAG")) {
         DumpBetaDepthStats();
       }
@@ -4025,8 +4929,18 @@ void NhlD3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t fron
   // in EDRAM, never resolved to a linear guest buffer), so this is the real oracle.
   const char* shot_frame = std::getenv("NHL_SHOT_FRAME");
   const bool shot_continuous = std::getenv("NHL_SHOT_CONTINUOUS") != nullptr;
-  if (shot_continuous || shot_frame) {
-    const bool hit = shot_continuous ||
+  // F11 = grab a screenshot on demand (interactive live takeover: press F10 to take over a
+  // static menu, then F11 to snapshot what beta rendered into live_frame.png).
+  constexpr int kVkF11 = 0x7A;
+  const bool f11_down = (GetAsyncKeyState(kVkF11) & 0x8000) != 0;
+  const bool f11_rising = f11_down && !beta_f11_prev_down_;
+  beta_f11_prev_down_ = f11_down;
+  // In live takeover, F11 also arms a direct dump of beta's offscreen RT (next frame ->
+  // beta_owned_draw.png) so we can see what beta actually rendered, independent of the
+  // presenter/frontbuffer. live_frame.png (presenter) shows the base's frozen frontbuffer.
+  if (f11_rising && beta_live_ && beta_takeover_) beta_live_rt_dump_pending_ = true;
+  if (shot_continuous || shot_frame || f11_rising) {
+    const bool hit = shot_continuous || f11_rising ||
                      (shot_frame && frame_index_ == std::strtoull(shot_frame, nullptr, 10));
     if (hit && graphics_system_) {
       auto* presenter = graphics_system_->presenter();
