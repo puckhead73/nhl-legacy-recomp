@@ -67,7 +67,8 @@ struct TexturePacketDesc {
     uint32_t data_bytes;       // size of the linear texel blob that follows this struct
     uint32_t fetch_slot;       // Xenos texture fetch-constant slot (diagnostic)
     uint32_t is_signed;        // 0 = unsigned binding, 1 = signed binding
-    uint32_t reserved;
+    uint32_t swizzle;          // Xenos 12-bit component swizzle (4x3-bit; 0=R,1=G,2=B,3=A,4=0,5=1).
+                               // Applied to the plume view's component mapping (e.g. BGRA 8888).
 };
 
 struct DrawPacketHeader {

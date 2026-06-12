@@ -2009,7 +2009,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       if (pfmt == UINT32_MAX || !fi || !ok2d || !guest || !width || !height || width > 8192 ||
           height > 8192) {
         td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
-        td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4;
+        td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4; td.swizzle = 0x688;  // identity RGBA
         std::vector<uint8_t> blob(td.data_bytes);
         for (size_t i = 0; i < blob.size(); i += 4) {
           blob[i] = 255; blob[i + 1] = 0; blob[i + 2] = 255; blob[i + 3] = 255;  // magenta
@@ -2059,6 +2059,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       td.width = width; td.height = height; td.tex_format = pfmt;
       td.row_pitch_bytes = blocks_x * bpb; td.data_bytes = uint32_t(blob.size());
+      // Guest component swizzle (e.g. k_8888 menu logo is BGRA -> R<->B). k_8 is replicated to
+      // RGBA (v,v,v,v) so it samples right under identity; everything else carries the real swizzle.
+      td.swizzle = expand_r8 ? 0x688u : uint32_t(tf.swizzle);
       // k_8: replicate the 1-byte coverage to RGBA8 (v,v,v,v) — the font then samples correctly on
       // any channel without a single-channel host format / swizzle dependency.
       if (expand_r8) {

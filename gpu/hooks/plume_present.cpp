@@ -504,6 +504,25 @@ RenderBlendOperation toPlumeBlendOp(uint32_t o) {
     }
 }
 
+// C-5a: map a Xenos 3-bit texture-swizzle component (0=R,1=G,2=B,3=A,4=0,5=1) to plume's enum, and
+// the 12-bit guest swizzle to a plume component mapping. Applied to the sampled view so e.g. the
+// menu logo's BGRA 8888 reads as RGBA (else blue<->red -> the "orange logo").
+RenderSwizzle xenosSwz(uint32_t s) {
+    switch (s & 7) {
+        case 0: return RenderSwizzle::R;
+        case 1: return RenderSwizzle::G;
+        case 2: return RenderSwizzle::B;
+        case 3: return RenderSwizzle::A;
+        case 4: return RenderSwizzle::ZERO;
+        case 5: return RenderSwizzle::ONE;
+        default: return RenderSwizzle::IDENTITY;
+    }
+}
+RenderComponentMapping xenosSwizzleMapping(uint32_t swz) {
+    return RenderComponentMapping(xenosSwz(swz), xenosSwz(swz >> 3), xenosSwz(swz >> 6),
+                                  xenosSwz(swz >> 9));
+}
+
 // C-5a: build ONE fully self-contained RenderableDraw from a v3 packet (in memory). Mirrors the C-4
 // CreateTexturedDraw resource setup, but owns everything per-draw (its own VS/PS/buffers/textures/
 // layout/sets/pipeline) so many can be replayed into one RT. Draws with no translated PS are skipped
@@ -604,7 +623,9 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                                       RenderTextureCopyLocation::PlacedFootprint(staging.get(), rf, t.desc.width, t.desc.height, 1, t.desc.width, 0));
                 up->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
             }
-            auto view = tex ? tex->createTextureView(RenderTextureViewDesc::Texture2D(rf)) : nullptr;
+            RenderTextureViewDesc vd = RenderTextureViewDesc::Texture2D(rf);
+            vd.componentMapping = xenosSwizzleMapping(t.desc.swizzle);  // apply the guest swizzle
+            auto view = tex ? tex->createTextureView(vd) : nullptr;
             d.textures.push_back(std::move(tex));
             d.texViews.push_back(std::move(view));
             stagings.push_back(std::move(staging));
