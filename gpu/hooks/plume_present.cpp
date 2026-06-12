@@ -311,30 +311,12 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     std::fclose(pf);
     if (psSpirv.empty() || texs.empty()) return false;
 
-    // Refresh the C-3 bool/loop UBO with the real constants (it was zero-filled at C-3b.1). 256 =
-    // the C-3 kBoolSize allocation.
-    if (!boolBlob.empty()) {
-        if (void* p = c.xlatBoolBuf->map()) {
-            std::memset(p, 0, 256);
-            std::memcpy(p, boolBlob.data(), std::min<size_t>(boolBlob.size(), 256));
-            c.xlatBoolBuf->unmap();
-        }
-    }
-    // VS / PS packed float-constant UBOs (set 1 bindings 1 and 2). >= 16 B so the CBV is valid.
-    auto mkFloatUbo = [&](const std::vector<uint8_t>& src) {
-        const uint64_t sz = std::max<uint64_t>(src.size(), 16);
-        auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
-        if (b) {
-            void* p = b->map();
-            std::memset(p, 0, sz);
-            if (!src.empty()) std::memcpy(p, src.data(), src.size());
-            b->unmap();
-        }
-        return b;
-    };
-    c.xlatVsFloatBuf = mkFloatUbo(vsFloat);
-    c.xlatPsFloatBuf = mkFloatUbo(psFloat);
+    // The C-3 block already created + FILLED the bool/loop + VS/PS float UBOs (set1 bindings 1..4)
+    // and shares them with this textured pass. REUSE them — recreating would free the buffers the
+    // C-3 solid descriptor set references. boolBlob/vsFloat/psFloat were read above only to advance
+    // the file position to the PS SPIR-V + textures.
     if (!c.xlatVsFloatBuf || !c.xlatPsFloatBuf) return false;
+    (void)boolBlob; (void)vsFloat; (void)psFloat;
 
     // PS shader module.
     c.xlatTexPS = c.device->createShader(psSpirv.data(), psSpirv.size(), "main", fmt);
@@ -438,8 +420,8 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     }
     c.xlatTexSet0->setBuffer(0, c.xlatSharedBuf.get(), 1u << 16);
     c.xlatTexSet1->setBuffer(0, c.xlatSysBuf.get(), 2048);
-    c.xlatTexSet1->setBuffer(1, c.xlatVsFloatBuf.get(), std::max<uint64_t>(vsFloat.size(), 16));
-    c.xlatTexSet1->setBuffer(2, c.xlatPsFloatBuf.get(), std::max<uint64_t>(psFloat.size(), 16));
+    c.xlatTexSet1->setBuffer(1, c.xlatVsFloatBuf.get(), 256 * 16);
+    c.xlatTexSet1->setBuffer(2, c.xlatPsFloatBuf.get(), 256 * 16);
     c.xlatTexSet1->setBuffer(3, c.xlatBoolBuf.get(), 256);
     c.xlatTexSet1->setBuffer(4, c.xlatFetchBuf.get(), 768);
     for (uint32_t i = 0; i < nTex && i < c.xlatTextures.size(); ++i) {
@@ -559,8 +541,8 @@ void RenderClear(PlumeCtx& c) {
                     RenderDescriptorSetBuilder set2;  // C-3b.2: PS fragment-counter UAV (space2/u0)
                     if (!emptyLayout) {
                         set0.begin(); set0.addByteAddressBuffer(0); set0.end();           // shared memory
-                        set1.begin();                                                     // constants (gaps 1,2)
-                        set1.addConstantBuffer(0); set1.addConstantBuffer(3); set1.addConstantBuffer(4);
+                        set1.begin();                                                     // constants 0..4
+                        for (uint32_t b = 0; b <= 4; ++b) set1.addConstantBuffer(b);       // sys,vsF,psF,bool,fetch
                         set1.end();
                         set2.begin(); set2.addReadWriteByteAddressBuffer(0); set2.end();  // frag counter
                         lb.addDescriptorSet(set0);  // -> set 0
@@ -586,7 +568,7 @@ void RenderClear(PlumeCtx& c) {
                         c.xlatPipeline = c.device->createGraphicsPipeline(pd);
                         REXLOG_INFO("[highcut-C3a] graphics pipeline (layout={}): {} "
                                     "— any pipeline/driver error is on stderr.",
-                                    emptyLayout ? "empty" : "set0=SSBO@0,set1=CBV@0,3,4",
+                                    emptyLayout ? "empty" : "set0=SSBO@0,set1=CBV@0..4,set2=UAV@0",
                                     c.xlatPipeline ? "CREATED" : "FAILED (null)");
 
                         // C-3b.1: create + bind the VS's descriptor buffers so it can be drawn.
@@ -602,10 +584,16 @@ void RenderClear(PlumeCtx& c) {
                                 return b;
                             };
                             constexpr uint64_t kSysSize = 2048, kBoolSize = 256, kFetchSize = 768,
-                                               kSharedSize = 1u << 16;
+                                               kSharedSize = 1u << 16, kFloatSize = 256 * 16;
                             c.xlatSysBuf = mkUbo(kSysSize);
                             c.xlatBoolBuf = mkUbo(kBoolSize);
                             c.xlatFetchBuf = mkUbo(kFetchSize);
+                            // C-4: VS/PS float-constant UBOs (set1 bindings 1/2). The solid+counter
+                            // pass needs the VS floats too (most real VSs put their transform matrix
+                            // here) or every vertex collapses to 0 -> 0 fragments. Shared with the
+                            // textured pass (CreateTexturedDraw reuses these, doesn't recreate).
+                            c.xlatVsFloatBuf = mkUbo(kFloatSize);
+                            c.xlatPsFloatBuf = mkUbo(kFloatSize);
                             c.xlatSharedBuf = c.device->createBuffer(
                                 RenderBufferDesc::UploadBuffer(kSharedSize, RenderBufferFlag::STORAGE));
                             if (c.xlatSharedBuf) { void* p = c.xlatSharedBuf->map(); std::memset(p, 0, kSharedSize); c.xlatSharedBuf->unmap(); }
@@ -616,17 +604,20 @@ void RenderClear(PlumeCtx& c) {
                             if (c.xlatCounterBuf) { void* p = c.xlatCounterBuf->map(); std::memset(p, 0, kCounterSize); c.xlatCounterBuf->unmap(); }
                             RenderDescriptorSetBuilder ds0, ds1, ds2;
                             ds0.begin(); ds0.addByteAddressBuffer(0); ds0.end();
-                            ds1.begin(); ds1.addConstantBuffer(0); ds1.addConstantBuffer(3); ds1.addConstantBuffer(4); ds1.end();
+                            ds1.begin(); for (uint32_t b = 0; b <= 4; ++b) ds1.addConstantBuffer(b); ds1.end();
                             ds2.begin(); ds2.addReadWriteByteAddressBuffer(0); ds2.end();
                             c.xlatSet0 = ds0.create(c.device.get());
                             c.xlatSet1 = ds1.create(c.device.get());
                             c.xlatSet2 = ds2.create(c.device.get());
                             if (c.xlatSet0 && c.xlatSet1 && c.xlatSet2 && c.xlatSysBuf && c.xlatBoolBuf &&
-                                c.xlatFetchBuf && c.xlatSharedBuf && c.xlatCounterBuf) {
+                                c.xlatFetchBuf && c.xlatSharedBuf && c.xlatCounterBuf && c.xlatVsFloatBuf &&
+                                c.xlatPsFloatBuf) {
                                 c.xlatSet0->setBuffer(0, c.xlatSharedBuf.get(), kSharedSize);
                                 c.xlatSet1->setBuffer(0, c.xlatSysBuf.get(), kSysSize);
-                                c.xlatSet1->setBuffer(1, c.xlatBoolBuf.get(), kBoolSize);
-                                c.xlatSet1->setBuffer(2, c.xlatFetchBuf.get(), kFetchSize);
+                                c.xlatSet1->setBuffer(1, c.xlatVsFloatBuf.get(), kFloatSize);
+                                c.xlatSet1->setBuffer(2, c.xlatPsFloatBuf.get(), kFloatSize);
+                                c.xlatSet1->setBuffer(3, c.xlatBoolBuf.get(), kBoolSize);
+                                c.xlatSet1->setBuffer(4, c.xlatFetchBuf.get(), kFetchSize);
                                 c.xlatSet2->setBuffer(0, c.xlatCounterBuf.get(), kCounterSize);
                                 c.xlatDrawReady = true;
 
@@ -645,14 +636,21 @@ void RenderClear(PlumeCtx& c) {
                                             std::memcpy(p, tmp.data(), n < cap ? n : cap);
                                             b->unmap();
                                         };
+                                        // Read in packet order: fetch, sys, shared, bool, vs-float,
+                                        // ps-float (the rest — ps_spirv + textures — is read by
+                                        // CreateTexturedDraw, which re-opens the file).
                                         fillBuf(c.xlatFetchBuf.get(), kFetchSize, hdr.fetch_bytes);
                                         fillBuf(c.xlatSysBuf.get(), kSysSize, hdr.sys_bytes);
                                         fillBuf(c.xlatSharedBuf.get(), kSharedSize, hdr.shared_bytes);
+                                        fillBuf(c.xlatBoolBuf.get(), kBoolSize, hdr.bool_bytes);
+                                        fillBuf(c.xlatVsFloatBuf.get(), kFloatSize, hdr.vs_float_bytes);
+                                        fillBuf(c.xlatPsFloatBuf.get(), kFloatSize, hdr.ps_float_bytes);
                                         c.xlatVertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
                                         REXLOG_INFO("[highcut-C3b2] filled buffers from packet: verts={} "
-                                                    "fetch={} sys={} shared={} topo={}",
+                                                    "fetch={} sys={} shared={} bool={} vsF={} psF={} topo={}",
                                                     hdr.vertex_count, hdr.fetch_bytes, hdr.sys_bytes,
-                                                    hdr.shared_bytes, hdr.topology);
+                                                    hdr.shared_bytes, hdr.bool_bytes, hdr.vs_float_bytes,
+                                                    hdr.ps_float_bytes, hdr.topology);
                                     }
                                     std::fclose(pf);
                                 } else {

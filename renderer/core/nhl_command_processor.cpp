@@ -1901,6 +1901,29 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfLess |
                      rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfEqual |
                      rg::SpirvShaderTranslator::kSysFlag_AlphaPassIfGreater;
+    // Vertex w-division control (PA_CL_VTE_CNTL) — REQUIRED for vte-enabled (projective) draws.
+    // The VS epilogue computes w' = WNotReciprocal ? w : 1/w and gl_Position.w = w'; without
+    // WNotReciprocal a real perspective draw gets w'=1/w and the host divide then MULTIPLIES xy
+    // by w -> every vertex blasts off-screen -> 0 fragments (the C-4 draw#22 bug; same class as
+    // the DXBC path's quarter-width symptom).
+    {
+      const auto vte_pkt = register_file_->Get<reg::PA_CL_VTE_CNTL>();
+      if (vte_pkt.vtx_xy_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_XYDividedByW;
+      if (vte_pkt.vtx_z_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_ZDividedByW;
+      if (vte_pkt.vtx_w0_fmt) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_WNotReciprocal;
+    }
+    if (polygonal) spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_PrimitivePolygonal;
+    if (draw_util::IsPrimitiveLine(*register_file_)) {
+      spv_sys.flags |= rg::SpirvShaderTranslator::kSysFlag_PrimitiveLine;
+    }
+    // D3D->Vulkan clip-space y-flip: the guest produces y-UP clip space (D3D convention, what the
+    // beta D3D12 path renders); Vulkan NDC is y-DOWN and plume passes viewports verbatim (no
+    // negative-height flip). Negate the y ndc transform so the plume image is upright.
+    // NHL_HIGHCUT_NO_YFLIP disables for A/B.
+    if (!std::getenv("NHL_HIGHCUT_NO_YFLIP")) {
+      spv_sys.ndc_scale[1] = -spv_sys.ndc_scale[1];
+      spv_sys.ndc_offset[1] = -spv_sys.ndc_offset[1];
+    }
     {
       const int32_t guest_exp_bias = register_file_->Get<reg::RB_COLOR_INFO>().color_exp_bias;
       const float color_scale = std::exp2f(float(guest_exp_bias));
@@ -2066,9 +2089,12 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       std::fclose(pf);
       REXLOG_INFO("[highcut-C4] dumped draw packet v2: verts={} topo={} vtx_size={} bool={} "
-                  "vs_float={} ps_float={} ps_spirv={} textures={}",
+                  "vs_float={} ps_float={} ps_spirv={} textures={} flags=0x{:X} "
+                  "ndc_scale=({},{},{}) ndc_offset=({},{},{})",
                   hdr.vertex_count, hdr.topology, vtx_size, hdr.bool_bytes, hdr.vs_float_bytes,
-                  hdr.ps_float_bytes, hdr.ps_spirv_bytes, hdr.texture_count);
+                  hdr.ps_float_bytes, hdr.ps_spirv_bytes, hdr.texture_count, spv_sys.flags,
+                  spv_sys.ndc_scale[0], spv_sys.ndc_scale[1], spv_sys.ndc_scale[2],
+                  spv_sys.ndc_offset[0], spv_sys.ndc_offset[1], spv_sys.ndc_offset[2]);
     }
   }
 
