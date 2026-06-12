@@ -776,9 +776,16 @@ void RenderClear(PlumeCtx& c) {
     c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
     c.cmd->setScissors(RenderRect(0, 0, w, h));
 
-    // Animated clear so the plume window is obviously alive and synced to the game.
-    const float t = (c.frame % 120) / 120.0f;
-    c.cmd->clearColor(0, RenderColor(0.1f, t, 0.2f + 0.3f * t, 1.0f));
+    // C-5: clear to BLACK — the guest framebuffer base behind the menu. (C-1/C-3 used an animated
+    // teal/green clear as a "window alive" indicator, but that green showed THROUGH the menu's
+    // low-alpha overlays — e.g. the bottom nav bars, draws 121/122: a black BC3 texture at alpha
+    // ~0.13 over the clear = ~87% clear = bright green. Real game clears black there -> dark bars.)
+    if (c5_mode) {
+        c.cmd->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+    } else {
+        const float t = (c.frame % 120) / 120.0f;
+        c.cmd->clearColor(0, RenderColor(0.1f, t, 0.2f + 0.3f * t, 1.0f));
+    }
 
     // C-2: if the CP thread published a translated Xenos VS, create a plume shader module from
     // it (once). createShader runs the SPIR-V through vkCreateShaderModule on a real Vulkan
