@@ -97,9 +97,28 @@ and the SDK's `spirv_builder.h` compiles against it with no fatal API drift (pro
     `LinkageType` arg (passed `spv::LinkageTypeMax`). Plus 3 const data tables the SDK declares but
     doesn't export (`ucode::kAluVectorOpcodeInfos`, `draw_util::kD3D10StandardSamplePositions{2x,4x}`)
     supplied verbatim in `gpu/spirv/spirv_translator_tables.cc`.
-- **P-3 (next)** — translate one analyzed `beta_current_vs_` → valid SPIR-V (byte-validate with
-  spirv-val), gated `NHL_HIGHCUT_XLAT_TEST`, `is_new`-only so the live DXBC translation is never
-  overwritten. Then **C-2/C-3**: feed that SPIR-V to plume-Vulkan `createShader` + build a pipeline,
+- **P-3 DONE (2026-06-11)** — a real game vertex shader translates to valid SPIR-V at runtime.
+  Gated `NHL_HIGHCUT_XLAT_TEST` in `RenderBetaOwnedDraw` (once/process): build a fresh
+  `SpirvShader` from `beta_current_vs_`'s ucode (ISOLATED — never touches the live DXBC
+  `D3D12Shader`, so the validated beta path is byte-identical and there is no clobber risk),
+  `AnalyzeUcode` → `GetDefaultVertexShaderModification` → `GetOrCreateTranslation` →
+  `TranslateAnalyzedShader`. Result on a 24-dword VS: `is_valid=true`, **6216 bytes, magic
+  0x07230203**, dumped to `highcut_p3_vs.spv`. Structurally verified (SPIR-V 1.5; instruction
+  stream walks exactly to end; Capability/MemoryModel/EntryPoint/Function/Return/FunctionEnd all
+  present). Needed the ported `gpu/spirv/spirv_shader.cc` (the `SpirvShader` subclass).
+  - **glslang drift fix (risk #5):** glslang 14.3.0's `Builder::createAccessChain` derives its
+    result type from the STATEFUL `accessChain` (`getResultingAccessChainType`), but Xenia's
+    translator calls it statelessly with explicit base+offsets → `NoResult` assert at runtime.
+    Fixed by patching glslang to compute the type statelessly from base+offsets (idempotent
+    `string(REPLACE)` in CMakeLists, guarded by a marker; glslang's own `collapseAccessChain`
+    passes the stateful base/indexChain so it is unaffected). Kept glslang at 14.3.0 (re-pinning
+    to Xenia's submodule SHA would have reverted the P-2b `makeFunctionEntry` fix and risked the
+    SDK header / toolchain compat P-1 validated).
+  - **NOT YET: full `spirv-val`.** No SPIRV-Tools/`spirv-val` is available in the tree (glslang
+    `ENABLE_OPT=off`). Achieved bar = magic + structural well-formedness + translator `is_valid`.
+    Full semantic `spirv-val` (build SPIRV-Tools) OR the real test at **C-2** (feed to plume-Vulkan
+    `createShader` + validation layers) is the next validation step.
+- **C-2/C-3 (next)** — feed the P-3 SPIR-V to plume-Vulkan `createShader` + build a pipeline,
   rejoining the C milestones below.
 
 ## Milestones (incremental, each independently testable)

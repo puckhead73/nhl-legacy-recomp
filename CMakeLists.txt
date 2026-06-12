@@ -39,6 +39,8 @@ set(NHLLEGACY_SOURCES
     gpu/spirv/spirv_shader_translator_fetch.cc
     gpu/spirv/spirv_shader_translator_memexport.cc
     gpu/spirv/spirv_shader_translator_rb.cc
+    # P-3 = the SpirvShader (Shader subclass the translator emits into).
+    gpu/spirv/spirv_shader.cc
     # Const data tables the SDK declares (ucode.h / util/draw.h) but doesn't export.
     gpu/spirv/spirv_translator_tables.cc
     # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
@@ -103,6 +105,31 @@ FetchContent_Declare(glslang
     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
     GIT_TAG 14.3.0)
 FetchContent_MakeAvailable(glslang)
+# High-cut path C (P-3): glslang 14.3.0's Builder::createAccessChain derives its result type
+# from the STATEFUL accessChain (getResultingAccessChainType), but Xenia's Xenos->SPIR-V
+# translator calls createAccessChain directly with explicit base+offsets and never configures
+# the stateful chain (it targets older, stateless glslang) -> NoResult assert at runtime. Patch
+# createAccessChain to compute the type statelessly from base+offsets. glslang's own internal
+# caller (collapseAccessChain) passes accessChain.base/indexChain, so it yields the identical
+# type and is unaffected. Idempotent (guarded by the "nhl high-cut P-3" marker), so it is safe
+# to re-run on every configure. See docs/highcut-c-plume-renderer-plan.md.
+set(_glslang_spvbuilder "${glslang_SOURCE_DIR}/SPIRV/SpvBuilder.cpp")
+file(READ "${_glslang_spvbuilder}" _spvbuilder_src)
+string(FIND "${_spvbuilder_src}" "nhl high-cut P-3" _spvbuilder_patched)
+if(_spvbuilder_patched EQUAL -1)
+  string(REPLACE
+    "    Id typeId = getResultingAccessChainType();"
+[[    Id typeId = getTypeId(base); /* nhl high-cut P-3: stateless access-chain type */
+    typeId = getContainedTypeId(typeId);
+    for (int nhl_i = 0; nhl_i < (int)offsets.size(); ++nhl_i)
+        typeId = isStructType(typeId) ? getContainedTypeId(typeId, getConstantScalar(offsets[nhl_i]))
+                                      : getContainedTypeId(typeId, offsets[nhl_i]);]]
+    _spvbuilder_src "${_spvbuilder_src}")
+  file(WRITE "${_glslang_spvbuilder}" "${_spvbuilder_src}")
+  message(STATUS "high-cut P-3: patched glslang createAccessChain (stateless)")
+else()
+  message(STATUS "high-cut P-3: glslang createAccessChain already patched")
+endif()
 # The SPIRV target provides spv::Builder (glslang's SPIR-V backend). Adding the glslang source
 # root to the include path makes the SDK's `#include <SPIRV/SpvBuilder.h>` resolve.
 target_link_libraries(nhllegacy PRIVATE SPIRV)

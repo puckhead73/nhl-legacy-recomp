@@ -3,6 +3,7 @@
 #include "renderer/core/nhl_command_processor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -22,7 +23,11 @@
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+// High-cut path C, P-3: the ported Xenos->SPIR-V translator + its SpirvShader subclass.
+#include <rex/graphics/pipeline/shader/spirv.h>
+#include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/string/buffer.h>
 #include <rex/logging.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -1534,6 +1539,49 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                 register_file_->Get<reg::SQ_PROGRAM_CNTL>().value,
                 register_file_->Get<reg::SQ_CONTEXT_MISC>().value);
   }
+  // High-cut path C, P-3 (gated NHL_HIGHCUT_XLAT_TEST, once per process): translate the
+  // current VS's Xenos ucode to SPIR-V via the ported SpirvShaderTranslator and dump the
+  // bytes for spirv-val. FULLY ISOLATED — a fresh SpirvShader built from the same ucode,
+  // never touching beta_current_vs_ (the live DXBC D3D12Shader), so the validated beta
+  // path is byte-identical. The fresh shader owns its own translation slot, so there is
+  // no clobber risk (is_new is always true). See docs/highcut-c-plume-renderer-plan.md.
+  static std::atomic_flag highcut_p3_done = ATOMIC_FLAG_INIT;
+  if (std::getenv("NHL_HIGHCUT_XLAT_TEST") && !highcut_p3_done.test_and_set()) {
+    namespace rg = rex::graphics;
+    rg::SpirvShader p3_vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
+                          beta_current_vs_->ucode_dwords(),
+                          beta_current_vs_->ucode_dword_count(), std::endian::native);
+    rex::string::StringBuffer p3_disasm;
+    p3_vs.AnalyzeUcode(p3_disasm);
+    const uint32_t p3_num_reg = register_file_->Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg;
+    const uint32_t p3_reg_count = p3_vs.GetDynamicAddressableRegisterCount(p3_num_reg);
+    rg::SpirvShaderTranslator::Features p3_features(/*all=*/true);
+    rg::SpirvShaderTranslator p3_xlat(p3_features, /*native_2x_msaa_with_attachments=*/false,
+                                      /*native_2x_msaa_no_attachments=*/false,
+                                      /*edram_fragment_shader_interlock=*/false);
+    const uint64_t p3_mod =
+        p3_xlat.GetDefaultVertexShaderModification(p3_reg_count, result.host_vertex_shader_type);
+    bool p3_is_new = false;
+    rg::Shader::Translation* p3_tr = p3_vs.GetOrCreateTranslation(p3_mod, &p3_is_new);
+    const bool p3_ok = p3_xlat.TranslateAnalyzedShader(*p3_tr);
+    const auto& p3_bin = p3_tr->translated_binary();
+    uint32_t p3_magic = 0;
+    if (p3_bin.size() >= 4) std::memcpy(&p3_magic, p3_bin.data(), 4);
+    REXLOG_INFO("[highcut-P3] VS xlat: ucode_dwords={} reg_count={} hvst={} mod=0x{:016X} "
+                "is_new={} ok={} is_valid={} spirv_bytes={} magic=0x{:08X} (expect 0x07230203)",
+                p3_vs.ucode_dword_count(), p3_reg_count,
+                uint32_t(result.host_vertex_shader_type), p3_mod, p3_is_new, p3_ok,
+                p3_tr->is_valid(), p3_bin.size(), p3_magic);
+    if (p3_tr->is_valid() && !p3_bin.empty()) {
+      if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
+        std::fwrite(p3_bin.data(), 1, p3_bin.size(), p3_f);
+        std::fclose(p3_f);
+        REXLOG_INFO("[highcut-P3] wrote {} bytes to highcut_p3_vs.spv (cwd) for spirv-val",
+                    p3_bin.size());
+      }
+    }
+  }
+
   const uint64_t vs_mod = beta_pipeline_cache_
                               ->GetCurrentVertexShaderModification(
                                   *beta_current_vs_, result.host_vertex_shader_type,
