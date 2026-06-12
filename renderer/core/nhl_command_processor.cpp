@@ -1990,8 +1990,13 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       const xenos::TextureFormat fmt = tf.format;
       const rg::FormatInfo* fi = rg::FormatInfo::Get(fmt);
       uint32_t pfmt = UINT32_MAX;
+      bool expand_r8 = false;  // k_8: 1-byte coverage -> RGBA8 (v,v,v,v) so any channel reads the glyph
       switch (fmt) {
         case xenos::TextureFormat::k_8_8_8_8: pfmt = nhl::highcut::kTexRGBA8; break;
+        // k_8: an 8-bit single-channel texture — the MENU FONT atlas (glyph coverage). Untile the
+        // 1-byte texels then replicate to RGBA8 so whichever channel the text PS samples (the swizzle
+        // is typically "rrrr"/"...r" for fonts) gets the coverage. Was unsupported -> magenta blocks.
+        case xenos::TextureFormat::k_8: pfmt = nhl::highcut::kTexRGBA8; expand_r8 = true; break;
         case xenos::TextureFormat::k_DXT1:    pfmt = nhl::highcut::kTexBC1; break;
         case xenos::TextureFormat::k_DXT2_3:  pfmt = nhl::highcut::kTexBC2; break;
         case xenos::TextureFormat::k_DXT4_5:  pfmt = nhl::highcut::kTexBC3; break;
@@ -2054,6 +2059,18 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       td.width = width; td.height = height; td.tex_format = pfmt;
       td.row_pitch_bytes = blocks_x * bpb; td.data_bytes = uint32_t(blob.size());
+      // k_8: replicate the 1-byte coverage to RGBA8 (v,v,v,v) — the font then samples correctly on
+      // any channel without a single-channel host format / swizzle dependency.
+      if (expand_r8) {
+        std::vector<uint8_t> rgba(blob.size() * 4);
+        for (size_t i = 0; i < blob.size(); ++i) {
+          const uint8_t v = blob[i];
+          rgba[i * 4 + 0] = v; rgba[i * 4 + 1] = v; rgba[i * 4 + 2] = v; rgba[i * 4 + 3] = v;
+        }
+        blob = std::move(rgba);
+        td.row_pitch_bytes = blocks_x * 4u;
+        td.data_bytes = uint32_t(blob.size());
+      }
       REXLOG_INFO("[highcut-C4] tex slot={} {}x{} fmt={} pfmt={} tiled={} endian={} pitch_blk={} "
                   "blob={} is_signed={}",
                   slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
