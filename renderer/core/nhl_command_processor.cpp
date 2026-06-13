@@ -2133,7 +2133,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.blend_src_a = (bc0 >> 16) & 0x1F;
     hdr.blend_op_a = (bc0 >> 21) & 0x7;
     hdr.blend_dst_a = (bc0 >> 24) & 0x1F;
-    hdr.color_write_mask = 0xF;  // C-5a: write all channels (per-RT mask refinement deferred)
+    // C-5b: the REAL RT0 color write mask (RB_COLOR_MASK bits 0..3 = R,G,B,A write enables; matches
+    // plume's RenderColorWriteEnable R=1,G=2,B=4,A=8). Mask-only draws (mask=0) write NO color in the
+    // game — they set up stencil/masking — but C-5a forced 0xF, so their (discarded) PS output, e.g.
+    // a green fill, leaked onto the screen as the "green bars". 0 => nothing written (invisible).
+    hdr.color_write_mask = register_file_->Get<reg::RB_COLOR_MASK>().value & 0xFu;
     // C-5b: per-draw guest scissor (PA_SC_WINDOW_SCISSOR), scaled from guest-surface px to the
     // 1280x720 logical RT (geometry lands on the full RT via ndc, so the clip must too). The game
     // clips the description text / ticker via this; a degenerate rect => full RT (no clip).
@@ -2177,12 +2181,12 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
       }
       std::fclose(pf);
-      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) scissor=({},{},{},{}) "
+      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) cwm=0x{:X} "
                   "vs_spirv={} ps_spirv={} textures={} blend=src{}/dst{}/op{} flags=0x{:X}",
                   frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
-                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.sc_left, hdr.sc_top, hdr.sc_right, hdr.sc_bottom,
-                  hdr.vs_spirv_bytes, hdr.ps_spirv_bytes, hdr.texture_count, hdr.blend_src,
-                  hdr.blend_dst, hdr.blend_op, spv_sys.flags);
+                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.color_write_mask, hdr.vs_spirv_bytes,
+                  hdr.ps_spirv_bytes, hdr.texture_count, hdr.blend_src, hdr.blend_dst, hdr.blend_op,
+                  spv_sys.flags);
       if (frame_capture) ++highcut_capture_idx_;
     }
   }
