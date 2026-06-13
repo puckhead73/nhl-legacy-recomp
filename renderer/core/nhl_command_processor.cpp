@@ -2134,6 +2134,28 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.blend_op_a = (bc0 >> 21) & 0x7;
     hdr.blend_dst_a = (bc0 >> 24) & 0x1F;
     hdr.color_write_mask = 0xF;  // C-5a: write all channels (per-RT mask refinement deferred)
+    // C-5b: per-draw guest scissor (PA_SC_WINDOW_SCISSOR), scaled from guest-surface px to the
+    // 1280x720 logical RT (geometry lands on the full RT via ndc, so the clip must too). The game
+    // clips the description text / ticker via this; a degenerate rect => full RT (no clip).
+    {
+      const auto wstl = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+      const auto wsbr = register_file_->Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+      int32_t gl = int32_t(wstl.tl_x), gt = int32_t(wstl.tl_y);
+      int32_t gr = int32_t(wsbr.br_x), gb = int32_t(wsbr.br_y);
+      uint32_t gw = register_file_->Get<reg::RB_SURFACE_INFO>().surface_pitch;
+      if (!gw) gw = beta_rt_width_;
+      const uint32_t gh = gw * beta_rt_height_ / beta_rt_width_;
+      if (gr <= gl || gb <= gt) { gl = 0; gt = 0; gr = int32_t(gw); gb = int32_t(gh); }  // no clip
+      auto sx = [&](int32_t v) -> uint32_t {
+        int64_t s = int64_t(v) * beta_rt_width_ / int64_t(gw);
+        return uint32_t(s < 0 ? 0 : (s > beta_rt_width_ ? beta_rt_width_ : s));
+      };
+      auto sy = [&](int32_t v) -> uint32_t {
+        int64_t s = int64_t(v) * beta_rt_height_ / int64_t(gh ? gh : beta_rt_height_);
+        return uint32_t(s < 0 ? 0 : (s > beta_rt_height_ ? beta_rt_height_ : s));
+      };
+      hdr.sc_left = sx(gl); hdr.sc_top = sy(gt); hdr.sc_right = sx(gr); hdr.sc_bottom = sy(gb);
+    }
     char pkt_path[64];
     if (frame_capture) {
       std::snprintf(pkt_path, sizeof(pkt_path), "highcut_frame_%u.bin", highcut_capture_idx_);
@@ -2155,13 +2177,12 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
       }
       std::fclose(pf);
-      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) vs_spirv={} ps_spirv={} "
-                  "textures={} blend=src{}/dst{}/op{} flags=0x{:X} ndc_s=({},{}) ndc_o=({},{})",
+      REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) scissor=({},{},{},{}) "
+                  "vs_spirv={} ps_spirv={} textures={} blend=src{}/dst{}/op{} flags=0x{:X}",
                   frame_capture ? "C5" : "C4", pkt_path, hdr.vertex_count, hdr.topology, hdr.vp_x,
-                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.vs_spirv_bytes, hdr.ps_spirv_bytes,
-                  hdr.texture_count, hdr.blend_src, hdr.blend_dst, hdr.blend_op, spv_sys.flags,
-                  spv_sys.ndc_scale[0], spv_sys.ndc_scale[1], spv_sys.ndc_offset[0],
-                  spv_sys.ndc_offset[1]);
+                  hdr.vp_y, hdr.vp_w, hdr.vp_h, hdr.sc_left, hdr.sc_top, hdr.sc_right, hdr.sc_bottom,
+                  hdr.vs_spirv_bytes, hdr.ps_spirv_bytes, hdr.texture_count, hdr.blend_src,
+                  hdr.blend_dst, hdr.blend_op, spv_sys.flags);
       if (frame_capture) ++highcut_capture_idx_;
     }
   }

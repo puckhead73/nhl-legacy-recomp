@@ -105,6 +105,7 @@ struct RenderableDraw {
     uint32_t vertexCount = 0;
     uint32_t indexCount = 0;  // >0 => drawIndexedInstanced (quad expand); else drawInstanced
     bool textured = false;  // has set3 (textures+samplers) bound
+    int32_t scLeft = 0, scTop = 0, scRight = 0, scBottom = 0;  // C-5b: per-draw clip (RT px)
 };
 
 struct PlumeCtx {
@@ -721,6 +722,11 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     d.pipeline = c.device->createGraphicsPipeline(pd);
     if (!d.pipeline) return false;
     d.vertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
+    d.scLeft = int32_t(hdr.sc_left); d.scTop = int32_t(hdr.sc_top);
+    d.scRight = int32_t(hdr.sc_right); d.scBottom = int32_t(hdr.sc_bottom);
+    if (d.scRight <= d.scLeft || d.scBottom <= d.scTop) {  // degenerate -> full RT
+        d.scLeft = 0; d.scTop = 0; d.scRight = int32_t(kWidth); d.scBottom = int32_t(kHeight);
+    }
     return true;
 }
 
@@ -1013,6 +1019,11 @@ void RenderClear(PlumeCtx& c) {
         for (auto& d : c.c5draws) {
             const uint32_t this_i = di++;
             if (this_i < c5_min || this_i >= c5_max) continue;
+            // C-5b: per-draw clip (the game scissors the description text to its box, the ticker to
+            // its bar, etc). NHL_HIGHCUT_NO_SCISSOR forces full-RT for A/B.
+            static const bool no_scissor = std::getenv("NHL_HIGHCUT_NO_SCISSOR") != nullptr;
+            if (no_scissor) c.cmd->setScissors(RenderRect(0, 0, kWidth, kHeight));
+            else c.cmd->setScissors(RenderRect(d.scLeft, d.scTop, d.scRight, d.scBottom));
             c.cmd->setGraphicsPipelineLayout(d.layout.get());
             c.cmd->setPipeline(d.pipeline.get());
             c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);

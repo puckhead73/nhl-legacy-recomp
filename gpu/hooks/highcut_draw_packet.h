@@ -93,6 +93,10 @@ struct DrawPacketHeader {
     uint32_t blend_src, blend_dst, blend_op;           // color
     uint32_t blend_src_a, blend_dst_a, blend_op_a;     // alpha
     uint32_t color_write_mask; // RGBA bits 0..3 (1=R,2=G,4=B,8=A)
+    // Per-draw guest scissor (PA_SC_WINDOW_SCISSOR), already scaled to the 1280x720 logical RT. The
+    // game clips e.g. the right-side description text to its box and the bottom ticker to its bar;
+    // without it those overflow (and a draw scissored to ~nothing renders full -> bleed).
+    uint32_t sc_left, sc_top, sc_right, sc_bottom;
 };
 
 }  // namespace nhl::highcut
