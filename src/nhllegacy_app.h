@@ -119,6 +119,16 @@ class NhllegacyApp : public rex::ReXApp {
       REXCVAR_SET(d3d12_debug, true);
       REXLOG_INFO("[nhl-beta] D3D12 debug layer enabled via NHL_BETA_D3D12_DEBUG");
     }
+    // Opt-in verbose SDK logging (NHL_LOG_LEVEL=debug|trace): surfaces the texture
+    // cache's per-texture create/load actions (TextureKey::LogAction) for diagnosing
+    // textures that bind but sample zero.
+    if (const char* lvl = std::getenv("NHL_LOG_LEVEL")) {
+      REXCVAR_SET(log_level, std::string(lvl));
+      // The logger tree is already initialized by the time OnPreSetup runs, so the
+      // cvar alone is too late — apply the level to all live categories directly.
+      rex::SetAllLevels(spdlog::level::from_str(lvl));
+      REXLOG_INFO("[nhl-beta] log_level={} via NHL_LOG_LEVEL", lvl);
+    }
     // Force the BINDFUL descriptor path under the beta backend. The base
     // D3D12CommandProcessor (which owns root-signature creation) otherwise picks
     // bindless on capable HW (RTX 4080), so ConfigurePipeline hands our owned

@@ -26,6 +26,8 @@
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 
+#include "gpu/hooks/highcut_draw_packet.h"  // C-5d.3: nhl::highcut::ResolveMarker member type
+
 // Forward declarations for the Tier-1 "beta" backend's own cache instances. The
 // concrete definitions (heavy D3D12 headers) are pulled in only by the .cpp, so
 // the unique_ptr members below require a user-declared destructor defined there.
@@ -143,6 +145,11 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   // killed. Overwrites every frame, so the last frame before exit is the captured one.
   uint32_t highcut_capture_idx_ = 0;
   uint64_t highcut_last_frame_index_ = UINT64_MAX;  // detect a new guest frame to reset the index
+  uint64_t highcut_last_present_count_ = UINT64_MAX;  // C-5d: guest-present frame delimiter (live-3D)
+  // C-5d.3: guest EDRAM resolve events captured in stream order (after_draw = highcut_capture_idx_ at
+  // resolve time). Rewritten to highcut_resolves.bin after each resolve; reset at each frame boundary.
+  std::vector<nhl::highcut::ResolveMarker> highcut_resolves_;
+  void HighcutCaptureResolve();  // record a resolve marker (dest addr + source surface) during capture
   bool beta_ucode_dumped_ = false;        // dump textured VS/PS ucode disasm once
   void FinalizeBetaTakeoverCapture();
   // Live continuous rendering (NHL_BETA_LIVE): present our offscreen RT to the window

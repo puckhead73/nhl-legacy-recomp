@@ -1316,9 +1316,50 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
                 beta_resolves_seen_++, dest, ri.copy_dest_extent_start);
 }
 
+// C-5d.3: during high-cut frame capture, record a guest EDRAM resolve (RB_MODECONTROL.kCopy) in stream
+// order. The plume replay uses these to host-copy the just-finished surface RT into a texture keyed by
+// the resolve DEST address, so a later draw that samples that address (TexturePacketDesc.fetch_base_
+// addr) reads OUR rendered pass (reflection/shadow) instead of an empty guest-RAM untile. after_draw =
+// the per-frame draw count so far → the replay does the copy after replaying that many draws. Sidecar
+// `highcut_resolves.bin` rewritten after each resolve (survives a mid-frame kill, like highcut_frame.count).
+void NhlD3D12CommandProcessor::HighcutCaptureResolve() {
+  static const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
+  if (!frame_capture || !memory_) return;
+  namespace draw_util = rex::graphics::draw_util;
+  draw_util::ResolveInfo ri{};
+  if (!draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, 1, 1, false, false, ri))
+    return;
+  if (!ri.copy_dest_base) return;
+  nhl::highcut::ResolveMarker m{};
+  m.after_draw = highcut_capture_idx_;
+  m.dest_addr = ri.copy_dest_base;
+  m.is_depth = ri.IsCopyingDepth() ? 1u : 0u;
+  namespace reg = rex::graphics::reg;
+  m.src_depth_base = register_file_->Get<reg::RB_DEPTH_INFO>().depth_base;
+  m.src_pitch = register_file_->Get<reg::RB_SURFACE_INFO>().surface_pitch;
+  m.src_msaa = uint32_t(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
+  highcut_resolves_.push_back(m);
+  if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
+    const uint32_t magic = nhl::highcut::kResolveSidecarMagic;
+    const uint32_t count = uint32_t(highcut_resolves_.size());
+    std::fwrite(&magic, 4, 1, rf);
+    std::fwrite(&count, 4, 1, rf);
+    std::fwrite(highcut_resolves_.data(), sizeof(nhl::highcut::ResolveMarker), count, rf);
+    std::fclose(rf);
+  }
+  REXLOG_INFO("[highcut-C5d3] resolve after draw {}: dest=0x{:X} is_depth={} src(depth={} pitch={} msaa={})",
+              m.after_draw, m.dest_addr, m.is_depth, m.src_depth_base, m.src_pitch, m.src_msaa);
+}
+
 // Defined in gpu/hooks/plume_present.cpp — C-2 shader bridge: hand a translated Xenos VS's
 // SPIR-V to the plume Vulkan thread for shader-module creation (no-op unless NHL_HIGHCUT_PRESENT).
 extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size);
+
+// Defined in gpu/hooks/d3d9_resources.cpp — C-5d frame delimiter. Bumped on every guest VdSwap
+// (sub_827F1C88), unconditionally, independent of IssueSwap (which live-3D takeover never reaches).
+// The C-5 frame capture resets its per-frame draw index when this advances, so a live-3D capture is
+// delimited to ONE guest frame instead of stacking 2–3.
+extern "C" uint64_t HighcutGuestPresentCount();
 
 void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     xenos::PrimitiveType primitive_type, uint32_t index_count,
@@ -1563,6 +1604,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   std::vector<uint8_t> p3_ps_spirv;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
   uint32_t p3_ps_sampler_count = 0;
+  // C-5d.3: VERTEX-shader texture/sampler bindings (the skinning bone palette). Captured + untiled +
+  // bound to set2 so skinned meshes don't collapse to zero fragments.
+  std::vector<rex::graphics::SpirvShader::TextureBinding> p3_vs_texbinds;
+  uint32_t p3_vs_sampler_count = 0;
   // C-5a: NHL_HIGHCUT_FRAME_CAPTURE dumps EVERY interesting owned draw of the frame (to
   // highcut_frame_<idx>.bin) for the multi-draw plume replay, not just the C-4 single selected draw.
   const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
@@ -1655,6 +1700,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                 ? vs_trw->translated_binary()
                 : p3_bin;  // fall back to the default-mask VS if the masked retranslate failed
         p3_vs_spirv.assign(vs_binw.begin(), vs_binw.end());  // inline VS for the packet
+        // C-5d.3: the VS's texture/sampler bindings AFTER translation (the skinning bone palette). Bind
+        // to set2 at replay; without it skinned vertices read zero bones and collapse to zero fragments.
+        p3_vs_texbinds = p3_vs.GetTextureBindingsAfterTranslation();
+        p3_vs_sampler_count = uint32_t(p3_vs.GetSamplerBindingsAfterTranslation().size());
         if (!frame_capture) {  // C-4 single-draw bridge writes the shared .spv + in-memory publish
           if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
             std::fwrite(vs_binw.data(), 1, vs_binw.size(), p3_f);
@@ -2017,7 +2066,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // magenta placeholder so the bind/sample path still runs (and is visibly wrong if reached).
     std::vector<nhl::highcut::TexturePacketDesc> tex_descs;
     std::vector<std::vector<uint8_t>> tex_blobs;
-    for (const auto& tb : p3_ps_texbinds) {
+    std::vector<nhl::highcut::TexturePacketDesc> vs_tex_descs;  // C-5d.3: VS (set2) textures
+    std::vector<std::vector<uint8_t>> vs_tex_blobs;
+    // C-4/C-5d.3: untile each texture binding (PS or VS) into a LINEAR blob + a TexturePacketDesc.
+    // Factored into a lambda so the SAME path serves PS textures (set3) and the VS skinning bone
+    // palette (set2). Xenos textures are tiled in 32x32-block tiles; GetTiledOffset2D gives the
+    // per-block byte offset. 2D 8888 + DXT1/2_3/4_5 supported; anything else -> 2x2 magenta.
+    auto untileBindings = [&](const std::vector<rex::graphics::SpirvShader::TextureBinding>& binds,
+                              std::vector<nhl::highcut::TexturePacketDesc>& out_descs,
+                              std::vector<std::vector<uint8_t>>& out_blobs) {
+    for (const auto& tb : binds) {
       const uint32_t slot = tb.fetch_constant;
       xenos::xe_gpu_texture_fetch_t tf{};
       std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
@@ -2039,9 +2097,13 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         case xenos::TextureFormat::k_DXT1:    pfmt = nhl::highcut::kTexBC1; break;
         case xenos::TextureFormat::k_DXT2_3:  pfmt = nhl::highcut::kTexBC2; break;
         case xenos::TextureFormat::k_DXT4_5:  pfmt = nhl::highcut::kTexBC3; break;
+        // C-5d.3: the VERTEX-shader skinning BONE PALETTE (each texel = one float4 matrix row). Without
+        // it the skinned meshes (players + most of the gameplay scene) collapse to zero fragments.
+        case xenos::TextureFormat::k_32_32_32_32_FLOAT: pfmt = nhl::highcut::kTexRGBA32F; break;
         default: break;
       }
       const uint32_t tex_base = uint32_t(tf.base_address) << 12;
+      td.fetch_base_addr = tex_base;  // C-5d.3: match against resolve dest addrs at replay
       const bool ok2d = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked;
       const uint8_t* guest =
           (tex_base && memory_) ? memory_->TranslatePhysical<const uint8_t*>(tex_base) : nullptr;
@@ -2055,7 +2117,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         }
         REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 magenta",
                     slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base);
-        tex_descs.push_back(td); tex_blobs.push_back(std::move(blob));
+        out_descs.push_back(td); out_blobs.push_back(std::move(blob));
         continue;
       }
       const uint32_t bw = fi->block_width, bh = fi->block_height, bpb = fi->bytes_per_block();
@@ -2079,10 +2141,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           std::memcpy(&blob[(size_t(by) * blocks_x + bx) * bpb], guest + src, bpb);
         }
       }
-      // Endian: 8888 -> per-texel 32-bit swap; BCn -> 16-bit swap (DXT endpoint/index words).
+      // Endian: 8888 / RGBA32F -> 32-bit word swap (each float/uint is a 32-bit word); BCn -> 16-bit
+      // swap (DXT endpoint/index words). RGBA32F = 4 words per texel, all handled by the 32-bit loop.
       const xenos::Endian end = xenos::Endian(tf.endianness);
       if (end != xenos::Endian::kNone) {
-        if (pfmt == nhl::highcut::kTexRGBA8) {
+        if (pfmt == nhl::highcut::kTexRGBA8 || pfmt == nhl::highcut::kTexRGBA32F) {
           for (size_t i = 0; i + 4 <= blob.size(); i += 4) {
             uint32_t v; std::memcpy(&v, &blob[i], 4);
             v = xenos::GpuSwap(v, end);
@@ -2117,8 +2180,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                   "blob={} is_signed={}",
                   slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
                   pitch_blocks, td.data_bytes, td.is_signed);
-      tex_descs.push_back(td); tex_blobs.push_back(std::move(blob));
+      out_descs.push_back(td); out_blobs.push_back(std::move(blob));
     }
+    };  // untileBindings
+    untileBindings(p3_ps_texbinds, tex_descs, tex_blobs);   // set3 (pixel) textures
+    untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs);  // C-5d.3: set2 (vertex/skinning) textures
 
     REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
                 "index_count(param)={} idx_type={}",
@@ -2139,6 +2205,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       // index-expands (4-vert quads -> 2 tris) and draws TRIANGLE_LIST; carry the guest vert count.
       hdr.topology = nhl::highcut::kTopoTriangleListQuadExpand;
       hdr.vertex_count = index_count;  // guest quad-vert count (4 * #quads)
+    } else if (result.guest_primitive_type == xenos::PrimitiveType::kTriangleStrip) {
+      // C-5e: the PLAYERS (and other meshes) are indexed TRIANGLE STRIPS with PRIMITIVE RESTART
+      // (guest reset index 0xFFFF for u16 / 0xFFFFFFFF for u32). Flattening them to a triangle LIST
+      // (the old `else` below) both scrambled connectivity AND drew the 0xFFFF reset markers as real
+      // out-of-bounds vertices -> every triangle touching one streaked to a single degenerate point =
+      // the "explosion to rink center" long misattributed to skinning. Emit a real strip: the replay
+      // maps kTopoTriangleStrip -> TRIANGLE_STRIP and plume's Vulkan backend auto-enables
+      // primitiveRestartEnable, whose native reset index (max of the index type) == the guest's 0xFFFF.
+      hdr.topology = nhl::highcut::kTopoTriangleStrip;
+      hdr.vertex_count = index_count;  // index count -> drawIndexedInstanced (indexed kGuestDMA strip)
     } else {
       hdr.topology = nhl::highcut::kTopoTriangleList;
       hdr.vertex_count = index_count;
@@ -2153,6 +2229,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     hdr.ps_spirv_bytes = uint32_t(p3_ps_spirv.size());
     hdr.texture_count = uint32_t(tex_descs.size());
     hdr.ps_sampler_count = p3_ps_sampler_count;
+    hdr.vs_texture_count = uint32_t(vs_tex_descs.size());  // C-5d.3: set2 (skinning) textures
+    hdr.vs_sampler_count = p3_vs_sampler_count;
     hdr.index_format = index_format;                     // C-5d: kGuestDMA indices (0 => non-indexed)
     hdr.index_bytes = uint32_t(index_blob.size());
     // C-5a: per-draw viewport (final vpi) so the plume replay places each draw correctly.
@@ -2245,15 +2323,52 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       hdr.cull_mode = cull;
       hdr.front_ccw = mc.face ? 0u : 1u;  // face: 0=front CCW, 1=front CW
     }
-    // C-5a/c: detect a NEW guest frame (frame_index_ advanced) and reset the per-frame dump index so
-    // this frame overwrites highcut_frame_0..N. This replaces the old IssueSwap-based reset: live-3D
-    // takeover can be killed mid-frame BEFORE its IssueSwap is ever reached (the swap deadlocks / the
-    // process exits during the slow per-draw translate+untile+dump), so any reset/finalize gated on
-    // IssueSwap never ran and the count file was never written. Resetting here (in the draw path,
-    // which always runs) makes capture independent of the swap completing.
-    if (frame_capture && frame_index_ != highcut_last_frame_index_) {
-      highcut_last_frame_index_ = frame_index_;
-      highcut_capture_idx_ = 0;
+    // C-5d: capture the guest render-surface identity so the replay can bucket draws into per-surface
+    // flat RTs (Problem 1: the frame-start mask draw must own its OWN depth+stencil, separate from the
+    // 3D geometry). EDRAM tile bases are surface KEYS only — the flat path does no EDRAM addressing.
+    {
+      const auto ci = register_file_->Get<reg::RB_COLOR_INFO>();
+      const auto di = register_file_->Get<reg::RB_DEPTH_INFO>();
+      const auto si = register_file_->Get<reg::RB_SURFACE_INFO>();
+      hdr.surface_color_base = ci.color_base | (uint32_t(ci.color_base_bit_11) << 11);
+      hdr.surface_depth_base = di.depth_base;
+      hdr.surface_pitch = si.surface_pitch;
+      hdr.surface_msaa = uint32_t(si.msaa_samples);
+      hdr.surface_color_format = uint32_t(ci.color_format);
+    }
+    // C-5a/c/d: detect a NEW guest frame and reset the per-frame dump index so this frame overwrites
+    // highcut_frame_0..N. Resetting here (in the draw path, which always runs) makes capture
+    // independent of the swap completing — live-3D takeover can be killed mid-frame BEFORE its
+    // IssueSwap is ever reached (the swap deadlocks / the process exits during the slow per-draw
+    // translate+untile+dump), so any reset/finalize gated on IssueSwap never ran.
+    //
+    // C-5d FRAME DELIMITER: frame_index_ only advances inside IssueSwap, which live-3D takeover never
+    // reaches (it presents via PresentBetaLiveFrame), so frame_index_ stays FROZEN during takeover and
+    // a capture stacked 2–3 frames. Use the unconditional guest-present counter instead — it bumps on
+    // every guest VdSwap (sub_827F1C88), upstream of all takeover plumbing. We OR the two signals so
+    // non-takeover capture (where frame_index_ advances and the guest-present hook may or may not fire)
+    // still resets correctly. The first draw after a present starts a fresh frame's bins.
+    if (frame_capture) {
+      const uint64_t present_count = HighcutGuestPresentCount();
+      if (present_count != highcut_last_present_count_ ||
+          frame_index_ != highcut_last_frame_index_) {
+        // Spike/verify: log the boundary so a live-3D capture proves the guest-present hook advances
+        // (frame_index_ stays frozen under takeover) and shows the per-frame draw count.
+        REXLOG_INFO("[highcut-C5] frame boundary: present={} frame_index_={} prev_frame_draws={}",
+                    present_count, frame_index_, highcut_capture_idx_);
+        highcut_last_present_count_ = present_count;
+        highcut_last_frame_index_ = frame_index_;
+        highcut_capture_idx_ = 0;
+        // C-5d.3: new frame — drop the prior frame's resolve markers and truncate the sidecar so a
+        // frame with no resolves can't replay a stale list (resolves this frame re-append + rewrite).
+        highcut_resolves_.clear();
+        if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
+          const uint32_t magic = nhl::highcut::kResolveSidecarMagic, zero = 0;
+          std::fwrite(&magic, 4, 1, rf);
+          std::fwrite(&zero, 4, 1, rf);
+          std::fclose(rf);
+        }
+      }
     }
     char pkt_path[64];
     if (frame_capture) {
@@ -2274,6 +2389,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       for (size_t i = 0; i < tex_descs.size(); ++i) {
         std::fwrite(&tex_descs[i], 1, sizeof(tex_descs[i]), pf);
         std::fwrite(tex_blobs[i].data(), 1, tex_blobs[i].size(), pf);
+      }
+      for (size_t i = 0; i < vs_tex_descs.size(); ++i) {  // C-5d.3: VS (set2) textures after PS textures
+        std::fwrite(&vs_tex_descs[i], 1, sizeof(vs_tex_descs[i]), pf);
+        std::fwrite(vs_tex_blobs[i].data(), 1, vs_tex_blobs[i].size(), pf);
       }
       if (hdr.index_bytes) std::fwrite(index_blob.data(), 1, hdr.index_bytes, pf);  // C-5d, last
       std::fclose(pf);
@@ -5103,6 +5222,7 @@ bool NhlD3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, ui
         // draw verbatim so the validated single-pass menu/intro stay byte-identical.
         const auto em = register_file_->Get<rex::graphics::reg::RB_MODECONTROL>().edram_mode;
         if (em == xenos::EdramMode::kCopy) {
+          HighcutCaptureResolve();  // C-5d.3: record the resolve in the high-cut capture stream
           BetaResolveEdram();
         } else if (em != xenos::EdramMode::kNoOperation) {
           RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);
@@ -5114,6 +5234,7 @@ bool NhlD3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, ui
         if (flat_rt) {
           const auto em = register_file_->Get<rex::graphics::reg::RB_MODECONTROL>().edram_mode;
           if (em == xenos::EdramMode::kCopy) {
+            HighcutCaptureResolve();  // C-5d.3: record the resolve in the high-cut capture stream
             BetaFlatResolve();
           } else if (em != xenos::EdramMode::kNoOperation) {
             RenderBetaOwnedDraw(primitive_type, index_count, index_buffer_info);

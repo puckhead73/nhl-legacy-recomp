@@ -120,6 +120,17 @@ std::vector<Resolve> g_frameResolves;        // resolves seen since last frame d
 uint64_t g_resolvesTotal = 0;
 uint64_t g_frames = 0;
 
+// C-5d frame delimiter. Bumped on EVERY guest VdSwap (sub_827F1C88), UNCONDITIONALLY — independent
+// of the NHL_HIGHCUT/NHL_HIGHCUT_PRESENT gates AND of the CP's NhlD3D12CommandProcessor::IssueSwap
+// (which live-3D takeover never reaches: it presents via PresentBetaLiveFrame, leaving frame_index_
+// frozen, so a multi-frame capture stacks). The guest's high-level present call is upstream of all
+// our takeover plumbing and still executes every game-loop iteration, so this is the reliable
+// per-frame signal the C-5 capture uses to delimit one frame. Read via HighcutGuestPresentCount().
+std::atomic<uint64_t> g_guestPresentCount{0};
+extern "C" uint64_t HighcutGuestPresentCount() {
+    return g_guestPresentCount.load(std::memory_order_relaxed);
+}
+
 // Decode the GPUTEXTURE_FETCH_CONSTANT-style header embedded in a D3D resource
 // object (header base at object+28; see file header). Returns false if the pointer
 // is implausible. Reads dword_1 (object+32) and dword_2 (object+36).
@@ -321,11 +332,52 @@ REX_HOOK_RAW(sub_827EF8E0) {
     __imp__sub_827EF8E0(ctx, base);
 }
 
+// ---------------------------------------------------------------------------
+// NHL_DRAW_TAP: frequency counters for the DRAW_INDX_2-EMITTING functions found
+// by static scan (`ori ...,13824` = PM4 0x3600 header low half) — the candidates
+// the M1 "per-draw path is inlined" verdict never measured. sub_827FFEC8 was
+// labeled "game code writing packets inline" purely from its TU index, but TUs
+// are address chunks, not library boundaries. If any of these ticks at ~draw
+// rate on a live boot, draws ARE interceptable out-of-line and the inlined-draw
+// determination (docs/highcut-m1-tap-correlation.md) is overturned.
+// ---------------------------------------------------------------------------
+const bool g_drawtap = std::getenv("NHL_DRAW_TAP") != nullptr;
+struct DrawTap { const char* name; std::atomic<uint64_t> calls; };
+DrawTap g_drawTaps[] = {
+    {"sub_827FFEC8", {}}, {"sub_82800798", {}}, {"sub_83739050", {}},
+    {"sub_827E5DB8", {}}, {"sub_827EB7D0", {}}, {"sub_827EB928", {}},
+};
+std::atomic<uint64_t> g_drawTapFrames{0};
+inline void DrawTapHit(int slot, const PPCContext& ctx) {
+    if (!g_drawtap) return;
+    const uint64_t n = g_drawTaps[slot].calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4) {
+        REXLOG_INFO("[draw-tap] FIRST {} #{} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X}",
+                    g_drawTaps[slot].name, n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
+                    ctx.r7.u32);
+    }
+}
+inline void DrawTapFrame() {
+    if (!g_drawtap) return;
+    const uint64_t f = g_drawTapFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (f % 120 == 0) {
+        for (auto& t : g_drawTaps) {
+            const uint64_t n = t.calls.load(std::memory_order_relaxed);
+            REXLOG_INFO("[draw-tap] tick {} calls={} per_frame={:.2f}", t.name, n,
+                        double(n) / double(f));
+        }
+    }
+}
+
 // Present/Swap (1/frame): args (device r3, surface* r4, _, w r6, h r7). Drives the
 // per-frame graph dump (H-1) and the in-process plume swapchain (H-2).
 REX_HOOK_RAW(sub_827F1C88) {
+    // C-5d: bump the unconditional guest-present counter FIRST (before any gate) — this is the CP's
+    // C-5 frame delimiter, and it must advance even when nothing else high-cut is enabled.
+    g_guestPresentCount.fetch_add(1, std::memory_order_relaxed);
     // H-2: advance the plume frame in lock-step with the guest present (self-gating).
     HighcutPlumeTick();
+    DrawTapFrame();
     if (g_enabled) {
         std::lock_guard<std::mutex> lk(g_mtx);
         const uint32_t surf = ctx.r4.u32;
@@ -348,3 +400,11 @@ REX_HOOK_RAW(sub_827F1C88) {
     }
     __imp__sub_827F1C88(ctx, base);
 }
+
+// NHL_DRAW_TAP pass-through counters for the DRAW_INDX_2 emitters (see block above).
+REX_HOOK_RAW(sub_827FFEC8) { DrawTapHit(0, ctx); __imp__sub_827FFEC8(ctx, base); }
+REX_HOOK_RAW(sub_82800798) { DrawTapHit(1, ctx); __imp__sub_82800798(ctx, base); }
+REX_HOOK_RAW(sub_83739050) { DrawTapHit(2, ctx); __imp__sub_83739050(ctx, base); }
+REX_HOOK_RAW(sub_827E5DB8) { DrawTapHit(3, ctx); __imp__sub_827E5DB8(ctx, base); }
+REX_HOOK_RAW(sub_827EB7D0) { DrawTapHit(4, ctx); __imp__sub_827EB7D0(ctx, base); }
+REX_HOOK_RAW(sub_827EB928) { DrawTapHit(5, ctx); __imp__sub_827EB928(ctx, base); }

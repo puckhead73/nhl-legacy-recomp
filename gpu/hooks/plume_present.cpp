@@ -45,6 +45,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "plume_render_interface.h"
@@ -101,8 +102,12 @@ struct RenderableDraw {
     std::vector<std::unique_ptr<RenderTexture>> textures;
     std::vector<std::unique_ptr<RenderTextureView>> texViews;
     std::unique_ptr<RenderSampler> sampler;
+    // C-5d.3: VERTEX-shader textures (skinning bone palette) -> descriptor set 2.
+    std::vector<std::unique_ptr<RenderTexture>> vsTextures;
+    std::vector<std::unique_ptr<RenderTextureView>> vsTexViews;
+    std::unique_ptr<RenderSampler> vsSampler;
     std::unique_ptr<RenderPipelineLayout> layout;
-    std::unique_ptr<RenderDescriptorSet> set0, set1, set3;
+    std::unique_ptr<RenderDescriptorSet> set0, set1, set2, set3;
     std::unique_ptr<RenderPipeline> pipeline;
     std::unique_ptr<RenderBuffer> indexBuf;  // quad-list expansion (C-5a.1) OR kGuestDMA (C-5d)
     uint32_t vertexCount = 0;
@@ -110,7 +115,18 @@ struct RenderableDraw {
     bool indexU32 = true;     // index buffer element size: true=R32_UINT (quad expand), false=R16_UINT
     bool textured = false;  // has set3 (textures+samplers) bound
     int32_t scLeft = 0, scTop = 0, scRight = 0, scBottom = 0;  // C-5b: per-draw clip (RT px)
+    // C-5d.2: the guest render surface this draw targets (v6 packet). Draws are bucketed by this so a
+    // non-primary surface (the 384^2 RTT pass, the 320x180 stencil-mask passes) renders into its OWN
+    // offscreen RT instead of the swapchain — keeping its depth/stencil writes off the main scene.
+    uint32_t surfDepthBase = 0, surfPitch = 0, surfMsaa = 0;
 };
+
+// C-5d.2: pack the v6 surface tuple into one key. color_base is always 0 in this title, so it's
+// omitted; (depth_base, pitch, msaa) distinguishes every guest surface seen (640 main passes, the
+// 800-pitch 384^2 RTT pass, the 320-pitch mask passes).
+static inline uint64_t SurfaceKey(uint32_t depthBase, uint32_t pitch, uint32_t msaa) {
+    return (uint64_t(depthBase) << 32) | (uint64_t(pitch) << 8) | (msaa & 0xFF);
+}
 
 struct PlumeCtx {
     HWND hwnd = nullptr;
@@ -169,6 +185,18 @@ struct PlumeCtx {
     std::vector<RenderableDraw> c5draws;
     bool c5loaded = false;
     uint64_t frame = 0;
+    // C-5d.2: per-surface offscreen render targets. A draw to a NON-primary guest surface renders
+    // into its own flat color+depth+stencil RT (cached here, keyed by SurfaceKey) instead of the
+    // swapchain, so its writes don't pollute the main scene. Sized to the swapchain (the draws' ndc
+    // fills clip space regardless of the guest surface size); the content isn't composited yet
+    // (that's C-5d.3 Resolve=host-copy) — the win is ISOLATION. Recreated with the swapchain.
+    struct SurfaceRT {
+        std::unique_ptr<RenderTexture> color, depth;
+        std::unique_ptr<RenderFramebuffer> fb;
+        uint64_t clearedFrame = ~0ull;  // last frame cleared (clear once per frame, LOAD thereafter)
+    };
+    std::unordered_map<uint64_t, SurfaceRT> c5surfaces;
+    uint64_t c5PrimaryKey = 0;  // the ONE guest surface (depth,pitch,msaa) shown on the swapchain
 };
 
 // Guest Present hook bumps this; the plume thread renders one frame per increment.
@@ -206,6 +234,7 @@ HWND CreatePlumeWindow() {
 
 void CreateFramebuffers(PlumeCtx& c) {
     c.fbs.clear();
+    c.c5surfaces.clear();  // C-5d.2: offscreen surface RTs are swapchain-sized — rebuild on resize
     // C-5c: (re)create the shared depth+stencil target to match the swapchain size, then attach it to
     // every framebuffer. Pass only the texture — plume derives the correct both-aspect (depth+stencil)
     // attachment view internally for D32_FLOAT_S8_UINT. DEPTH_TARGET flag is set by DepthTarget().
@@ -617,6 +646,17 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         if (!t.data && t.desc.data_bytes) return false;
         texs.push_back(t);
     }
+    // C-5d.3: VERTEX-shader textures (skinning bone palette) — after the PS textures, before the index.
+    std::vector<TexLoad> vs_texs;
+    for (uint32_t i = 0; i < hdr.vs_texture_count; ++i) {
+        const uint8_t* dp = take(uint32_t(sizeof(hc::TexturePacketDesc)));
+        if (!dp) return false;
+        TexLoad t{};
+        std::memcpy(&t.desc, dp, sizeof(t.desc));
+        t.data = take(t.desc.data_bytes);
+        if (!t.data && t.desc.data_bytes) return false;
+        vs_texs.push_back(t);
+    }
     // C-5d: kGuestDMA index blob (raw guest indices, last in the packet).
     const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
     if (hdr.index_bytes && !idxData) return false;
@@ -661,12 +701,26 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
 
     const uint32_t nTex = hdr.texture_count;
     const uint32_t nSamp = hdr.ps_sampler_count ? hdr.ps_sampler_count : 1u;
-    if (textured) {
+    const uint32_t nVsTex = hdr.vs_texture_count;                              // C-5d.3: VS (set2)
+    // EXACT sampler count (NOT defaulted to 1 like the PS path): a skinning bone palette is read via
+    // texel-fetch and may have 0 samplers. Adding a phantom sampler would make set2's layout mismatch
+    // the translated VS's declared bindings.
+    const uint32_t nVsSamp = hdr.vs_sampler_count;
+    const bool vs_textured = nVsTex > 0;
+    // C-4/C-5d.3: create + upload a list of guest textures (PS or VS) into plume textures+views, plus a
+    // LINEAR/CLAMP sampler. Factored so PS textures (set3) and the VS skinning bone palette (set2) use
+    // one path. Returns false only on sampler-create failure (a null texture is tolerated downstream).
+    auto createTextures = [&](const std::vector<TexLoad>& srcTexs,
+                              std::vector<std::unique_ptr<RenderTexture>>& outTex,
+                              std::vector<std::unique_ptr<RenderTextureView>>& outView,
+                              std::unique_ptr<RenderSampler>& outSampler, RenderFilter filter) -> bool {
+        if (srcTexs.empty()) return true;
         auto mapFmt = [](uint32_t f) -> RenderFormat {
             switch (f) {
                 case hc::kTexBC1: return RenderFormat::BC1_UNORM;
                 case hc::kTexBC2: return RenderFormat::BC2_UNORM;
                 case hc::kTexBC3: return RenderFormat::BC3_UNORM;
+                case hc::kTexRGBA32F: return RenderFormat::R32G32B32A32_FLOAT;  // C-5d.3 bone palette
                 default: return RenderFormat::R8G8B8A8_UNORM;
             }
         };
@@ -674,7 +728,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         auto fence = c.device->createCommandFence();
         std::vector<std::unique_ptr<RenderBuffer>> stagings;
         up->begin();
-        for (auto& t : texs) {
+        for (auto& t : srcTexs) {
             const RenderFormat rf = mapFmt(t.desc.tex_format);
             auto tex = c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
             auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.desc.data_bytes ? t.desc.data_bytes : 4u));
@@ -688,8 +742,8 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             RenderTextureViewDesc vd = RenderTextureViewDesc::Texture2D(rf);
             vd.componentMapping = xenosSwizzleMapping(t.desc.swizzle);  // apply the guest swizzle
             auto view = tex ? tex->createTextureView(vd) : nullptr;
-            d.textures.push_back(std::move(tex));
-            d.texViews.push_back(std::move(view));
+            outTex.push_back(std::move(tex));
+            outView.push_back(std::move(view));
             stagings.push_back(std::move(staging));
         }
         up->end();
@@ -697,16 +751,26 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
         c.queue->waitForCommandFence(fence.get());
         RenderSamplerDesc sd;
-        sd.minFilter = RenderFilter::LINEAR;
-        sd.magFilter = RenderFilter::LINEAR;
+        sd.minFilter = filter;
+        sd.magFilter = filter;
         sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
-        d.sampler = c.device->createSampler(sd);
-        if (!d.sampler) return false;
-    }
+        outSampler = c.device->createSampler(sd);
+        return outSampler != nullptr;
+    };
+    if (!createTextures(texs, d.textures, d.texViews, d.sampler, RenderFilter::LINEAR)) return false;
+    // C-5d.3: the VS skinning bone palette MUST be POINT-sampled — LINEAR blends adjacent bone-matrix
+    // rows into garbage transforms (the radial vertex explosion). Each texel is an exact matrix row.
+    if (!createTextures(vs_texs, d.vsTextures, d.vsTexViews, d.vsSampler, RenderFilter::NEAREST)) return false;
 
     auto bSet1 = [](RenderDescriptorSetBuilder& b) {
         b.begin();
         for (uint32_t i = 0; i <= 4; ++i) b.addConstantBuffer(i);
+        b.end();
+    };
+    auto bSet2 = [&](RenderDescriptorSetBuilder& b) {  // C-5d.3: VS textures (skinning) then samplers
+        b.begin();
+        for (uint32_t i = 0; i < nVsTex; ++i) b.addTexture(i);
+        for (uint32_t i = 0; i < nVsSamp; ++i) b.addSampler(nVsTex + i);
         b.end();
     };
     auto bSet3 = [&](RenderDescriptorSetBuilder& b) {
@@ -715,14 +779,18 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         for (uint32_t i = 0; i < nSamp; ++i) b.addSampler(nTex + i);
         b.end();
     };
+    // set2 must EXIST whenever set3 does (so PS textures land on set 3) OR when the VS has textures.
+    const bool need_set2 = vs_textured || textured;
     RenderPipelineLayoutBuilder lb;
     lb.begin(false, false);
     { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); lb.addDescriptorSet(s); }  // set0
     { RenderDescriptorSetBuilder s; bSet1(s); lb.addDescriptorSet(s); }                                       // set1
-    if (textured) {
-        { RenderDescriptorSetBuilder s; s.begin(); s.end(); lb.addDescriptorSet(s); }                         // set2 empty
-        { RenderDescriptorSetBuilder s; bSet3(s); lb.addDescriptorSet(s); }                                   // set3
+    if (need_set2) {                                                                                          // set2
+        RenderDescriptorSetBuilder s;
+        if (vs_textured) bSet2(s); else { s.begin(); s.end(); }  // VS textures, else empty placeholder
+        lb.addDescriptorSet(s);
     }
+    if (textured) { RenderDescriptorSetBuilder s; bSet3(s); lb.addDescriptorSet(s); }                         // set3
     lb.end();
     d.layout = lb.create(c.device.get());
     if (!d.layout) return false;
@@ -736,6 +804,13 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     d.set1->setBuffer(2, d.psFloatBuf.get(), kFloat);
     d.set1->setBuffer(3, d.boolBuf.get(), kBool);
     d.set1->setBuffer(4, d.fetchBuf.get(), kFetch);
+    if (vs_textured) {  // C-5d.3: bind the VS skinning textures to set2
+        RenderDescriptorSetBuilder s; bSet2(s); d.set2 = s.create(c.device.get());
+        if (!d.set2) return false;
+        for (uint32_t i = 0; i < nVsTex && i < d.vsTextures.size(); ++i)
+            if (d.vsTextures[i]) d.set2->setTexture(i, d.vsTextures[i].get(), RenderTextureLayout::SHADER_READ, d.vsTexViews[i].get());
+        for (uint32_t i = 0; i < nVsSamp; ++i) d.set2->setSampler(nVsTex + i, d.vsSampler.get());
+    }
     if (textured) {
         RenderDescriptorSetBuilder s; bSet3(s); d.set3 = s.create(c.device.get());
         if (!d.set3) return false;
@@ -803,22 +878,28 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                                              hdr.front_depth_fail_op, hdr.front_func);
     pd.stencilBackFace = toPlumeStencilFace(hdr.back_fail_op, hdr.back_pass_op,
                                             hdr.back_depth_fail_op, hdr.back_func);
-    // Cull. NHL_HIGHCUT_NOCULL force-disables it at replay time (bring-up). The replay bakes a y-flip
-    // into ndc, which REVERSES on-screen triangle winding, so a guest CCW front face is CW on our RT
-    // -> invert front_ccw when choosing RenderFrontFace (NHL_HIGHCUT_FLIP_FACE toggles to test this).
+    // Cull. NHL_HIGHCUT_NOCULL force-disables it at replay time (bring-up). C-5e: use the guest front-
+    // face winding (PA_SU_SC_MODE_CNTL.face) DIRECTLY — verified correct on a full face-off scene (ice +
+    // closed player meshes). The old code inverted it "to compensate for the y-flip baked into ndc," but
+    // that double-flipped: a y-flip reverses on-screen winding AND Vulkan's framebuffer-space front-face
+    // determination already accounts for the flipped clip-space, so the net needs NO inversion. The
+    // inverted version culled the camera-facing side of closed meshes (players seen front-from-behind,
+    // logo mirrored) and culled the ice. NHL_HIGHCUT_FLIP_FACE now re-applies the OLD inversion for A/B.
     static const bool no_cull = std::getenv("NHL_HIGHCUT_NOCULL") != nullptr;
     static const bool flip_face = std::getenv("NHL_HIGHCUT_FLIP_FACE") != nullptr;
     pd.cullMode = no_cull ? RenderCullMode::NONE
                 : (hdr.cull_mode == 1 ? RenderCullMode::FRONT
                 : (hdr.cull_mode == 2 ? RenderCullMode::BACK : RenderCullMode::NONE));
-    bool front_ccw_screen = (hdr.front_ccw != 0);  // guest convention
-    front_ccw_screen = !front_ccw_screen;          // y-flip reverses winding on our RT
+    bool front_ccw_screen = (hdr.front_ccw != 0);  // guest convention, used directly
     if (flip_face) front_ccw_screen = !front_ccw_screen;
     pd.frontFace = front_ccw_screen ? RenderFrontFace::COUNTER_CLOCKWISE
                                     : RenderFrontFace::CLOCKWISE;
     d.pipeline = c.device->createGraphicsPipeline(pd);
     if (!d.pipeline) return false;
     d.vertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
+    d.surfDepthBase = hdr.surface_depth_base;  // C-5d.2: surface bucket key
+    d.surfPitch = hdr.surface_pitch;
+    d.surfMsaa = hdr.surface_msaa;
     d.scLeft = int32_t(hdr.sc_left); d.scTop = int32_t(hdr.sc_top);
     d.scRight = int32_t(hdr.sc_right); d.scBottom = int32_t(hdr.sc_bottom);
     if (d.scRight <= d.scLeft || d.scBottom <= d.scTop) {  // degenerate -> full RT
@@ -855,6 +936,76 @@ void LoadC5Frames(PlumeCtx& c) {
     }
     REXLOG_INFO("[highcut-C5] loaded {} renderable draws ({} skipped) of {} captured owned draws",
                 built, skipped, count);
+
+    // C-5d.2: pick the PRIMARY guest surface = the (depth_base,pitch,msaa) tuple with the most draws
+    // (the main scene). ONLY that surface renders to the swapchain; EVERY other surface — incl. a
+    // second same-pitch surface that's a distinct guest depth buffer (e.g. 640/2X vs 640/1X) — renders
+    // into its OWN offscreen color+depth RT. This matters: lumping two guest depth buffers onto one
+    // shared host depth gives wrong occlusion (large areas depth-killed → the "squash"). Override the
+    // pick with NHL_HIGHCUT_C5_PRIMARY_PITCH (+ optional NHL_HIGHCUT_C5_PRIMARY_DEPTH) to bisect which
+    // surface is the final image; NHL_HIGHCUT_C5_NOSPLIT forces the old all-into-swapchain (= C-5c).
+    // Default primary = the surface with the most TEXTURED draws (the opaque scene with real game art,
+    // e.g. depth=360 here), NOT the most draws — the largest surface is often an UNTEXTURED aux pass
+    // (a depth/shadow prepass or a reflection pass that samples a screen-size resolve) that renders
+    // black on its own. Tie-break on total draws.
+    std::unordered_map<uint64_t, uint32_t> keyCounts, keyTexCounts;
+    for (const auto& d : c.c5draws) {
+        const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
+        ++keyCounts[k];
+        if (d.textured) ++keyTexCounts[k];
+    }
+    uint64_t bestKey = 0; uint32_t bestTex = 0, bestN = 0;
+    for (const auto& kv : keyCounts) {
+        const uint32_t tex = keyTexCounts[kv.first];
+        if (tex > bestTex || (tex == bestTex && kv.second > bestN)) { bestTex = tex; bestN = kv.second; bestKey = kv.first; }
+    }
+    if (const char* op = std::getenv("NHL_HIGHCUT_C5_PRIMARY_PITCH")) {
+        const uint32_t wantPitch = uint32_t(std::strtoul(op, nullptr, 10));
+        const char* od = std::getenv("NHL_HIGHCUT_C5_PRIMARY_DEPTH");
+        const uint32_t wantDepth = od ? uint32_t(std::strtoul(od, nullptr, 10)) : 0xFFFFFFFFu;
+        uint64_t k2 = 0; uint32_t n2 = 0;  // most-drawn surface matching the requested pitch (+depth)
+        for (const auto& d : c.c5draws) {
+            if (d.surfPitch != wantPitch) continue;
+            if (wantDepth != 0xFFFFFFFFu && d.surfDepthBase != wantDepth) continue;
+            const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
+            if (keyCounts[k] > n2) { n2 = keyCounts[k]; k2 = k; }
+        }
+        if (k2) { bestKey = k2; bestN = n2; bestTex = keyTexCounts[k2]; }
+    }
+    c.c5PrimaryKey = bestKey;
+    auto unkPitch = [](uint64_t k) { return uint32_t((k >> 8) & 0xFFFFFF); };
+    auto unkDepth = [](uint64_t k) { return uint32_t(k >> 32); };
+    auto unkMsaa  = [](uint64_t k) { return uint32_t(k & 0xFF); };
+    REXLOG_INFO("[highcut-C5d] PRIMARY surface = depth={} pitch={} msaa={} ({} draws, {} textured); "
+                "{} distinct surfaces:", unkDepth(bestKey), unkPitch(bestKey), unkMsaa(bestKey),
+                keyCounts[bestKey], bestTex, uint32_t(keyCounts.size()));
+    for (const auto& kv : keyCounts)
+        REXLOG_INFO("[highcut-C5d]   surface depth={} pitch={} msaa={} -> {} draws ({} textured) ({})",
+                    unkDepth(kv.first), unkPitch(kv.first), unkMsaa(kv.first), kv.second,
+                    keyTexCounts[kv.first], kv.first == c.c5PrimaryKey ? "PRIMARY -> swapchain" : "offscreen RT");
+}
+
+// C-5d.2: lazily create + cache the offscreen color+depth+stencil RT for a NON-primary guest surface.
+// Sized to the swapchain (the draws' ndc already fills clip space regardless of the guest surface
+// size, and per-draw scissors are in swapchain coords). Color=kSwapFormat, depth=kDepthFormat at 1X so
+// it stays renderpass-compatible with the per-draw pipelines (which declare exactly those formats).
+PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key) {
+    auto it = c.c5surfaces.find(key);
+    if (it != c.c5surfaces.end()) return &it->second;
+    const uint32_t w = c.swap->getWidth(), h = c.swap->getHeight();
+    PlumeCtx::SurfaceRT s;
+    s.color = c.device->createTexture(RenderTextureDesc::ColorTarget(w, h, kSwapFormat));
+    s.depth = c.device->createTexture(RenderTextureDesc::DepthTarget(w, h, kDepthFormat));
+    if (!s.color || !s.depth) { REXLOG_ERROR("[highcut-C5d] offscreen surface RT create failed"); return nullptr; }
+    RenderFramebufferDesc fd;
+    const RenderTexture* col = s.color.get();
+    fd.colorAttachments = &col;
+    fd.colorAttachmentsCount = 1;
+    fd.depthAttachment = s.depth.get();
+    s.fb = c.device->createFramebuffer(fd);
+    if (!s.fb) { REXLOG_ERROR("[highcut-C5d] offscreen surface framebuffer create failed"); return nullptr; }
+    auto res = c.c5surfaces.emplace(key, std::move(s));
+    return &res.first->second;
 }
 
 void RenderClear(PlumeCtx& c) {
@@ -893,7 +1044,17 @@ void RenderClear(PlumeCtx& c) {
     // low-alpha overlays — e.g. the bottom nav bars, draws 121/122: a black BC3 texture at alpha
     // ~0.13 over the clear = ~87% clear = bright green. Real game clears black there -> dark bars.)
     if (c5_mode) {
-        c.cmd->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+        // Diagnostic: NHL_HIGHCUT_C5_CLEAR=R,G,B (0..255) overrides the black clear, so a pass whose
+        // draws output black (opaque One/Zero) shows as BLACK SILHOUETTES on the bright clear — reveals
+        // whether a "black" surface actually has full-screen geometry (the scene) or is itself a band.
+        static const RenderColor c5clear = []() {
+            if (const char* s = std::getenv("NHL_HIGHCUT_C5_CLEAR")) {
+                int r = 0, g = 0, b = 0; std::sscanf(s, "%d,%d,%d", &r, &g, &b);
+                return RenderColor(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
+            }
+            return RenderColor(0.0f, 0.0f, 0.0f, 1.0f);
+        }();
+        c.cmd->clearColor(0, c5clear);
     } else {
         const float t = (c.frame % 120) / 120.0f;
         c.cmd->clearColor(0, RenderColor(0.1f, t, 0.2f + 0.3f * t, 1.0f));
@@ -1114,27 +1275,39 @@ void RenderClear(PlumeCtx& c) {
         c.cmd->drawInstanced(3, 1, 0, 0);
     }
 
-    // C-5a: replay every captured owned draw of the frame into this one flat RT, in order, each
-    // with its own pipeline + per-draw blend. Viewport/scissor are the full swapchain (set above);
-    // each draw positions its geometry via its own ndc (baked into its SystemConstants). Per-surface
-    // RTs + Resolve=host-copy (correct render-to-texture composition) is C-5b.
+    // C-5a/d.2: replay the captured frame's owned draws, routed by guest render surface. DEFAULT: only
+    // the PRIMARY surface (the visible scene) renders to the swapchain; every other surface (the
+    // depth=184 pass, the 384^2 shadow/RTT pass, the 320x180 stencil masks) is DROPPED — the resolve
+    // graph showed nothing samples them, so a mask's Always-depth write and the shadow pass can't
+    // pollute the main scene (Problem 1) AND we don't pay to render them. Each primary draw carries its
+    // own pipeline + per-draw blend/depth/stencil/cull; ndc fills clip space so the full swapchain
+    // viewport is correct. Gates:
+    //   NHL_HIGHCUT_C5_NOSPLIT    — render ALL surfaces to the swapchain (= C-5c baseline).
+    //   NHL_HIGHCUT_C5_OFFSCREEN  — render the non-primary surfaces into their OWN offscreen color+
+    //                               depth+stencil RTs (the C-5d.3 Resolve=host-copy foundation; pure
+    //                               overhead today since nothing samples them).
+    //   NHL_HIGHCUT_C5_PRIMARY_PITCH/_DEPTH — override which surface is the main scene.
     if (c5_mode && !c.c5draws.empty()) {
         // Bisection: replay only draws [MINDRAW, MAXDRAW) to isolate an artifact to a draw index.
         static const uint32_t c5_min = []() { const char* s = std::getenv("NHL_HIGHCUT_C5_MINDRAW"); return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 0u; }();
         static const uint32_t c5_max = []() { const char* s = std::getenv("NHL_HIGHCUT_C5_MAXDRAW"); return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 0xFFFFFFFFu; }();
-        uint32_t di = 0;
-        for (auto& d : c.c5draws) {
-            const uint32_t this_i = di++;
-            if (this_i < c5_min || this_i >= c5_max) continue;
-            // C-5b: per-draw clip (the game scissors the description text to its box, the ticker to
-            // its bar, etc). NHL_HIGHCUT_NO_SCISSOR forces full-RT for A/B.
-            static const bool no_scissor = std::getenv("NHL_HIGHCUT_NO_SCISSOR") != nullptr;
+        static const bool no_scissor = std::getenv("NHL_HIGHCUT_NO_SCISSOR") != nullptr;
+        static const bool no_split = std::getenv("NHL_HIGHCUT_C5_NOSPLIT") != nullptr;
+        // Opt-in: render non-primary surfaces offscreen (C-5d.3 foundation). Default OFF — they're
+        // never sampled, so rendering them is wasted GPU work; dropping them gives the same image.
+        static const bool render_offscreen = std::getenv("NHL_HIGHCUT_C5_OFFSCREEN") != nullptr;
+        auto inWindow = [&](uint32_t i) { return i >= c5_min && i < c5_max; };
+        // Bind+draw one renderable draw into the currently-bound framebuffer (its own pipeline carries
+        // blend/depth/stencil/cull + topology). The per-draw scissor is in swapchain coords; offscreen
+        // RTs are swapchain-sized so it stays in range.
+        auto renderDraw = [&](RenderableDraw& d) {
             if (no_scissor) c.cmd->setScissors(RenderRect(0, 0, kWidth, kHeight));
             else c.cmd->setScissors(RenderRect(d.scLeft, d.scTop, d.scRight, d.scBottom));
             c.cmd->setGraphicsPipelineLayout(d.layout.get());
             c.cmd->setPipeline(d.pipeline.get());
             c.cmd->setGraphicsDescriptorSet(d.set0.get(), 0);
             c.cmd->setGraphicsDescriptorSet(d.set1.get(), 1);
+            if (d.set2) c.cmd->setGraphicsDescriptorSet(d.set2.get(), 2);  // C-5d.3: VS skinning textures
             if (d.textured) c.cmd->setGraphicsDescriptorSet(d.set3.get(), 3);
             if (d.indexCount > 0) {  // quad-list expansion (R32) or kGuestDMA (R16/R32)
                 const uint32_t istride = d.indexU32 ? 4u : 2u;
@@ -1145,6 +1318,55 @@ void RenderClear(PlumeCtx& c) {
             } else {
                 c.cmd->drawInstanced(d.vertexCount, 1, 0, 0);
             }
+        };
+        auto isPrimary = [&](const RenderableDraw& d) {
+            return no_split || SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa) == c.c5PrimaryKey;
+        };
+
+        // C-5d.2 (opt-in via NHL_HIGHCUT_C5_OFFSCREEN): render each NON-primary surface's draws into its
+        // own offscreen RT (grouped by surface, capture order preserved within a surface). Each is its
+        // own render pass (barriers + setFramebuffer end the prior pass; a fresh clear+draws begin a new
+        // one), so the mask/RTT passes get their OWN depth+stencil and never touch the swapchain. This
+        // is the C-5d.3 Resolve=host-copy foundation; off by default (nothing samples the result yet).
+        if (!no_split && render_offscreen) {
+            std::vector<uint64_t> order;
+            std::unordered_map<uint64_t, char> seen;
+            for (uint32_t i = 0; i < c.c5draws.size(); ++i) {
+                if (!inWindow(i) || isPrimary(c.c5draws[i])) continue;
+                const auto& d = c.c5draws[i];
+                const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
+                if (!seen[k]) { seen[k] = 1; order.push_back(k); }
+            }
+            for (uint64_t k : order) {
+                PlumeCtx::SurfaceRT* s = GetOrCreateSurfaceRT(c, k);
+                if (!s) continue;
+                const RenderTextureBarrier bb[] = {
+                    RenderTextureBarrier(s->color.get(), RenderTextureLayout::COLOR_WRITE),
+                    RenderTextureBarrier(s->depth.get(), RenderTextureLayout::DEPTH_WRITE),
+                };
+                c.cmd->barriers(RenderBarrierStage::GRAPHICS, bb, 2);
+                c.cmd->setFramebuffer(s->fb.get());
+                c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
+                c.cmd->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+                c.cmd->clearDepthStencil(true, true, 1.0f, 0);
+                for (uint32_t i = 0; i < c.c5draws.size(); ++i) {
+                    if (!inWindow(i) || isPrimary(c.c5draws[i])) continue;
+                    auto& d = c.c5draws[i];
+                    if (SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa) == k) renderDraw(d);
+                }
+            }
+            // Re-bind the swapchain for the primary draws; its color+depth keep their earlier clear
+            // (renderpass LOAD), and they were left in COLOR_WRITE/DEPTH_WRITE (only offscreen RTs were
+            // transitioned), so no extra barrier is needed.
+            c.cmd->setFramebuffer(c.fbs[idx].get());
+            c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
+        }
+
+        // Primary surface -> swapchain (the main scene; == C-5c when NHL_HIGHCUT_C5_NOSPLIT).
+        for (uint32_t i = 0; i < c.c5draws.size(); ++i) {
+            if (!inWindow(i)) continue;
+            if (!isPrimary(c.c5draws[i])) continue;  // non-primary went to its offscreen RT (or skipped)
+            renderDraw(c.c5draws[i]);
         }
     }
 

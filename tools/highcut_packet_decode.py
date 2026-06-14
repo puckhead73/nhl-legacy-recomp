@@ -36,6 +36,7 @@ MAGIC = 0x48334450  # 'H3DP'
 HDR_V3 = "<14I6f8I4I"          # 14 u32 + 6 f32 + 8 u32 + 4 u32
 HDR_V4 = HDR_V3 + "17I"        # + 17 u32 (depth/stencil/cull)
 HDR_V5 = HDR_V4 + "2I"         # + 2 u32 (index_format, index_bytes)
+HDR_V6 = HDR_V5 + "5I"         # + 5 u32 (surface color_base/depth_base/pitch/msaa/color_format)
 HDR_V3_FIELDS = [
     "magic", "version", "vertex_count", "topology", "fetch_bytes", "sys_bytes", "shared_bytes",
     "bool_bytes", "vs_float_bytes", "ps_float_bytes", "vs_spirv_bytes", "ps_spirv_bytes",
@@ -52,16 +53,29 @@ HDR_V4_FIELDS = HDR_V3_FIELDS + [
     "front_ccw",
 ]
 HDR_V5_FIELDS = HDR_V4_FIELDS + ["index_format", "index_bytes"]
-TEX_DESC = "<8I"  # width height tex_format row_pitch_bytes data_bytes fetch_slot is_signed swizzle
-TEX_FIELDS = ["width", "height", "tex_format", "row_pitch_bytes", "data_bytes", "fetch_slot",
-              "is_signed", "swizzle"]
+HDR_V6_FIELDS = HDR_V5_FIELDS + ["surface_color_base", "surface_depth_base", "surface_pitch",
+                                 "surface_msaa", "surface_color_format"]
+HDR_V7 = HDR_V6                # v7 header == v6; only TexturePacketDesc grew (+fetch_base_addr)
+HDR_V7_FIELDS = HDR_V6_FIELDS
+HDR_V8 = HDR_V7 + "2I"         # v8: + vs_texture_count, vs_sampler_count (VS skinning textures)
+HDR_V8_FIELDS = HDR_V7_FIELDS + ["vs_texture_count", "vs_sampler_count"]
+# TexturePacketDesc: v3-v6 = 8 u32; v7 += fetch_base_addr (the guest texture base addr, for resolve match)
+TEX_DESC_V6 = "<8I"
+TEX_DESC_V7 = "<9I"
+TEX_FIELDS_V6 = ["width", "height", "tex_format", "row_pitch_bytes", "data_bytes", "fetch_slot",
+                 "is_signed", "swizzle"]
+TEX_FIELDS_V7 = TEX_FIELDS_V6 + ["fetch_base_addr"]
+# Resolve sidecar (highcut_resolves.bin): [magic 'H3RV'][count][ResolveMarker x count]
+RESOLVE_MAGIC = 0x48335256
+RESOLVE_DESC = "<6I"  # after_draw dest_addr is_depth src_depth_base src_pitch src_msaa
+RESOLVE_FIELDS = ["after_draw", "dest_addr", "is_depth", "src_depth_base", "src_pitch", "src_msaa"]
 
 CMP = {0: "Never", 1: "Less", 2: "Equal", 3: "LEqual", 4: "Greater", 5: "NotEqual",
        6: "GEqual", 7: "Always"}
 SOP = {0: "Keep", 1: "Zero", 2: "Replace", 3: "IncClamp", 4: "DecClamp", 5: "Invert",
        6: "IncWrap", 7: "DecWrap"}
 TOPO = {0: "TriList", 1: "TriStrip", 2: "QuadExpand"}
-TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3"}
+TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3", 4: "RGBA32F"}
 CULL = {0: "none", 1: "front", 2: "back"}
 
 
@@ -69,9 +83,15 @@ def parse_header(buf):
     if len(buf) < 8 or struct.unpack_from("<I", buf, 0)[0] != MAGIC:
         return None, 0, None
     version = struct.unpack_from("<I", buf, 4)[0]
-    # Only v3 (C-5a), v4 (C-5c), v5 (C-5d) share the layout this tool decodes; v2 and earlier had a
+    # Only v3 (C-5a), v4 (C-5c), v5/v6 (C-5d) share the layout this tool decodes; v2 and earlier had a
     # different header and would parse to garbage, so reject them explicitly rather than print nonsense.
-    if version == 5:
+    if version == 8:
+        fmt, fields = HDR_V8, HDR_V8_FIELDS
+    elif version == 7:
+        fmt, fields = HDR_V7, HDR_V7_FIELDS
+    elif version == 6:
+        fmt, fields = HDR_V6, HDR_V6_FIELDS
+    elif version == 5:
         fmt, fields = HDR_V5, HDR_V5_FIELDS
     elif version == 4:
         fmt, fields = HDR_V4, HDR_V4_FIELDS
@@ -105,17 +125,22 @@ def fmt_draw_line(h):
     if h["version"] >= 5:
         ifmt = {0: "none", 1: "u16", 2: "u32"}.get(h["index_format"], "?")
         s += f"  idx={ifmt}" + (f"/{h['index_bytes']}B" if h["index_format"] else "")
+    if h["version"] >= 6:
+        s += (f"  surf[c={h['surface_color_base']} d={h['surface_depth_base']} "
+              f"pitch={h['surface_pitch']} msaa={h['surface_msaa']} fmt={h['surface_color_format']}]")
     return s
 
 
 def iter_textures(buf, h, hdr_size):
+    tex_desc = TEX_DESC_V7 if h["version"] >= 7 else TEX_DESC_V6
+    tex_fields = TEX_FIELDS_V7 if h["version"] >= 7 else TEX_FIELDS_V6
     off = (hdr_size + h["fetch_bytes"] + h["sys_bytes"] + h["shared_bytes"] + h["bool_bytes"] +
            h["vs_float_bytes"] + h["ps_float_bytes"] + h["vs_spirv_bytes"] + h["ps_spirv_bytes"])
     for _ in range(h["texture_count"]):
-        if off + struct.calcsize(TEX_DESC) > len(buf):
+        if off + struct.calcsize(tex_desc) > len(buf):
             return
-        d = dict(zip(TEX_FIELDS, struct.unpack_from(TEX_DESC, buf, off)))
-        off += struct.calcsize(TEX_DESC)
+        d = dict(zip(tex_fields, struct.unpack_from(tex_desc, buf, off)))
+        off += struct.calcsize(tex_desc)
         blob = buf[off:off + d["data_bytes"]]
         off += d["data_bytes"]
         yield d, blob
@@ -219,6 +244,9 @@ def write_png(path, w, h, rgba):
 def decode_textures(buf, h, hdr_size, base):
     for i, (d, blob) in enumerate(iter_textures(buf, h, hdr_size)):
         w, hh, fmt = d["width"], d["height"], d["tex_format"]
+        if fmt == 4:  # RGBA32F (bone palette) — not an image; skip PNG
+            print(f"    tex{i}: RGBA32F {w}x{hh} (skinning bone palette — no PNG)")
+            continue
         if fmt == 0:  # RGBA8 already (tight rows)
             rgba = bytearray(blob[:w * hh * 4])
             rgba += bytes(w * hh * 4 - len(rgba))
@@ -238,7 +266,7 @@ def process_file(path, verbose, png):
             print(f"{os.path.basename(path)}: not a valid H3DP packet")
         else:
             print(f"{os.path.basename(path)}: unsupported packet v{version} "
-                  f"(this tool decodes v3/v4 — re-dump with the current build)")
+                  f"(this tool decodes v3–v6 — re-dump with the current build)")
         return None
     print(f"{os.path.basename(path):26} {fmt_draw_line(h)}")
     if png:
@@ -263,12 +291,22 @@ def main():
         print(f"frame: {count} captured owned draws")
         stencil_draws, depth_draws, indexed = [], [], 0
         is3d = []  # per-draw: main-3D content (vp_w==640 & textured), for frame-window finding
+        surfaces = {}  # C-5d: (color_base, depth_base, pitch, msaa) -> {draws, vps, has_mask, ...}
+        samplers = {}  # C-5d.3: fetch_base_addr -> [draw indices that sample it] (v7)
         for i in range(count):
             p = os.path.join(args.target, f"highcut_frame_{i}.bin")
             if not os.path.exists(p):
                 is3d.append(False)
                 continue
+            with open(p, "rb") as f:
+                _buf = f.read()
             h = process_file(p, args.verbose, args.png)
+            if h and h.get("version", 0) >= 7:
+                hs = struct.calcsize(HDR_V8 if h["version"] >= 8 else HDR_V7)
+                for td, _blob in iter_textures(_buf, h, hs):
+                    a = td.get("fetch_base_addr", 0)
+                    if a:
+                        samplers.setdefault(a, []).append(i)
             if h and h.get("stencil_enable"):
                 stencil_draws.append(i)
             if h and h.get("depth_enable"):
@@ -276,6 +314,18 @@ def main():
             if h and h.get("index_format"):
                 indexed += 1
             is3d.append(bool(h and h.get("vp_w") == 640.0 and h.get("texture_count", 0) > 0))
+            if h and h.get("version", 0) >= 6:
+                key = (h["surface_color_base"], h["surface_depth_base"], h["surface_pitch"],
+                       h["surface_msaa"])
+                b = surfaces.setdefault(key, {"draws": [], "vps": set(), "fmt": h["surface_color_format"],
+                                              "stencil": 0, "mask": []})
+                b["draws"].append(i)
+                b["vps"].add((int(h["vp_w"]), int(h["vp_h"])))
+                if h.get("stencil_enable"):
+                    b["stencil"] += 1
+                    # A "mask" draw seeds stencil: stencil_enable + pass_op==Replace(2) + depth Always(7).
+                    if h.get("front_pass_op") == 2 and h.get("depth_func") == 7:
+                        b["mask"].append(i)
         # Largest contiguous run of main-3D-content draws — a good single-frame replay window. (The
         # live-3D capture accumulates several frames since IssueSwap can't delimit them; replay this
         # window to view one frame without the full-screen mask draws that blackout the RT.)
@@ -292,10 +342,51 @@ def main():
         print(f"\nsummary: {len(depth_draws)} depth-tested, {indexed} indexed (kGuestDMA), "
               f"{len(stencil_draws)} stencil-tested draws")
         print(f"         stencil-tested: {stencil_draws}")
+        # C-5d surface buckets: which distinct guest render surfaces the frame draws into, and which
+        # one carries the stencil-seeding mask. This is the map the per-surface replay buckets by.
+        if surfaces:
+            print(f"\nsurfaces (C-5d): {len(surfaces)} distinct render targets")
+            for key, b in sorted(surfaces.items(), key=lambda kv: -len(kv[1]["draws"])):
+                cb, db, pitch, msaa = key
+                dr = b["draws"]
+                rng = f"{dr[0]}..{dr[-1]}" if len(dr) > 1 else f"{dr[0]}"
+                vps = ",".join(f"{w}x{h}" for w, h in sorted(b["vps"]))
+                note = f" MASK@{b['mask']}" if b["mask"] else ""
+                print(f"  color={cb:<5} depth={db:<5} pitch={pitch:<5} msaa={msaa} fmt={b['fmt']}: "
+                      f"{len(dr)} draws [{rng}] vp={{{vps}}} stencil={b['stencil']}{note}")
         if best[0]:
             print(f"\nlargest 3D-content run: {best[0]} draws [{best[1]}..{best[2]}] — replay one frame:")
             print(f'  $env:NHL_HIGHCUT_C5_MINDRAW="{best[1]}"; '
                   f'$env:NHL_HIGHCUT_C5_MAXDRAW="{best[2] + 1}"; .\\_c5render.ps1')
+        # C-5d.3 resolve dependency graph: read highcut_resolves.bin (guest EDRAM resolves in stream
+        # order) and cross-reference each resolve DEST address with the draws that SAMPLE it (v7
+        # fetch_base_addr). This is the map the replay's Resolve=host-copy follows: "after draw N,
+        # surface S resolved to addr A; draws [...] later sample A → bind S's offscreen RT".
+        rpath = os.path.join(args.target, "highcut_resolves.bin")
+        if os.path.exists(rpath):
+            with open(rpath, "rb") as f:
+                rbuf = f.read()
+            if len(rbuf) >= 8 and struct.unpack_from("<I", rbuf, 0)[0] == RESOLVE_MAGIC:
+                rcount = struct.unpack_from("<I", rbuf, 4)[0]
+                print(f"\nresolves (C-5d.3): {rcount} guest EDRAM resolve events")
+                off = 8
+                for _ in range(rcount):
+                    if off + struct.calcsize(RESOLVE_DESC) > len(rbuf):
+                        break
+                    r = dict(zip(RESOLVE_FIELDS, struct.unpack_from(RESOLVE_DESC, rbuf, off)))
+                    off += struct.calcsize(RESOLVE_DESC)
+                    consumers = samplers.get(r["dest_addr"], [])
+                    kind = "depth" if r["is_depth"] else "color"
+                    cons = (f"sampled by draws {consumers[:8]}" + ("…" if len(consumers) > 8 else "")
+                            if consumers else "NOT sampled by any captured draw")
+                    print(f"  after draw {r['after_draw']:<5} {kind} resolve dest=0x{r['dest_addr']:08X} "
+                          f"src(depth={r['src_depth_base']} pitch={r['src_pitch']} msaa={r['src_msaa']}) "
+                          f"-> {cons}")
+                # sampled addresses that are NOT produced by any resolve (genuine guest textures)
+                resolved_dests = {struct.unpack_from(RESOLVE_DESC, rbuf, 8 + j * struct.calcsize(RESOLVE_DESC))[1]
+                                  for j in range(min(rcount, (len(rbuf) - 8) // struct.calcsize(RESOLVE_DESC)))}
+                unresolved = sorted(a for a in samplers if a not in resolved_dests)
+                print(f"  ({len(unresolved)} distinct sampled addrs are plain guest textures, not resolve targets)")
         return 0
     process_file(args.target, args.verbose, args.png)
     return 0

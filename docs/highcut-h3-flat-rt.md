@@ -357,12 +357,138 @@ the flat path) or the sampler/UV. The fix generalizes to all 3D scenes (gameplay
 This is the documented deep Tier-1 parity core (build-order §4.1) and is multi-session
 renderer work — isolated precisely here, to resume with the frame debugger.
 
+## 2026-06-11 — diagnostic campaign executed: hypotheses ranked, fix isolated to RTT-chain + color
+
+Ran the `docs/h3-3d-geometry-parity-plan.md` investigation against a live frame-100 capture
+(the `CAPTURE_FRAME=150` in older notes is STALE — this `454109EC_stream.xtr` is only **109
+frames** (0–108); frame 108 is a black transition. Capture a late valid frame, e.g.
+**`NHL_BETA_CAPTURE_FRAME=100`**, which renders the EQUIPMENT UI correctly with the **player
+missing** — the wall reproduced).
+
+**New diagnostic added (gated, default-off):** `NHL_BETA_FLAT_DUMP=1` writes every guest
+resolve's captured host texture to `flatresolve_<seq>_<dest>.png` at capture finalize
+(`BetaFlatResolve` records a readback copy; `WriteBetaFlatResolveDumps` writes the PNGs). This
+is the decisive per-resolve "what landed where" view the plan called for.
+
+**Hypotheses ruled out (with evidence):**
+- **H1 WVP / float-constant upload — KILLED.** `NHL_BETA_BIND_DIAG` on the player draws
+  (e.g. owned-draw #27, vte=0x43F, ext 640×360): **`dyn=false`** (static addressing, so the
+  sparse `pack_floats` is the correct CBV layout), the dumped float4s are a **sane view matrix
+  (c[0..3]) + projection (c[4..7]) + combined WVP (c[12..15])**, and the vertex fetch
+  (fc=95, 0x19249000, stride 32) reads real guest data (nz=806/1024). Geometry *setup* is
+  correct. (The prime suspect from the plan does not apply to these draws.)
+- **H4 depth / reversed-Z — KILLED.** `NHL_BETA_DEPTH_FORCE_ALWAYS` changes nothing; depth
+  clears to `1.0` (correct far plane for the player's zfunc=3 LEQUAL).
+
+**What the 19 resolve dumps show (the real residual):**
+- 10 of 19 resolve dests are **fully empty** (uniform 0,0,0).
+- The player's content-bearing surface **`0x1A6E9000`** (resolved 4×) DOES contain the player,
+  localized to the **top-left 640×360 viewport** — but with **R and G channels pinned at 255**
+  (per-channel min R=255, G=255; only blue varies). The player rasterizes; its **color is
+  saturated/wrong**, not absent.
+- The surface the player composite actually **samples — `0x1AF09000`** (resolves #13 empty,
+  #16) — comes out **perfectly uniform `(0,127,15)`**, the documented **depth-as-color
+  green-fold** value ([[rov-green-player-is-fold-color]], [[beta-depth-buffer-status]]). So the
+  composite reads a **different dest than where the player landed**, and that dest holds the
+  depth-green fold, not the player.
+
+**Conclusion (evidence-backed):** the residual is NOT geometry/WVP/depth. It is the
+**multi-level RTT chain + color-target correctness** in the single shared offscreen RT:
+(1) the player's color writes saturate R/G on its real surface (`0x1A6E9000`), and (2) the
+composite's source (`0x1AF09000`) resolves to the depth-green fold instead of the player
+surface — a resolve-dest/surface mapping + color/depth-target confusion. This is the
+[[beta-scene04-projection]] / green-fold core: beta mis-drives the RT cache for the player's
+multi-pass surfaces. **Fix = the per-surface flat-RT manager** (each guest `RB_COLOR_INFO.
+color_base` → its own flat host RT; resolve copies the *correct source surface region*, not
+the whole shared RT; separate color vs depth), plus running down the R/G-saturation on the
+player color write. Multi-session, as the plan flagged (worst-case branch). Diagnostic toggles
+to resume: `NHL_BETA_FLAT_DUMP`, `NHL_BETA_BIND_DIAG`, `NHL_BETA_EDRAM_DIAG`,
+`NHL_BETA_DEPTH_FORCE_ALWAYS`.
+
 ## Reproduce (the diagnostic runs above)
 
 ```
+# Per-resolve host-texture dump at a VALID late frame (109-frame trace; 150 is stale):
+NHL_BACKEND=beta NHL_BETA_TAKEOVER=1 NHL_BETA_DEPTH=1 NHL_BETA_FLAT=1 NHL_BETA_FLAT_DUMP=1 \
+  NHL_BETA_CAPTURE_FRAME=100 NHL_REPLAY_XTR=...\gpu_trace\scene_02\454109EC_stream.xtr \
+  nhllegacy.exe --game_data_root "H:\…\NHL Legacy - Vanilla"   # -> flatresolve_*.png + beta_owned_draw.png
+# Judge flatresolve_*.png by FORCING ALPHA OPAQUE (they keep RTV alpha); 0x1AF09000 is the
+# player composite source, 0x1A6E9000 is the player's real (R/G-saturated) surface.
+
 # offscreen flat-RTV (empty for the 19-resolve scene_02):
 NHL_BACKEND=beta NHL_BETA_TAKEOVER=1 NHL_REPLAY_XTR=...\gpu_trace\scene_02\454109EC_stream.xtr \
   nhllegacy.exe --game_data_root "H:\…\NHL Legacy - Vanilla"   # -> beta_owned_draw.png (alpha 0)
 # add NHL_BETA_VP_FULLRT=1 / NHL_BETA_DEPTH=1 / NHL_BETA_EDRAM=1 to reproduce the table.
 # beta_owned_draw.png keeps RTV alpha — composite over BLACK before judging ([[beta-png-alpha-artifact]]).
 ```
+
+## 2026-06-11 (cont.) — SOLVED: the player renders at parity (three root causes, all fixed)
+
+The "player missing" wall is **down**. `NHL_BACKEND=beta NHL_BETA_TAKEOVER=1 NHL_BETA_DEPTH=1
+NHL_BETA_FLAT=1 NHL_BETA_CAPTURE_FRAME=100` on scene_02 now produces the oracle frame
+(equipment UI + blue stage + black player silhouette, ~40 dB vs the cross-resolution
+oracle). Three independent defects stacked on this one scene; each was isolated with an
+in-engine experiment and fixed in `renderer/core/nhl_command_processor.cpp`:
+
+1. **Pixel-shader float constants read from the WRONG BANK (the big one — affects every
+   scene).** Xenos splits the 512-entry float-constant file per stage: VS = c0..255 at reg
+   `0x4000+`, **PS = file entries 256..511 at reg `0x4400+`** (ucode "c0" in a PS is file
+   entry 256; Xenia reads the pixel pack from `SHADER_CONSTANT_256_X`). `pack_floats` fed
+   BOTH stages from `0x4000` — every PS got the VERTEX bank. The create-player post-grade
+   PS (`out = lerp(player + grain*c1, c2.rgb, c2.w)`, grain remap `grain*c255.y + c255.x`)
+   then saw a view-matrix row as its green tint and 0.5 as its remap → the **uniform
+   (0,127,15) green** that the on-screen player quads sampled (this is also the long-
+   standing "green fold color" value — it was never EDRAM fold, it was the PS reading VS
+   constants). Fix: `pack_floats(sh, pixel_stage)` reads PS floats from `0x4400`.
+   A/B toggle: `NHL_BETA_PS_BANK_OLD=1`. scene_03 f30 A/B shows the same content minus a
+   gray wash (improvement, no regression; its black quads pre-date this and are the known
+   trace-data texture gap).
+
+2. **The skinning bone-matrix VS texture loads as ZERO through the SDK texture cache (beta
+   path only).** The player VS is texture-skinned: it fetches 6 texels from VS texture
+   **tf16** (384×160 linear `k_32_32_32_32_FLOAT` endian=2 at `0x1C7AE000` — written
+   mid-frame by the trace between draws #26/#27, one write per even frame, full 0xF0000
+   arena). Binding resolves (host_swizzle 0x688 ✓), guest RAM + our shmem buffer hold the
+   data at draw time (probes), no debug-layer errors — yet the sampled content is zero, so
+   the skin matrix = 0 → every vertex collapses → **zero pixels rasterized** (proven by a
+   purple-clear + SKIP_RANGE experiment, then by substituting a CPU-built SRV which made
+   the player appear). The base path loads the same texture fine, so it's a beta-usage
+   interaction inside the prebuilt SDK we cannot see into. Fix (ours): **VS-texture
+   CPU-upload path** — any VERTEX-stage binding of a linear `k_32_32_32_32_FLOAT` 2D
+   texture binds a CPU-built `R32G32B32A32_FLOAT` Texture2DArray filled from guest RAM
+   (k8in32 swap), re-uploaded when a trace write covers its range (`EnsureBetaVsTexSub`,
+   map keyed by guest base). Default ON; `NHL_BETA_NO_VSTEX_CPU=1` disables. The blue
+   STAGE backdrop also came back with this (its RTT pass also skins via a 384×64 palette
+   at `0x1C6EE000`).
+
+3. **Bool/loop constant upload was 16 dwords; the block is 40** (8 bool + 32 loop;
+   the translator's b1 cbuffer is declared 160 B). OOB CBV reads return 0 → any shader
+   driving a loop from a high loop-constant runs 0 iterations. Not the killer for this
+   scene (the player VS has no loops) but a real latent bug — fixed to `40 * 4`.
+
+Plus one flat-model correction: **`BetaFlatResolve` no longer snapshots the color RT for
+`is_depth=1` resolves** (a depth resolve to a dest that also receives color would
+overwrite the good color capture with depth-as-color; the dest now keeps its latest COLOR
+capture, and the depth resolve still acts as a pass boundary for the per-pass depth
+clear). Restore old behavior: `NHL_BETA_FLAT_DEPTH_COPY=1`.
+
+**Corrections to the earlier 2026-06-11 section** (analysis made with the pre-fix
+diagnostics): the "R/G pinned at 255" and "composite reads the wrong dest" conclusions
+were artifacts of the PS-bank bug (wrong PS constants saturate/tint everything); the
+resolve-dest mapping was actually CORRECT all along — capture#8 (0x1AF09000) holds the
+black player + alpha mask, the composite samples it, grades it (badly, bug 1), and the
+later green capture (#10) was the graded output, not depth-fold. Also `fmt=38` is
+`k_32_32_32_32_FLOAT` (16 B/texel), so the bone data rows 3–5.8 were exactly where the
+draws sample (earlier "rows 6–11 vs sampled 3.5–5.5" used the wrong texel size). No
+per-surface flat-RT manager was needed — the snapshot-at-resolve model held up.
+
+**New/changed diagnostics:** `NHL_BETA_UCODE_DRAW=<idx>` (choose which textured draw's
+ucode lands in `beta_textured_ucode.txt`), VS-texture identity in `NHL_BETA_BIND_DIAG`
+(`VS-tex#` lines: fc, base, fmt, host_swizzle, raw fc dwords, full-extent guest-RAM scan),
+`NHL_BETA_GPUDUMP` now also works in the flat/offscreen path (recorded at finalize),
+`NHL_LOG_LEVEL=debug|trace` (SDK logger levels at runtime), `WATCH` logs frame + row
+fingerprints, shmem buffer named `beta_shared_memory` for debug-layer messages.
+
+**Status:** scene_02 f100 at oracle parity. Next: re-run scene_04/gameplay with the PS-bank
+fix (suspect it cures more than this scene); textured (non-silhouette) player needs a live
+F9 capture with warm textures (trace-data gap, capture-side).

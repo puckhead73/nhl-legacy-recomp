@@ -169,3 +169,48 @@ $env:NHL_D3D9_TAP=1 ; <launch nhllegacy.exe --game_data_root ...>
 #   grep "d3d9-tap] tick"  -> per-frame call frequencies
 #   grep "FIRST-CALL"       -> which hooks the linker wired in
 ```
+
+## 2026-06-11 — Cursory REVIEW of the "per-draw path is inlined" determination (post the PS-bank/VS-tex upsets)
+
+Re-examined because this date's session overturned several "settled" conclusions. Verdict:
+**the operational conclusion (draws not interceptable at any known out-of-line function →
+hybrid/PM4 decode) SURVIVES, and is now better evidenced than M1 left it — but two of M1's
+supporting claims were unsound, and one caveat should be recorded.**
+
+What was checked:
+1. **`sub_827E2140` recharacterization — VERIFIED by body read** (recomp.31.cpp:13999). It
+   stores an (address, size) pair into a device shadow slot at `((17-index)+222)*8`, appends
+   the previously-bound resource to a deferred-release ring (alloc at device+13928/+13932,
+   flush via `sub_827E8EC0`), and sets dirty bits — a SetStreamSource-class BIND. No packet
+   writes, no ring-pointer (+48) access. M1's *first* guess (DrawIndexedPrimitive) was the
+   wrong part; its correction was right.
+2. **Static scan for PM4 draw headers** across all 183 recomp TUs: NO `ori …,0x2200`
+   (DRAW_INDX) construction exists anywhere; `ori …,0x3600` (DRAW_INDX_2) exists in exactly
+   7 functions: `sub_827E5DB8/827EB7D0/827EB928/827EF8E0` (lib TU 31), `sub_827FFEC8/
+   sub_82800798` (TU 32), `sub_83739050` (TU 163). Each has ≤2 static callers (vtable-
+   dispatched). So DRAW_INDX_2 emission is CENTRALIZED and out-of-line — not pervasively
+   inlined.
+3. **Live frequency tap of those 7 emitters** (new `NHL_DRAW_TAP` counters in
+   gpu/hooks/d3d9_resources.cpp; 75 s menu boot at 63 PM4 draws/frame): ALL ~0 calls/frame —
+   `sub_827FFEC8` = **0 calls**. The menu's 63 draws/frame are DRAW_INDX (0x22) packets whose
+   headers are built with no lis/ori immediates anywhere (template-copied or computed), so
+   the static scan cannot locate the 0x22 emitter either way.
+
+Corrections to M1's reasoning:
+- **The "sub_827FFEC8 is a GAME render function writing packets inline" attribution was
+  unsound**: TU index is an address chunk, not a library boundary (0x827FFxxx sits directly
+  after the D3D9 lib range), and the live tap shows it is NOT on the menu's hot path at all
+  (0 calls) — it was never evidence about the per-frame draw stream. It demonstrates inline
+  ring-writes exist in SOME path, not in the path that emits the 63 draws/frame.
+- **The "~61 draws/frame" ground truth overcounts game draw calls** (it includes resolve-rect
+  draws, clear quads, and EDRAM no-op draws — established by this date's beta work). The
+  inference survives anyway: the next-hottest non-bind candidate measured ~7/frame, far below
+  any plausible real-draw count.
+
+Standing caveat (how to overturn this later if ever needed): "inlined" remains an inference
+from absence — the code that actually writes the DRAW_INDX headers has never been positively
+located. If draw emission turns out to live in ONE hot EA-engine submit routine (rather than
+truly inlined at every call site), that routine would be hookable and a pure high cut becomes
+possible. The decisive experiment is a runtime WATCHPOINT on the command-buffer write pointer
+(device+48) capturing the writing PC during a draw-heavy frame. Until someone runs that, the
+hybrid (PM4-decoded draws + D3D9-hooked resources/present) stays the correct architecture.

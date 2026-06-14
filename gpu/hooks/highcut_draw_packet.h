@@ -27,7 +27,7 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 5;          // C-5d: + kGuestDMA index buffer (indexed draws)
+constexpr uint32_t kDrawPacketVersion = 8;          // C-5d.3: + VERTEX-shader textures (skinning bone palette)
 
 // Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
 // strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
@@ -42,10 +42,11 @@ enum DrawTopology : uint32_t {
 // Plume-neutral texel format the untiled blob is in (the CP side mustn't depend on plume's
 // RenderFormat enum; the plume thread maps these to the matching RenderFormat).
 enum PacketTexFormat : uint32_t {
-    kTexRGBA8 = 0,  // R8G8B8A8_UNORM  (k_8_8_8_8 untiled + endian-swapped)
-    kTexBC1 = 1,    // BC1_UNORM       (k_DXT1)
-    kTexBC2 = 2,    // BC2_UNORM       (k_DXT2_3)
-    kTexBC3 = 3,    // BC3_UNORM       (k_DXT4_5)
+    kTexRGBA8 = 0,    // R8G8B8A8_UNORM       (k_8_8_8_8 untiled + 32-bit endian-swapped)
+    kTexBC1 = 1,      // BC1_UNORM            (k_DXT1)
+    kTexBC2 = 2,      // BC2_UNORM            (k_DXT2_3)
+    kTexBC3 = 3,      // BC3_UNORM            (k_DXT4_5)
+    kTexRGBA32F = 4,  // R32G32B32A32_FLOAT   (k_32_32_32_32_FLOAT — the VS skinning bone palette)
 };
 
 // Plume-neutral blend factor/op — the xenos::BlendFactor / BlendOp enum VALUES (the CP decodes
@@ -70,7 +71,27 @@ struct TexturePacketDesc {
     uint32_t is_signed;        // 0 = unsigned binding, 1 = signed binding
     uint32_t swizzle;          // Xenos 12-bit component swizzle (4x3-bit; 0=R,1=G,2=B,3=A,4=0,5=1).
                                // Applied to the plume view's component mapping (e.g. BGRA 8888).
+    uint32_t fetch_base_addr;  // C-5d.3: guest texture base address (tf.base_address<<12). If a prior
+                               // pass RESOLVED to this address (ResolveMarker.dest_addr), the replay
+                               // binds OUR offscreen surface RT (host-copy) instead of this captured
+                               // blob — so render-to-texture passes (reflection/shadow) feed this draw.
 };
+
+// C-5d.3: a guest EDRAM Resolve event (sub_827EF8E0 / RB_MODECONTROL.edram_mode==kCopy), captured in
+// stream order alongside the draws so the replay can host-copy the just-finished surface RT into a
+// texture keyed by the resolve DEST address. Written to a sidecar `highcut_resolves.bin`:
+//   [uint32 count][ResolveMarker x count], rewritten after every resolve, reset at each frame boundary.
+// dest_addr matches a later draw's TexturePacketDesc.fetch_base_addr; src_* identifies the source
+// surface (the pass being resolved) so the replay knows which offscreen RT to copy.
+struct ResolveMarker {
+    uint32_t after_draw;      // resolve fires AFTER this many captured draws this frame (= capture idx)
+    uint32_t dest_addr;       // guest dest (draw_util::GetResolveInfo copy_dest_base) — the sampled addr
+    uint32_t is_depth;        // 1 = depth resolve (shadow/depth map), 0 = color
+    uint32_t src_depth_base;  // source surface key (RB_DEPTH_INFO / RB_SURFACE_INFO at resolve time)
+    uint32_t src_pitch;
+    uint32_t src_msaa;
+};
+constexpr uint32_t kResolveSidecarMagic = 0x48335256;  // 'H3RV'
 
 struct DrawPacketHeader {
     uint32_t magic;            // kDrawPacketMagic
@@ -125,6 +146,24 @@ struct DrawPacketHeader {
     // VERY END of the packet (after all textures). vertex_count = the index count (drawIndexedInstanced).
     uint32_t index_format;        // 0 = none (drawInstanced / quad-expand), 1 = u16, 2 = u32
     uint32_t index_bytes;         // size of the raw index blob appended after the textures
+    // C-5d: guest render-surface identity. Draws sharing a (color_base, depth_base, surface_pitch,
+    // msaa) tuple target the SAME guest surface; the replay buckets them into ONE per-surface flat
+    // plume RT (each with its own depth+stencil), instead of the single shared RT — which can't both
+    // let a frame-start mask draw seed stencil AND keep its Always-depth write off the 3D geometry's
+    // shared depth (Problem 1). color_base/depth_base are EDRAM tile indices used only as surface KEYS
+    // (the flat path has no EDRAM addressing); color_format picks the per-surface plume RT format.
+    uint32_t surface_color_base;   // RB_COLOR_INFO.color_base (+bit11) — EDRAM tile, color surface key
+    uint32_t surface_depth_base;   // RB_DEPTH_INFO.depth_base — EDRAM tile, depth surface key
+    uint32_t surface_pitch;        // RB_SURFACE_INFO.surface_pitch (logical surface width)
+    uint32_t surface_msaa;         // RB_SURFACE_INFO.msaa_samples (0=1X, 1=2X, 2=4X)
+    uint32_t surface_color_format; // RB_COLOR_INFO.color_format (xenos::ColorRenderTargetFormat)
+    // C-5d.3: VERTEX-shader textures. Skinned meshes (players, most of the gameplay scene) fetch a
+    // BONE-PALETTE texture IN THE VS; without it the skinning collapses every vertex to a point → zero
+    // fragments (the "black depth=184 pass"). These bind to descriptor SET 2 (the translator's vertex-
+    // texture set, an empty placeholder before C-5d.3). They're appended AFTER the `texture_count` PS
+    // textures and BEFORE the index blob: [PS textures][VS textures][index]. Same TexturePacketDesc.
+    uint32_t vs_texture_count;     // number of VS TexturePacketDesc+blobs (set2 textures)
+    uint32_t vs_sampler_count;     // number of VS sampler bindings (set2, after the VS textures)
 };
 
 }  // namespace nhl::highcut
