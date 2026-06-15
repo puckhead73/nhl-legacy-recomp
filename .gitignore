@@ -33,3 +33,8 @@
 # Reproduce with: pwsh tools/fetch_thirdparty.ps1   (pinned commits in docs/highcut-m0-vendoring.md)
 /third_party/
 /tools/xenos_recomp/
+
+# C-5g note: the plume framebuffer-readback patch lives in third_party/plume/plume_vulkan.cpp,
+# but third_party/plume/ is an EMBEDDED git repo (vendored clone), so the parent repo cannot
+# track files inside it. The change is recorded in docs/plume-readback-patch.md (re-apply after
+# any plume re-vendor). Not un-ignoring it here since git can't add it through the nested repo.
