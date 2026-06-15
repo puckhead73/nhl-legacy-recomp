@@ -59,12 +59,16 @@ HDR_V7 = HDR_V6                # v7 header == v6; only TexturePacketDesc grew (+
 HDR_V7_FIELDS = HDR_V6_FIELDS
 HDR_V8 = HDR_V7 + "2I"         # v8: + vs_texture_count, vs_sampler_count (VS skinning textures)
 HDR_V8_FIELDS = HDR_V7_FIELDS + ["vs_texture_count", "vs_sampler_count"]
-# TexturePacketDesc: v3-v6 = 8 u32; v7 += fetch_base_addr (the guest texture base addr, for resolve match)
+# v9 header == v8; payload gained per-sampler SamplerPacketDesc blobs (filter/clamp) after the textures.
+HDR_V9, HDR_V9_FIELDS = HDR_V8, HDR_V8_FIELDS
+# TexturePacketDesc: v3-v6 = 8 u32; v7 += fetch_base_addr; v10 += array_layers (1=2D, 6=cube)
 TEX_DESC_V6 = "<8I"
 TEX_DESC_V7 = "<9I"
+TEX_DESC_V10 = "<10I"
 TEX_FIELDS_V6 = ["width", "height", "tex_format", "row_pitch_bytes", "data_bytes", "fetch_slot",
                  "is_signed", "swizzle"]
 TEX_FIELDS_V7 = TEX_FIELDS_V6 + ["fetch_base_addr"]
+TEX_FIELDS_V10 = TEX_FIELDS_V7 + ["array_layers"]
 # Resolve sidecar (highcut_resolves.bin): [magic 'H3RV'][count][ResolveMarker x count]
 RESOLVE_MAGIC = 0x48335256
 RESOLVE_DESC = "<6I"  # after_draw dest_addr is_depth src_depth_base src_pitch src_msaa
@@ -75,7 +79,7 @@ CMP = {0: "Never", 1: "Less", 2: "Equal", 3: "LEqual", 4: "Greater", 5: "NotEqua
 SOP = {0: "Keep", 1: "Zero", 2: "Replace", 3: "IncClamp", 4: "DecClamp", 5: "Invert",
        6: "IncWrap", 7: "DecWrap"}
 TOPO = {0: "TriList", 1: "TriStrip", 2: "QuadExpand"}
-TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3", 4: "RGBA32F"}
+TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3", 4: "RGBA32F", 5: "BC5"}
 CULL = {0: "none", 1: "front", 2: "back"}
 
 
@@ -85,7 +89,11 @@ def parse_header(buf):
     version = struct.unpack_from("<I", buf, 4)[0]
     # Only v3 (C-5a), v4 (C-5c), v5/v6 (C-5d) share the layout this tool decodes; v2 and earlier had a
     # different header and would parse to garbage, so reject them explicitly rather than print nonsense.
-    if version == 8:
+    if version == 10:
+        fmt, fields = HDR_V9, HDR_V9_FIELDS  # header unchanged from v8/v9; only TexturePacketDesc grew
+    elif version == 9:
+        fmt, fields = HDR_V9, HDR_V9_FIELDS
+    elif version == 8:
         fmt, fields = HDR_V8, HDR_V8_FIELDS
     elif version == 7:
         fmt, fields = HDR_V7, HDR_V7_FIELDS
@@ -132,8 +140,12 @@ def fmt_draw_line(h):
 
 
 def iter_textures(buf, h, hdr_size):
-    tex_desc = TEX_DESC_V7 if h["version"] >= 7 else TEX_DESC_V6
-    tex_fields = TEX_FIELDS_V7 if h["version"] >= 7 else TEX_FIELDS_V6
+    if h["version"] >= 10:
+        tex_desc, tex_fields = TEX_DESC_V10, TEX_FIELDS_V10
+    elif h["version"] >= 7:
+        tex_desc, tex_fields = TEX_DESC_V7, TEX_FIELDS_V7
+    else:
+        tex_desc, tex_fields = TEX_DESC_V6, TEX_FIELDS_V6
     off = (hdr_size + h["fetch_bytes"] + h["sys_bytes"] + h["shared_bytes"] + h["bool_bytes"] +
            h["vs_float_bytes"] + h["ps_float_bytes"] + h["vs_spirv_bytes"] + h["ps_spirv_bytes"])
     for _ in range(h["texture_count"]):
@@ -246,6 +258,9 @@ def decode_textures(buf, h, hdr_size, base):
         w, hh, fmt = d["width"], d["height"], d["tex_format"]
         if fmt == 4:  # RGBA32F (bone palette) — not an image; skip PNG
             print(f"    tex{i}: RGBA32F {w}x{hh} (skinning bone palette — no PNG)")
+            continue
+        if fmt == 5:  # BC5 normal map (2-channel) — stdlib decoder doesn't do BC5; skip PNG
+            print(f"    tex{i}: BC5 {w}x{hh} (k_DXN normal map — no PNG)")
             continue
         if fmt == 0:  # RGBA8 already (tight rows)
             rgba = bytearray(blob[:w * hh * 4])

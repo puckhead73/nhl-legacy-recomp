@@ -84,6 +84,108 @@ constexpr RenderFormat kSwapFormat = RenderFormat::B8G8R8A8_UNORM;
 // must declare this depthTargetFormat (else its renderpass is incompatible with the framebuffer's).
 constexpr RenderFormat kDepthFormat = RenderFormat::D32_FLOAT_S8_UINT;
 
+// ---------------------------------------------------------------------------------------------
+// C-5g debug tooling: a minimal, dependency-free PNG writer + a .spv-from-disk loader. These let a
+// headless replay (1) dump its final swapchain image to a file so the result is verifiable WITHOUT a
+// human eyeballing the window, and (2) swap one draw's pixel shader for an instrumented .spv (to read
+// the number-composition layer directly). Both are env-gated and one-shot — zero cost when unused.
+// ---------------------------------------------------------------------------------------------
+
+// CRC32 (PNG/zlib polynomial) — tiny table-free implementation; only used on a one-shot debug dump.
+inline uint32_t Crc32(const uint8_t* p, size_t n, uint32_t crc = 0xFFFFFFFFu) {
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1) + 1));
+    }
+    return crc;
+}
+
+// Write an RGBA8 image as a PNG using STORED (uncompressed) DEFLATE blocks — no zlib dependency.
+// src is `rowPitch`-strided; `bgra` swaps R/B (the swapchain is B8G8R8A8). Returns true on success.
+bool WriteImagePNG(const char* path, uint32_t w, uint32_t h, uint32_t rowPitch,
+                   const uint8_t* src, bool bgra) {
+    // Raw filtered scanlines: each row = filter byte (0) + w*4 RGBA bytes.
+    std::vector<uint8_t> raw;
+    raw.reserve(size_t(h) * (1 + size_t(w) * 4));
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* row = src + size_t(y) * rowPitch;
+        raw.push_back(0);
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* px = row + size_t(x) * 4;
+            uint8_t r = px[0], g = px[1], b = px[2];
+            if (bgra) { uint8_t t = r; r = b; b = t; }
+            // Force opaque: this is a presented-image screenshot — the swapchain's alpha is meaningless
+            // (often 0) and would make the whole dump look white when viewed over a white background.
+            raw.push_back(r); raw.push_back(g); raw.push_back(b); raw.push_back(255);
+        }
+    }
+    // zlib stream = 2-byte header + STORED deflate blocks + adler32 (over the raw bytes).
+    std::vector<uint8_t> z;
+    z.push_back(0x78); z.push_back(0x01);
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t chunk = std::min<size_t>(65535, raw.size() - pos);
+        bool final = (pos + chunk >= raw.size());
+        z.push_back(final ? 1 : 0);
+        z.push_back(uint8_t(chunk & 0xFF)); z.push_back(uint8_t((chunk >> 8) & 0xFF));
+        uint16_t nlen = uint16_t(~uint16_t(chunk));
+        z.push_back(uint8_t(nlen & 0xFF)); z.push_back(uint8_t((nlen >> 8) & 0xFF));
+        z.insert(z.end(), raw.begin() + pos, raw.begin() + pos + chunk);
+        pos += chunk;
+    }
+    uint32_t s1 = 1, s2 = 0;
+    for (uint8_t b : raw) { s1 = (s1 + b) % 65521; s2 = (s2 + s1) % 65521; }
+    uint32_t adler = (s2 << 16) | s1;
+    z.push_back(uint8_t(adler >> 24)); z.push_back(uint8_t(adler >> 16));
+    z.push_back(uint8_t(adler >> 8));  z.push_back(uint8_t(adler));
+
+    auto be32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        v.push_back(uint8_t(x >> 24)); v.push_back(uint8_t(x >> 16));
+        v.push_back(uint8_t(x >> 8));  v.push_back(uint8_t(x));
+    };
+    auto chunkOut = [&](std::vector<uint8_t>& out, const char tag[4], const std::vector<uint8_t>& data) {
+        be32(out, uint32_t(data.size()));
+        std::vector<uint8_t> td(tag, tag + 4);
+        td.insert(td.end(), data.begin(), data.end());
+        out.insert(out.end(), td.begin(), td.end());
+        be32(out, Crc32(td.data(), td.size()) ^ 0xFFFFFFFFu);
+    };
+    std::vector<uint8_t> ihdr;
+    be32(ihdr, w); be32(ihdr, h);
+    ihdr.push_back(8); ihdr.push_back(6); ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    chunkOut(png, "IHDR", ihdr);
+    chunkOut(png, "IDAT", z);
+    chunkOut(png, "IEND", {});
+    FILE* f = std::fopen(path, "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(png.data(), 1, png.size(), f) == png.size();
+    std::fclose(f);
+    return ok;
+}
+
+// NHL_HIGHCUT_DEBUG_PS=<path.spv> + NHL_HIGHCUT_DEBUG_PS_DRAW=<idx>: replace the pixel shader of the
+// given captured draw with an instrumented SPIR-V from disk. Returns the file bytes (empty if N/A).
+std::vector<uint8_t> MaybeLoadDebugPS(uint32_t drawIndex) {
+    static const char* dbgPath = std::getenv("NHL_HIGHCUT_DEBUG_PS");
+    static const char* dbgDrawS = std::getenv("NHL_HIGHCUT_DEBUG_PS_DRAW");
+    std::vector<uint8_t> out;
+    if (!dbgPath || !dbgDrawS) return out;
+    if (uint32_t(std::strtoul(dbgDrawS, nullptr, 10)) != drawIndex) return out;
+    if (FILE* f = std::fopen(dbgPath, "rb")) {
+        std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+        if (sz > 0) { out.resize(size_t(sz)); if (std::fread(out.data(), 1, size_t(sz), f) != size_t(sz)) out.clear(); }
+        std::fclose(f);
+    }
+    if (!out.empty())
+        REXLOG_INFO("[highcut-C5g] DEBUG_PS: draw {} uses instrumented PS '{}' ({} bytes)",
+                    drawIndex, dbgPath, uint32_t(out.size()));
+    else
+        REXLOG_INFO("[highcut-C5g] DEBUG_PS: draw {} requested '{}' but file is empty/missing",
+                    drawIndex, dbgPath);
+    return out;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CLOSE:   DestroyWindow(hwnd); return 0;
@@ -101,11 +203,13 @@ struct RenderableDraw {
     std::unique_ptr<RenderBuffer> sysBuf, boolBuf, fetchBuf, sharedBuf, vsFloatBuf, psFloatBuf;
     std::vector<std::unique_ptr<RenderTexture>> textures;
     std::vector<std::unique_ptr<RenderTextureView>> texViews;
-    std::unique_ptr<RenderSampler> sampler;
+    // C-5f: ONE sampler per PS sampler binding (was a single LINEAR+CLAMP for all). The jersey
+    // nameplate-layout map is POINT-sampled by the guest; LINEAR-blending it broke the back number.
+    std::vector<std::unique_ptr<RenderSampler>> samplers;
     // C-5d.3: VERTEX-shader textures (skinning bone palette) -> descriptor set 2.
     std::vector<std::unique_ptr<RenderTexture>> vsTextures;
     std::vector<std::unique_ptr<RenderTextureView>> vsTexViews;
-    std::unique_ptr<RenderSampler> vsSampler;
+    std::vector<std::unique_ptr<RenderSampler>> vsSamplers;  // C-5f: per-binding (was single)
     std::unique_ptr<RenderPipelineLayout> layout;
     std::unique_ptr<RenderDescriptorSet> set0, set1, set2, set3;
     std::unique_ptr<RenderPipeline> pipeline;
@@ -197,6 +301,7 @@ struct PlumeCtx {
     };
     std::unordered_map<uint64_t, SurfaceRT> c5surfaces;
     uint64_t c5PrimaryKey = 0;  // the ONE guest surface (depth,pitch,msaa) shown on the swapchain
+    bool c5ShotDone = false;    // C-5g: NHL_HIGHCUT_C5_SHOT one-shot framebuffer dump fired
 };
 
 // Guest Present hook bumps this; the plume thread renders one frame per increment.
@@ -394,6 +499,7 @@ bool CreateTexturedDraw(PlumeCtx& c) {
             case nhl::highcut::kTexBC1: return RenderFormat::BC1_UNORM;
             case nhl::highcut::kTexBC2: return RenderFormat::BC2_UNORM;
             case nhl::highcut::kTexBC3: return RenderFormat::BC3_UNORM;
+            case nhl::highcut::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
             default: return RenderFormat::R8G8B8A8_UNORM;
         }
     };
@@ -605,11 +711,35 @@ RenderComponentMapping xenosSwizzleMapping(uint32_t swz) {
                                   xenosSwz(swz >> 9));
 }
 
+// C-5f: map a guest xenos::TextureFilter (0=kPoint,1=kLinear,2=kBaseMap,3=kUseFetchConst) to plume.
+// kPoint -> NEAREST, everything else -> LINEAR (kUseFetchConst can't survive into the live fetch
+// constant we read; kBaseMap only applies to mip and reads as no-mip below).
+RenderFilter xenosFilter(uint32_t f) {
+    return f == 0u /*kPoint*/ ? RenderFilter::NEAREST : RenderFilter::LINEAR;
+}
+RenderMipmapMode xenosMipMode(uint32_t f) {
+    // kPoint -> NEAREST, kLinear -> LINEAR, kBaseMap(2)/other -> NEAREST (sample base level only).
+    return f == 1u /*kLinear*/ ? RenderMipmapMode::LINEAR : RenderMipmapMode::NEAREST;
+}
+// xenos::ClampMode -> plume RenderTextureAddressMode. 0=kRepeat,1=kMirroredRepeat,2=kClampToEdge,
+// 3=kMirrorClampToEdge,4=kClampToHalfway,5=kMirrorClampToHalfway,6=kClampToBorder,7=kMirrorClampToBorder.
+RenderTextureAddressMode xenosClamp(uint32_t c) {
+    switch (c) {
+        case 0: return RenderTextureAddressMode::WRAP;        // kRepeat
+        case 1: return RenderTextureAddressMode::MIRROR;      // kMirroredRepeat
+        case 3: return RenderTextureAddressMode::MIRROR_ONCE; // kMirrorClampToEdge
+        case 6: return RenderTextureAddressMode::BORDER;      // kClampToBorder
+        case 7: return RenderTextureAddressMode::MIRROR;      // kMirrorClampToBorder (no exact plume mode)
+        default: return RenderTextureAddressMode::CLAMP;      // 2/4/5 clamp-to-edge family
+    }
+}
+
 // C-5a: build ONE fully self-contained RenderableDraw from a v3 packet (in memory). Mirrors the C-4
 // CreateTexturedDraw resource setup, but owns everything per-draw (its own VS/PS/buffers/textures/
 // layout/sets/pipeline) so many can be replayed into one RT. Draws with no translated PS are skipped
 // (return false) — C-5a needs a color PS. Returns false on any resource-creation failure.
-bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, RenderableDraw& d) {
+bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, RenderableDraw& d,
+                         uint32_t drawIndex = ~0u) {
     namespace hc = nhl::highcut;
     if (bytes.size() < sizeof(hc::DrawPacketHeader)) return false;
     hc::DrawPacketHeader hdr{};
@@ -657,12 +787,30 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         if (!t.data && t.desc.data_bytes) return false;
         vs_texs.push_back(t);
     }
+    // C-5f: per-sampler descs (PS then VS), between the textures and the index blob.
+    std::vector<hc::SamplerPacketDesc> psSampDescs(hdr.ps_sampler_count), vsSampDescs(hdr.vs_sampler_count);
+    for (uint32_t i = 0; i < hdr.ps_sampler_count; ++i) {
+        const uint8_t* dp = take(uint32_t(sizeof(hc::SamplerPacketDesc)));
+        if (!dp) return false;
+        std::memcpy(&psSampDescs[i], dp, sizeof(hc::SamplerPacketDesc));
+    }
+    for (uint32_t i = 0; i < hdr.vs_sampler_count; ++i) {
+        const uint8_t* dp = take(uint32_t(sizeof(hc::SamplerPacketDesc)));
+        if (!dp) return false;
+        std::memcpy(&vsSampDescs[i], dp, sizeof(hc::SamplerPacketDesc));
+    }
     // C-5d: kGuestDMA index blob (raw guest indices, last in the packet).
     const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
     if (hdr.index_bytes && !idxData) return false;
 
     d.vs = c.device->createShader(vsSpirv, hdr.vs_spirv_bytes, "main", fmt);
-    d.ps = c.device->createShader(psSpirv, hdr.ps_spirv_bytes, "main", fmt);
+    // C-5g: optionally override this draw's PS with an instrumented .spv from disk (the number-layer
+    // probe). The instrumented shader keeps the same descriptor interface, so all bindings still line up.
+    std::vector<uint8_t> dbgPS = MaybeLoadDebugPS(drawIndex);
+    if (!dbgPS.empty())
+        d.ps = c.device->createShader(dbgPS.data(), dbgPS.size(), "main", fmt);
+    else
+        d.ps = c.device->createShader(psSpirv, hdr.ps_spirv_bytes, "main", fmt);
     if (!d.vs || !d.ps) return false;
     const bool textured = hdr.texture_count > 0;
     d.textured = textured;
@@ -707,19 +855,19 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // the translated VS's declared bindings.
     const uint32_t nVsSamp = hdr.vs_sampler_count;
     const bool vs_textured = nVsTex > 0;
-    // C-4/C-5d.3: create + upload a list of guest textures (PS or VS) into plume textures+views, plus a
-    // LINEAR/CLAMP sampler. Factored so PS textures (set3) and the VS skinning bone palette (set2) use
-    // one path. Returns false only on sampler-create failure (a null texture is tolerated downstream).
+    // C-4/C-5d.3: create + upload a list of guest textures (PS or VS) into plume textures+views.
+    // Factored so PS textures (set3) and the VS skinning bone palette (set2) use one path. Samplers are
+    // built separately (C-5f: one per guest SamplerBinding, honoring its filter/clamp).
     auto createTextures = [&](const std::vector<TexLoad>& srcTexs,
                               std::vector<std::unique_ptr<RenderTexture>>& outTex,
-                              std::vector<std::unique_ptr<RenderTextureView>>& outView,
-                              std::unique_ptr<RenderSampler>& outSampler, RenderFilter filter) -> bool {
+                              std::vector<std::unique_ptr<RenderTextureView>>& outView) -> bool {
         if (srcTexs.empty()) return true;
         auto mapFmt = [](uint32_t f) -> RenderFormat {
             switch (f) {
                 case hc::kTexBC1: return RenderFormat::BC1_UNORM;
                 case hc::kTexBC2: return RenderFormat::BC2_UNORM;
                 case hc::kTexBC3: return RenderFormat::BC3_UNORM;
+                case hc::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
                 case hc::kTexRGBA32F: return RenderFormat::R32G32B32A32_FLOAT;  // C-5d.3 bone palette
                 default: return RenderFormat::R8G8B8A8_UNORM;
             }
@@ -730,16 +878,33 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         up->begin();
         for (auto& t : srcTexs) {
             const RenderFormat rf = mapFmt(t.desc.tex_format);
-            auto tex = c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
+            // C-5g: a CUBE binding (array_layers==6) must be a real cube texture+view, else Vulkan
+            // samples our 2D placeholder as garbage and the cube-alpha material term drops the number.
+            const bool isCube = t.desc.array_layers == 6;
+            const uint32_t layers = isCube ? 6u : 1u;
+            auto tex = isCube
+                ? c.device->createTexture(RenderTextureDesc::Texture(
+                      RenderTextureDimension::TEXTURE_2D, t.desc.width, t.desc.height, 1, 1, 6, rf,
+                      RenderTextureFlag::CUBE))
+                : c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
             auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.desc.data_bytes ? t.desc.data_bytes : 4u));
             if (staging && t.desc.data_bytes) { void* p = staging->map(); std::memcpy(p, t.data, t.desc.data_bytes); staging->unmap(); }
             if (tex && staging) {
                 up->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
-                up->copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.get(), 0, 0),
-                                      RenderTextureCopyLocation::PlacedFootprint(staging.get(), rf, t.desc.width, t.desc.height, 1, t.desc.width, 0));
+                // One PlacedFootprint per face/layer; faces are concatenated tight in the blob (the CP
+                // writes them face-major), so layer N starts at N * faceBytes.
+                const uint32_t faceBytes = t.desc.data_bytes / layers;
+                for (uint32_t layer = 0; layer < layers; ++layer) {
+                    up->copyTextureRegion(
+                        RenderTextureCopyLocation::Subresource(tex.get(), 0, layer),
+                        RenderTextureCopyLocation::PlacedFootprint(staging.get(), rf, t.desc.width,
+                                                                   t.desc.height, 1, t.desc.width,
+                                                                   uint64_t(layer) * faceBytes));
+                }
                 up->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
             }
-            RenderTextureViewDesc vd = RenderTextureViewDesc::Texture2D(rf);
+            RenderTextureViewDesc vd = isCube ? RenderTextureViewDesc::TextureCube(rf)
+                                              : RenderTextureViewDesc::Texture2D(rf);
             vd.componentMapping = xenosSwizzleMapping(t.desc.swizzle);  // apply the guest swizzle
             auto view = tex ? tex->createTextureView(vd) : nullptr;
             outTex.push_back(std::move(tex));
@@ -750,17 +915,43 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         const RenderCommandList* cl = up.get();
         c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
         c.queue->waitForCommandFence(fence.get());
-        RenderSamplerDesc sd;
-        sd.minFilter = filter;
-        sd.magFilter = filter;
-        sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
-        outSampler = c.device->createSampler(sd);
-        return outSampler != nullptr;
+        return true;
     };
-    if (!createTextures(texs, d.textures, d.texViews, d.sampler, RenderFilter::LINEAR)) return false;
+    // C-5f: build `count` samplers from the guest SamplerBindings (honor filter+clamp per binding). The
+    // descriptor set declares `count` sampler bindings at nTex+i; bind sampler i = descs[i]. When the
+    // packet carries no descs (old capture / 0 bindings), fall back to `fallback` filter + CLAMP.
+    auto buildSamplers = [&](const std::vector<hc::SamplerPacketDesc>& descs, uint32_t count,
+                             RenderFilter fallback,
+                             std::vector<std::unique_ptr<RenderSampler>>& out) -> bool {
+        for (uint32_t i = 0; i < count; ++i) {
+            RenderSamplerDesc sd;
+            if (i < descs.size()) {
+                const auto& g = descs[i];
+                sd.magFilter = xenosFilter(g.mag_filter);
+                sd.minFilter = xenosFilter(g.min_filter);
+                sd.mipmapMode = xenosMipMode(g.mip_filter);
+                sd.addressU = xenosClamp(g.clamp_x);
+                sd.addressV = xenosClamp(g.clamp_y);
+                sd.addressW = xenosClamp(g.clamp_z);
+            } else {
+                sd.magFilter = sd.minFilter = fallback;
+                sd.mipmapMode = RenderMipmapMode::NEAREST;
+                sd.addressU = sd.addressV = sd.addressW = RenderTextureAddressMode::CLAMP;
+            }
+            auto s = c.device->createSampler(sd);
+            if (!s) return false;
+            out.push_back(std::move(s));
+        }
+        return true;
+    };
+    if (!createTextures(texs, d.textures, d.texViews)) return false;
+    if (!createTextures(vs_texs, d.vsTextures, d.vsTexViews)) return false;
+    // C-5f: PS samplers honor the guest per-binding filter/clamp. The jersey nameplate-layout map is
+    // POINT-sampled by the guest (LINEAR-blending it broke the back number); the bone palette likewise.
+    if (!buildSamplers(psSampDescs, nSamp, RenderFilter::LINEAR, d.samplers)) return false;
     // C-5d.3: the VS skinning bone palette MUST be POINT-sampled — LINEAR blends adjacent bone-matrix
-    // rows into garbage transforms (the radial vertex explosion). Each texel is an exact matrix row.
-    if (!createTextures(vs_texs, d.vsTextures, d.vsTexViews, d.vsSampler, RenderFilter::NEAREST)) return false;
+    // rows into garbage transforms. The guest sampler is POINT, so the descs carry it; NEAREST fallback.
+    if (!buildSamplers(vsSampDescs, nVsSamp, RenderFilter::NEAREST, d.vsSamplers)) return false;
 
     auto bSet1 = [](RenderDescriptorSetBuilder& b) {
         b.begin();
@@ -809,14 +1000,16 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         if (!d.set2) return false;
         for (uint32_t i = 0; i < nVsTex && i < d.vsTextures.size(); ++i)
             if (d.vsTextures[i]) d.set2->setTexture(i, d.vsTextures[i].get(), RenderTextureLayout::SHADER_READ, d.vsTexViews[i].get());
-        for (uint32_t i = 0; i < nVsSamp; ++i) d.set2->setSampler(nVsTex + i, d.vsSampler.get());
+        for (uint32_t i = 0; i < nVsSamp && i < d.vsSamplers.size(); ++i)
+            d.set2->setSampler(nVsTex + i, d.vsSamplers[i].get());
     }
     if (textured) {
         RenderDescriptorSetBuilder s; bSet3(s); d.set3 = s.create(c.device.get());
         if (!d.set3) return false;
         for (uint32_t i = 0; i < nTex && i < d.textures.size(); ++i)
             if (d.textures[i]) d.set3->setTexture(i, d.textures[i].get(), RenderTextureLayout::SHADER_READ, d.texViews[i].get());
-        for (uint32_t i = 0; i < nSamp; ++i) d.set3->setSampler(nTex + i, d.sampler.get());
+        for (uint32_t i = 0; i < nSamp && i < d.samplers.size(); ++i)
+            d.set3->setSampler(nTex + i, d.samplers[i].get());
     }
 
     RenderBlendDesc blend;
@@ -931,7 +1124,7 @@ void LoadC5Frames(PlumeCtx& c) {
         }
         if (bytes.empty()) { ++skipped; continue; }
         RenderableDraw d;
-        if (BuildRenderableDraw(c, bytes, d)) { c.c5draws.push_back(std::move(d)); ++built; }
+        if (BuildRenderableDraw(c, bytes, d, i)) { c.c5draws.push_back(std::move(d)); ++built; }
         else ++skipped;
     }
     REXLOG_INFO("[highcut-C5] loaded {} renderable draws ({} skipped) of {} captured owned draws",
@@ -1402,6 +1595,27 @@ void RenderClear(PlumeCtx& c) {
         c.cmd->drawInstanced(c.xlatVertexCount, 1, 0, 0);
     }
 
+    // C-5g: NHL_HIGHCUT_C5_SHOT=<path.png> — one-shot readback of the final swapchain image to a PNG,
+    // so a headless replay's result is verifiable without a human at the window. Warm up a few frames
+    // first (the scene/uploads settle), then copy tex -> a READBACK buffer this frame; mapped + written
+    // after the fence wait below. Row pitch is 256-byte aligned (D3D12-safe; harmless on Vulkan).
+    static const char* c5shot = std::getenv("NHL_HIGHCUT_C5_SHOT");
+    std::unique_ptr<RenderBuffer> shotBuf;
+    uint32_t shotPitch = 0;
+    const bool doShot = c5shot && !c.c5ShotDone && c.frame >= 16;
+    if (doShot) {
+        shotPitch = ((w * 4u) + 255u) & ~255u;
+        shotBuf = c.device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(shotPitch) * h));
+        if (shotBuf) {
+            c.cmd->barriers(RenderBarrierStage::COPY,
+                            RenderTextureBarrier(tex, RenderTextureLayout::COPY_SOURCE));
+            RenderTextureCopyLocation dstL = RenderTextureCopyLocation::PlacedFootprint(
+                shotBuf.get(), kSwapFormat, w, h, 1, shotPitch / 4u, 0);
+            RenderTextureCopyLocation srcL = RenderTextureCopyLocation::Subresource(tex, 0, 0);
+            c.cmd->copyTextureRegion(dstL, srcL, 0, 0, 0, nullptr);
+        }
+    }
+
     c.cmd->barriers(RenderBarrierStage::NONE,
                     RenderTextureBarrier(tex, RenderTextureLayout::PRESENT));
     c.cmd->end();
@@ -1415,6 +1629,17 @@ void RenderClear(PlumeCtx& c) {
     c.queue->executeCommandLists(&cl, 1, &wait, 1, &signal, 1, c.fence.get());
     c.swap->present(idx, &signal, 1);
     c.queue->waitForCommandFence(c.fence.get());
+
+    // C-5g: GPU is idle (fence waited) — map the readback buffer and write the PNG once.
+    if (doShot && shotBuf) {
+        if (const void* p = shotBuf->map()) {
+            bool ok = WriteImagePNG(c5shot, w, h, shotPitch, static_cast<const uint8_t*>(p), /*bgra=*/true);
+            shotBuf->unmap();
+            REXLOG_INFO("[highcut-C5g] framebuffer shot {} -> {} ({}x{})",
+                        ok ? "WROTE" : "FAILED", c5shot, w, h);
+        }
+        c.c5ShotDone = true;
+    }
 
     // C-3b.2 verify: the GPU is now idle (fence waited), so the PS's atomic writes to the host-
     // visible counter are complete + visible. Read this frame's rasterized-pixel count.

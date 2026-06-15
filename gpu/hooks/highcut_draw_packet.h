@@ -19,6 +19,9 @@
 //                                    per draw (0 => fall back to the shared highcut_p3_vs.spv)
 //   pixel_shader_spirv[ps_spirv_bytes]  — translated guest PS SPIR-V (0 => VS-only / solid PS path)
 //   for each of texture_count: TexturePacketDesc desc; uint8_t linear_texels[desc.data_bytes];
+//   for each of vs_texture_count: TexturePacketDesc desc; uint8_t linear_texels[desc.data_bytes]
+//   for each of ps_sampler_count: SamplerPacketDesc          — (v9) PS sampler filter/clamp state
+//   for each of vs_sampler_count: SamplerPacketDesc          — (v9) VS sampler filter/clamp state
 //   index_blob[index_bytes]        — (v5) raw guest kGuestDMA indices (u16/u32 per index_format)
 
 #pragma once
@@ -27,7 +30,7 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 8;          // C-5d.3: + VERTEX-shader textures (skinning bone palette)
+constexpr uint32_t kDrawPacketVersion = 10;         // C-5g: + cube textures (array_layers; env reflection)
 
 // Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
 // strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
@@ -47,6 +50,7 @@ enum PacketTexFormat : uint32_t {
     kTexBC2 = 2,      // BC2_UNORM            (k_DXT2_3)
     kTexBC3 = 3,      // BC3_UNORM            (k_DXT4_5)
     kTexRGBA32F = 4,  // R32G32B32A32_FLOAT   (k_32_32_32_32_FLOAT — the VS skinning bone palette)
+    kTexBC5 = 5,      // BC5_UNORM            (k_DXN — two-channel NORMAL MAPS; was stubbed -> magenta)
 };
 
 // Plume-neutral blend factor/op — the xenos::BlendFactor / BlendOp enum VALUES (the CP decodes
@@ -75,6 +79,31 @@ struct TexturePacketDesc {
                                // pass RESOLVED to this address (ResolveMarker.dest_addr), the replay
                                // binds OUR offscreen surface RT (host-copy) instead of this captured
                                // blob — so render-to-texture passes (reflection/shadow) feed this draw.
+    uint32_t array_layers;     // C-5g: 1 = normal 2D; 6 = CUBE map (data is 6 faces of width*height
+                               // concatenated, +X,-X,+Y,-Y,+Z,-Z). Player materials sample an env cube
+                               // for reflection AND use its ALPHA as a material factor (NHL12 finding):
+                               // a cube bound as a 2D placeholder gives garbage alpha -> the gold
+                               // back-number decal (which rides on that term) drops out while the
+                               // diffuse jersey stays correct. The plume side builds a real cube here.
+};
+
+// C-5f: per-sampler state, captured from the guest texture-fetch constant of each translated
+// SamplerBinding (in SamplerBindings order, so sampler binding i -> set descriptor nTex+i). Bring-up
+// hardcoded LINEAR+CLAMP for ALL PS textures, which silently broke the jersey NAMEPLATE LAYOUT map: a
+// data texture the player PS POINT-samples to compute the back-number atlas UV. LINEAR-blending it
+// produced a garbage UV -> the number sampled a blank atlas cell -> no number (while the chest crest,
+// a normal LINEAR decal, rendered fine). Honor the guest filter/clamp per binding to fix it. Fields
+// are the RAW Xenos enum VALUES (xenos::TextureFilter 0..3, xenos::ClampMode 0..7); the plume side
+// maps them to RenderFilter / RenderTextureAddressMode.
+struct SamplerPacketDesc {
+    uint32_t fetch_slot;  // Xenos texture fetch slot this sampler reads (diagnostic)
+    uint32_t mag_filter;  // xenos::TextureFilter (0=kPoint, 1=kLinear)
+    uint32_t min_filter;  // xenos::TextureFilter
+    uint32_t mip_filter;  // xenos::TextureFilter (2=kBaseMap => no mip)
+    uint32_t clamp_x;     // xenos::ClampMode (0=kRepeat/WRAP, 2=kClampToEdge/CLAMP, ...)
+    uint32_t clamp_y;     // xenos::ClampMode
+    uint32_t clamp_z;     // xenos::ClampMode
+    uint32_t aniso;       // xenos::AnisoFilter (max anisotropy; diagnostic / future use)
 };
 
 // C-5d.3: a guest EDRAM Resolve event (sub_827EF8E0 / RB_MODECONTROL.edram_mode==kCopy), captured in

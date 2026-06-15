@@ -1604,10 +1604,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   std::vector<uint8_t> p3_ps_spirv;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
   uint32_t p3_ps_sampler_count = 0;
+  // C-5f: the PS sampler bindings (filter/clamp resolved from each binding's fetch constant). Bring-up
+  // bound a single LINEAR+CLAMP sampler to all of set3; the jersey nameplate-layout map needs POINT.
+  std::vector<rex::graphics::SpirvShader::SamplerBinding> p3_ps_sampbinds;
   // C-5d.3: VERTEX-shader texture/sampler bindings (the skinning bone palette). Captured + untiled +
   // bound to set2 so skinned meshes don't collapse to zero fragments.
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_vs_texbinds;
   uint32_t p3_vs_sampler_count = 0;
+  std::vector<rex::graphics::SpirvShader::SamplerBinding> p3_vs_sampbinds;  // C-5f
   // C-5a: NHL_HIGHCUT_FRAME_CAPTURE dumps EVERY interesting owned draw of the frame (to
   // highcut_frame_<idx>.bin) for the multi-draw plume replay, not just the C-4 single selected draw.
   const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
@@ -1703,7 +1707,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         // C-5d.3: the VS's texture/sampler bindings AFTER translation (the skinning bone palette). Bind
         // to set2 at replay; without it skinned vertices read zero bones and collapse to zero fragments.
         p3_vs_texbinds = p3_vs.GetTextureBindingsAfterTranslation();
-        p3_vs_sampler_count = uint32_t(p3_vs.GetSamplerBindingsAfterTranslation().size());
+        p3_vs_sampbinds = p3_vs.GetSamplerBindingsAfterTranslation();  // C-5f
+        p3_vs_sampler_count = uint32_t(p3_vs_sampbinds.size());
         if (!frame_capture) {  // C-4 single-draw bridge writes the shared .spv + in-memory publish
           if (std::FILE* p3_f = std::fopen("highcut_p3_vs.spv", "wb")) {
             std::fwrite(vs_binw.data(), 1, vs_binw.size(), p3_f);
@@ -1745,7 +1750,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           if (ps_okw && ps_trw->is_valid() && !ps_bin.empty()) {
             p3_ps_spirv.assign(ps_bin.begin(), ps_bin.end());
             p3_ps_texbinds = p3_ps.GetTextureBindingsAfterTranslation();
-            p3_ps_sampler_count = uint32_t(p3_ps.GetSamplerBindingsAfterTranslation().size());
+            p3_ps_sampbinds = p3_ps.GetSamplerBindingsAfterTranslation();  // C-5f
+            p3_ps_sampler_count = uint32_t(p3_ps_sampbinds.size());
             if (!frame_capture) {  // C-4 single-draw debug dump; the packet carries inline PS SPIR-V
               if (std::FILE* psf = std::fopen("highcut_p3_ps.spv", "wb")) {
                 std::fwrite(ps_bin.data(), 1, ps_bin.size(), psf);
@@ -2079,9 +2085,22 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       const uint32_t slot = tb.fetch_constant;
       xenos::xe_gpu_texture_fetch_t tf{};
       std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
+      // C-5g: the rexglue SPIR-V translator reads a texture's exp_adjust (6-bit signed texel scale,
+      // texel *= 2^exp_adjust) from fetch-constant dword_4 — where LOD_BIAS lives — instead of its
+      // real home in dword_3. For a LOD-sharpened texture (the jersey name/number font atlas has
+      // lod_bias = -0.75), those bits read as a huge negative exp_adjust (~-12) -> texel *= 2^-12 ->
+      // the whole font layer (name AND number) goes black, while lod_bias=0 textures (base jersey,
+      // crests) are unaffected. Patch the packet's fetch blob: write the REAL exp_adjust (dword_3
+      // bits 13-18) into the bits the shader samples (dword_4 bits 13-18) and clear lod_bias there.
+      if (slot * 6 + 4 < 192u) {
+        uint32_t& d4 = fetch_blob[slot * 6 + 4];
+        const uint32_t real_exp = (fetch_blob[slot * 6 + 3] >> 13) & 0x3Fu;
+        d4 = (d4 & ~(0x3FFu << 12)) | (real_exp << 13);
+      }
       nhl::highcut::TexturePacketDesc td{};
       td.fetch_slot = slot;
       td.is_signed = tb.is_signed ? 1u : 0u;
+      td.array_layers = 1u;  // C-5g: 2D by default; the cube branch below sets 6
       const uint32_t width = uint32_t(tf.size_2d.width) + 1;
       const uint32_t height = uint32_t(tf.size_2d.height) + 1;
       const xenos::TextureFormat fmt = tf.format;
@@ -2097,6 +2116,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         case xenos::TextureFormat::k_DXT1:    pfmt = nhl::highcut::kTexBC1; break;
         case xenos::TextureFormat::k_DXT2_3:  pfmt = nhl::highcut::kTexBC2; break;
         case xenos::TextureFormat::k_DXT4_5:  pfmt = nhl::highcut::kTexBC3; break;
+        // C-5g: k_DXN = BC5 (two-channel normal maps). 16 bytes/block like BC3 (same untile path);
+        // was stubbed -> flat magenta normals -> broken specular/reflection on jersey + equipment.
+        case xenos::TextureFormat::k_DXN:     pfmt = nhl::highcut::kTexBC5; break;
         // C-5d.3: the VERTEX-shader skinning BONE PALETTE (each texel = one float4 matrix row). Without
         // it the skinned meshes (players + most of the gameplay scene) collapse to zero fragments.
         case xenos::TextureFormat::k_32_32_32_32_FLOAT: pfmt = nhl::highcut::kTexRGBA32F; break;
@@ -2104,6 +2126,27 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       const uint32_t tex_base = uint32_t(tf.base_address) << 12;
       td.fetch_base_addr = tex_base;  // C-5d.3: match against resolve dest addrs at replay
+      // C-5g: CUBE bindings (the env reflection map). A cube fails the 2D path below and was emitted as
+      // a 2x2 magenta 2D placeholder, which Vulkan binds to a cube descriptor as GARBAGE — and NHL
+      // player materials use the cube SAMPLE ALPHA as a material factor, so garbage alpha drops the gold
+      // back-number decal (which rides on that term) while the diffuse jersey stays correct. Emit a
+      // REAL 6-face cube here. Bring-up content: a neutral dark reflection with ALPHA=1 (mirrors NHL12's
+      // proven "force cube alpha to 1.0" fix); real per-face untiling can replace this once confirmed.
+      if (tb.dimension == xenos::FetchOpDimension::kCube) {
+        td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
+        td.row_pitch_bytes = 2 * 4; td.swizzle = 0x688;  // identity RGBA
+        td.array_layers = 6;
+        constexpr uint32_t kFace = 2u * 2u * 4u;
+        td.data_bytes = 6u * kFace;
+        std::vector<uint8_t> blob(td.data_bytes);
+        for (size_t i = 0; i < blob.size(); i += 4) {
+          blob[i] = 32; blob[i + 1] = 32; blob[i + 2] = 32; blob[i + 3] = 255;  // neutral, alpha=1
+        }
+        REXLOG_INFO("[highcut-C5g] tex slot={} CUBE base=0x{:X} -> 6-face neutral cube (alpha=1)",
+                    slot, tex_base);
+        out_descs.push_back(td); out_blobs.push_back(std::move(blob));
+        continue;
+      }
       const bool ok2d = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked;
       const uint8_t* guest =
           (tex_base && memory_) ? memory_->TranslatePhysical<const uint8_t*>(tex_base) : nullptr;
@@ -2185,6 +2228,32 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     };  // untileBindings
     untileBindings(p3_ps_texbinds, tex_descs, tex_blobs);   // set3 (pixel) textures
     untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs);  // C-5d.3: set2 (vertex/skinning) textures
+
+    // C-5f: per-sampler filter/clamp. For each translated SamplerBinding, resolve the guest sampler
+    // state from its texture fetch constant (dword_0 = clamp_x/y/z, dword_3 = mag/min/mip/aniso filter).
+    // Reading the live fetch constant gives the authoritative value even when the binding said
+    // kUseFetchConst. Order MUST match the SamplerBindings list (sampler i -> descriptor nTex+i).
+    auto buildSamplerDescs = [&](const std::vector<rg::SpirvShader::SamplerBinding>& binds,
+                                 std::vector<nhl::highcut::SamplerPacketDesc>& out) {
+      for (const auto& sb : binds) {
+        const uint32_t slot = sb.fetch_constant;
+        xenos::xe_gpu_texture_fetch_t tf{};
+        std::memcpy(&tf, &regs[0x4800 + slot * 6], 6 * 4);
+        nhl::highcut::SamplerPacketDesc sd{};
+        sd.fetch_slot = slot;
+        sd.mag_filter = uint32_t(tf.mag_filter);
+        sd.min_filter = uint32_t(tf.min_filter);
+        sd.mip_filter = uint32_t(tf.mip_filter);
+        sd.clamp_x = uint32_t(tf.clamp_x);
+        sd.clamp_y = uint32_t(tf.clamp_y);
+        sd.clamp_z = uint32_t(tf.clamp_z);
+        sd.aniso = uint32_t(tf.aniso_filter);
+        out.push_back(sd);
+      }
+    };
+    std::vector<nhl::highcut::SamplerPacketDesc> ps_samp_descs, vs_samp_descs;
+    buildSamplerDescs(p3_ps_sampbinds, ps_samp_descs);
+    buildSamplerDescs(p3_vs_sampbinds, vs_samp_descs);
 
     REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
                 "index_count(param)={} idx_type={}",
@@ -2394,6 +2463,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         std::fwrite(&vs_tex_descs[i], 1, sizeof(vs_tex_descs[i]), pf);
         std::fwrite(vs_tex_blobs[i].data(), 1, vs_tex_blobs[i].size(), pf);
       }
+      // C-5f: per-sampler descs (PS then VS), after all textures, before the index blob.
+      for (const auto& sd : ps_samp_descs) std::fwrite(&sd, 1, sizeof(sd), pf);
+      for (const auto& sd : vs_samp_descs) std::fwrite(&sd, 1, sizeof(sd), pf);
       if (hdr.index_bytes) std::fwrite(index_blob.data(), 1, hdr.index_bytes, pf);  // C-5d, last
       std::fclose(pf);
       REXLOG_INFO("[highcut-{}] dumped {}: verts={} topo={} vp=({},{},{},{}) cwm=0x{:X} "
