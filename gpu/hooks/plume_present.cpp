@@ -223,6 +223,7 @@ struct RenderableDraw {
     // non-primary surface (the 384^2 RTT pass, the 320x180 stencil-mask passes) renders into its OWN
     // offscreen RT instead of the swapchain — keeping its depth/stencil writes off the main scene.
     uint32_t surfDepthBase = 0, surfPitch = 0, surfMsaa = 0;
+    float vpW = 0, vpH = 0;  // C-5h: per-draw viewport, for full-res primary-surface selection
 };
 
 // C-5d.2: pack the v6 surface tuple into one key. color_base is always 0 in this title, so it's
@@ -500,6 +501,7 @@ bool CreateTexturedDraw(PlumeCtx& c) {
             case nhl::highcut::kTexBC2: return RenderFormat::BC2_UNORM;
             case nhl::highcut::kTexBC3: return RenderFormat::BC3_UNORM;
             case nhl::highcut::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
+            case nhl::highcut::kTexR16: return RenderFormat::R16_UNORM;  // C-5h: k_16 data/mask map
             default: return RenderFormat::R8G8B8A8_UNORM;
         }
     };
@@ -868,6 +870,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                 case hc::kTexBC2: return RenderFormat::BC2_UNORM;
                 case hc::kTexBC3: return RenderFormat::BC3_UNORM;
                 case hc::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
+                case hc::kTexR16: return RenderFormat::R16_UNORM;  // C-5h: k_16 data/mask map
                 case hc::kTexRGBA32F: return RenderFormat::R32G32B32A32_FLOAT;  // C-5d.3 bone palette
                 default: return RenderFormat::R8G8B8A8_UNORM;
             }
@@ -1093,6 +1096,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     d.surfDepthBase = hdr.surface_depth_base;  // C-5d.2: surface bucket key
     d.surfPitch = hdr.surface_pitch;
     d.surfMsaa = hdr.surface_msaa;
+    d.vpW = hdr.vp_w; d.vpH = hdr.vp_h;  // C-5h: viewport, for full-res primary-surface pick
     d.scLeft = int32_t(hdr.sc_left); d.scTop = int32_t(hdr.sc_top);
     d.scRight = int32_t(hdr.sc_right); d.scBottom = int32_t(hdr.sc_bottom);
     if (d.scRight <= d.scLeft || d.scBottom <= d.scTop) {  // degenerate -> full RT
@@ -1141,16 +1145,31 @@ void LoadC5Frames(PlumeCtx& c) {
     // e.g. depth=360 here), NOT the most draws — the largest surface is often an UNTEXTURED aux pass
     // (a depth/shadow prepass or a reflection pass that samples a screen-size resolve) that renders
     // black on its own. Tie-break on total draws.
+    // C-5h: the main camera renders at the LARGEST viewport (full resolution). In a normal scene that's
+    // also the most-drawn/most-textured surface, but in an INSTANT-REPLAY / multi-pass frame a HALF-RES
+    // aux pass (a reflection or picture-in-picture camera at e.g. 640x360) can out-COUNT the full-res
+    // broadcast view (1280x720) — the old "most textured draws" pick then upscaled the wrong camera (it
+    // looked like the view was sunk into the ice). Rank: any-textured beats none (skip untextured depth/
+    // shadow prepasses), then LARGEST viewport area, then most textured. Manual override still wins below.
     std::unordered_map<uint64_t, uint32_t> keyCounts, keyTexCounts;
+    std::unordered_map<uint64_t, uint64_t> keyMaxVpArea;
     for (const auto& d : c.c5draws) {
         const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
         ++keyCounts[k];
         if (d.textured) ++keyTexCounts[k];
+        const uint64_t area = uint64_t(d.vpW > 0 ? d.vpW : 0) * uint64_t(d.vpH > 0 ? d.vpH : 0);
+        if (area > keyMaxVpArea[k]) keyMaxVpArea[k] = area;
     }
-    uint64_t bestKey = 0; uint32_t bestTex = 0, bestN = 0;
+    uint64_t bestKey = 0, bestArea = 0; uint32_t bestTex = 0, bestN = 0;
     for (const auto& kv : keyCounts) {
         const uint32_t tex = keyTexCounts[kv.first];
-        if (tex > bestTex || (tex == bestTex && kv.second > bestN)) { bestTex = tex; bestN = kv.second; bestKey = kv.first; }
+        const uint64_t area = keyMaxVpArea[kv.first];
+        bool better;
+        if ((tex > 0) != (bestTex > 0))      better = (tex > 0);          // any textured beats none
+        else if (area != bestArea)           better = (area > bestArea);  // then largest viewport
+        else if (tex != bestTex)             better = (tex > bestTex);    // then most textured
+        else                                 better = (kv.second > bestN);// then most draws
+        if (bestKey == 0 || better) { bestKey = kv.first; bestArea = area; bestTex = tex; bestN = kv.second; }
     }
     if (const char* op = std::getenv("NHL_HIGHCUT_C5_PRIMARY_PITCH")) {
         const uint32_t wantPitch = uint32_t(std::strtoul(op, nullptr, 10));

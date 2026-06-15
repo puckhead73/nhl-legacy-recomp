@@ -79,7 +79,7 @@ CMP = {0: "Never", 1: "Less", 2: "Equal", 3: "LEqual", 4: "Greater", 5: "NotEqua
 SOP = {0: "Keep", 1: "Zero", 2: "Replace", 3: "IncClamp", 4: "DecClamp", 5: "Invert",
        6: "IncWrap", 7: "DecWrap"}
 TOPO = {0: "TriList", 1: "TriStrip", 2: "QuadExpand"}
-TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3", 4: "RGBA32F", 5: "BC5"}
+TEXFMT = {0: "RGBA8", 1: "BC1", 2: "BC2", 3: "BC3", 4: "RGBA32F", 5: "BC5", 6: "R16"}
 CULL = {0: "none", 1: "front", 2: "back"}
 
 
@@ -261,6 +261,15 @@ def decode_textures(buf, h, hdr_size, base):
             continue
         if fmt == 5:  # BC5 normal map (2-channel) — stdlib decoder doesn't do BC5; skip PNG
             print(f"    tex{i}: BC5 {w}x{hh} (k_DXN normal map — no PNG)")
+            continue
+        if fmt == 6:  # R16 single-channel data/mask map — render as grayscale PNG
+            rgba = bytearray(w * hh * 4)
+            for p in range(min(w * hh, len(blob) // 2)):
+                v = blob[p * 2 + 1]  # high byte of the 16-bit value ~= 8-bit magnitude
+                rgba[p * 4:p * 4 + 4] = bytes((v, v, v, 255))
+            out = f"{base}.tex{i}.R16.{w}x{hh}.png"
+            write_png(out, w, hh, rgba)
+            print(f"    tex{i}: R16 {w}x{hh} (k_16 data/mask) -> {out}")
             continue
         if fmt == 0:  # RGBA8 already (tight rows)
             rgba = bytearray(blob[:w * hh * 4])

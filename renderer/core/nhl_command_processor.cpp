@@ -2119,6 +2119,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         // C-5g: k_DXN = BC5 (two-channel normal maps). 16 bytes/block like BC3 (same untile path);
         // was stubbed -> flat magenta normals -> broken specular/reflection on jersey + equipment.
         case xenos::TextureFormat::k_DXN:     pfmt = nhl::highcut::kTexBC5; break;
+        // C-5h: k_16 = single-channel 16-bit data/mask map (spec/gloss/AO-type material input). 1x1
+        // block, 2 bytes/texel -> R16_UNORM; the generic untile + 16-bit endian-swap below handle it.
+        // Was unsupported -> magenta -> broke whatever equipment material term sampled it.
+        case xenos::TextureFormat::k_16:      pfmt = nhl::highcut::kTexR16; break;
         // C-5d.3: the VERTEX-shader skinning BONE PALETTE (each texel = one float4 matrix row). Without
         // it the skinned meshes (players + most of the gameplay scene) collapse to zero fragments.
         case xenos::TextureFormat::k_32_32_32_32_FLOAT: pfmt = nhl::highcut::kTexRGBA32F; break;
@@ -2154,12 +2158,20 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           height > 8192) {
         td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
         td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4; td.swizzle = 0x688;  // identity RGBA
+        // C-5h: DEPTH formats (k_24_8/_FLOAT) are resolved shadow/depth maps the main pass samples;
+        // until the resolve=host-copy composition binds the real surface, stub them NEUTRAL (white =
+        // far depth = "fully lit / no occlusion") instead of magenta, so the lighting reads a benign
+        // value rather than garbage. Everything else still stubs magenta (visibly wrong if reached).
+        const bool is_depth = (fmt == xenos::TextureFormat::k_24_8 ||
+                               fmt == xenos::TextureFormat::k_24_8_FLOAT);
+        const uint8_t sg = is_depth ? 255 : 0;  // green: 255 for depth (white), 0 for magenta
         std::vector<uint8_t> blob(td.data_bytes);
         for (size_t i = 0; i < blob.size(); i += 4) {
-          blob[i] = 255; blob[i + 1] = 0; blob[i + 2] = 255; blob[i + 3] = 255;  // magenta
+          blob[i] = 255; blob[i + 1] = sg; blob[i + 2] = 255; blob[i + 3] = 255;  // magenta / white
         }
-        REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 magenta",
-                    slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base);
+        REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 {}",
+                    slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base,
+                    is_depth ? "white (depth)" : "magenta");
         out_descs.push_back(td); out_blobs.push_back(std::move(blob));
         continue;
       }

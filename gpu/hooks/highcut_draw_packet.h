@@ -51,6 +51,7 @@ enum PacketTexFormat : uint32_t {
     kTexBC3 = 3,      // BC3_UNORM            (k_DXT4_5)
     kTexRGBA32F = 4,  // R32G32B32A32_FLOAT   (k_32_32_32_32_FLOAT — the VS skinning bone palette)
     kTexBC5 = 5,      // BC5_UNORM            (k_DXN — two-channel NORMAL MAPS; was stubbed -> magenta)
+    kTexR16 = 6,      // R16_UNORM            (k_16 — single-channel 16-bit data/mask map; was -> magenta)
 };
 
 // Plume-neutral blend factor/op — the xenos::BlendFactor / BlendOp enum VALUES (the CP decodes

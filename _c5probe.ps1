@@ -8,6 +8,8 @@ param(
   [switch]$Alpha,                            # show the alpha channel as grayscale
   [switch]$Step,                             # render registers 0..11, one shot each (12 launches)
   [switch]$Full,                             # render the WHOLE frame (default isolates -Draw only)
+  [int]$PrimaryDepth = -1,                   # override primary guest surface depth_base (e.g. 736)
+  [int]$PrimaryPitch = 0,                    # override primary guest surface pitch
   [int]$Seconds = 40,
   [string]$Out = ""                          # shot path (default _probe_d<Draw>_...png)
 )
@@ -37,6 +39,8 @@ function Invoke-Probe([string]$shot, [string]$instrSpv) {
   }
   $env:NHL_HIGHCUT_PRESENT = "1"; $env:NHL_HIGHCUT_C5 = "1"
   if (-not $Full) { $env:NHL_HIGHCUT_C5_MINDRAW = "$Draw"; $env:NHL_HIGHCUT_C5_MAXDRAW = "$($Draw + 1)" }
+  if ($PrimaryDepth -ge 0) { $env:NHL_HIGHCUT_C5_PRIMARY_DEPTH = "$PrimaryDepth" }
+  if ($PrimaryPitch -gt 0) { $env:NHL_HIGHCUT_C5_PRIMARY_PITCH = "$PrimaryPitch" }
   if ($instrSpv -ne "") { $env:NHL_HIGHCUT_DEBUG_PS = $instrSpv; $env:NHL_HIGHCUT_DEBUG_PS_DRAW = "$Draw" }
   $env:NHL_HIGHCUT_C5_SHOT = $shot
   if (Test-Path $shot) { Remove-Item $shot -Force }
