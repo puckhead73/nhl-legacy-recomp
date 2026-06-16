@@ -146,6 +146,13 @@ class NhlD3D12CommandProcessor : public rex::graphics::d3d12::D3D12CommandProces
   uint32_t highcut_capture_idx_ = 0;
   uint64_t highcut_last_frame_index_ = UINT64_MAX;  // detect a new guest frame to reset the index
   uint64_t highcut_last_present_count_ = UINT64_MAX;  // C-5d: guest-present frame delimiter (live-3D)
+  // C-5i broadcast-frame guard: only KEEP a captured frame that is a DENSE full-res 3D scene — count
+  // draws that are wide (>=1024 vp) AND depth-tested AND indexed (real 3D geometry, not flat UI/HUD or
+  // half-res replay passes). A frame latches when that count crosses the threshold (default 150, env
+  // NHL_HIGHCUT_CAPTURE_MIN3D), so the capture skips sparse/menu/transition frames and freezes the
+  // first action/close-up frame regardless of F10 timing (its bins + count frozen, later frames ignored).
+  uint32_t highcut_frame_3d_draws_ = 0;  // wide+depth+indexed draws seen this frame
+  bool highcut_captured_good_ = false;   // latched: a dense broadcast frame is captured, stop capturing
   // C-5d.3: guest EDRAM resolve events captured in stream order (after_draw = highcut_capture_idx_ at
   // resolve time). Rewritten to highcut_resolves.bin after each resolve; reset at each frame boundary.
   std::vector<nhl::highcut::ResolveMarker> highcut_resolves_;

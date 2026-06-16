@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -312,6 +313,24 @@ bool NhlD3D12CommandProcessor::BuildBetaCaches() {
   constexpr uint32_t kScaleX = 1;
   constexpr uint32_t kScaleY = 1;
   constexpr bool kBindless = false;
+
+  // C-5l: READBACK RESOLVE — the NHL12 sibling dev's fix for the green equipment.
+  // The recolorable equipment maps are render-to-texture / EDRAM-resolve results. By
+  // default rexglue keeps resolve output on the GPU (shared memory) and does NOT copy it
+  // back to guest CPU RAM, so our high-cut capture (which reads guest RAM via
+  // TranslatePhysical) sees stale garbage -> green/striped pads. Enabling readback-resolve
+  // makes the BASE CP's IssueCopy (run during NATIVE pre-F10 frames) download every resolve
+  // result into guest RAM, so by the time we F10-capture the goalie the equipment composite
+  // is actually present where we read it. "full" = read back every resolve; the d3d12 legacy
+  // bool is the backend force-enable that GetReadbackResolveMode honors. Set globally at
+  // setup, before any frame renders. Default ON (the green is the headline defect); opt out
+  // with NHL_HIGHCUT_NO_READBACK_RESOLVE to A/B against the prior behavior.
+  if (std::getenv("NHL_HIGHCUT_NO_READBACK_RESOLVE") == nullptr) {
+    REXCVAR_SET(readback_resolve, std::string("full"));
+    REXCVAR_SET(d3d12_readback_resolve, true);
+    REXLOG_INFO("[nhl-beta] C-5l: readback_resolve=full + d3d12_readback_resolve=true "
+                "(resolve results downloaded to guest RAM; fixes green equipment)");
+  }
 
   // 1. Shared memory — the guest-RAM mirror; dependency of texture/RT/primitive.
   beta_shared_memory_ = std::make_unique<d3d12::D3D12SharedMemory>(*this, *memory_, trace_writer_);
@@ -1325,6 +1344,7 @@ void NhlD3D12CommandProcessor::BetaFlatResolve() {
 void NhlD3D12CommandProcessor::HighcutCaptureResolve() {
   static const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
   if (!frame_capture || !memory_) return;
+  if (highcut_captured_good_) return;  // C-5i: broadcast frame latched — don't append later resolves
   namespace draw_util = rex::graphics::draw_util;
   draw_util::ResolveInfo ri{};
   if (!draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, 1, 1, false, false, ri))
@@ -2080,7 +2100,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // per-block byte offset. 2D 8888 + DXT1/2_3/4_5 supported; anything else -> 2x2 magenta.
     auto untileBindings = [&](const std::vector<rex::graphics::SpirvShader::TextureBinding>& binds,
                               std::vector<nhl::highcut::TexturePacketDesc>& out_descs,
-                              std::vector<std::vector<uint8_t>>& out_blobs) {
+                              std::vector<std::vector<uint8_t>>& out_blobs, bool is_ps) {
     for (const auto& tb : binds) {
       const uint32_t slot = tb.fetch_constant;
       xenos::xe_gpu_texture_fetch_t tf{};
@@ -2130,32 +2150,33 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       const uint32_t tex_base = uint32_t(tf.base_address) << 12;
       td.fetch_base_addr = tex_base;  // C-5d.3: match against resolve dest addrs at replay
-      // C-5g: CUBE bindings (the env reflection map). A cube fails the 2D path below and was emitted as
-      // a 2x2 magenta 2D placeholder, which Vulkan binds to a cube descriptor as GARBAGE — and NHL
-      // player materials use the cube SAMPLE ALPHA as a material factor, so garbage alpha drops the gold
-      // back-number decal (which rides on that term) while the diffuse jersey stays correct. Emit a
-      // REAL 6-face cube here. Bring-up content: a neutral dark reflection with ALPHA=1 (mirrors NHL12's
-      // proven "force cube alpha to 1.0" fix); real per-face untiling can replace this once confirmed.
-      if (tb.dimension == xenos::FetchOpDimension::kCube) {
+      // C-5i: CUBE bindings (the env reflection map) carry REAL 6-face content now. The faces are array
+      // slices in guest RAM; we untile each like a 2D image (same GetTiledOffset2D path) and concatenate
+      // them face-major, then the plume side builds a real cube + uploads the 6 faces. (C-5g emitted a
+      // neutral 6-face cube — NHL materials use the cube SAMPLE ALPHA as a material factor, so a garbage
+      // 2D placeholder dropped material terms; the neutral cube is now the FALLBACK if untiling can't
+      // proceed.) Confirmed via NHL_HIGHCUT_C5_CUBE: a populated cube lights the goalie equipment.
+      const bool isCube = tb.dimension == xenos::FetchOpDimension::kCube;
+      const uint32_t cubeLayers = isCube ? 6u : 1u;
+      auto emitNeutralCube = [&](const char* why) {
         td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
-        td.row_pitch_bytes = 2 * 4; td.swizzle = 0x688;  // identity RGBA
-        td.array_layers = 6;
+        td.row_pitch_bytes = 2 * 4; td.swizzle = 0x688; td.array_layers = 6;  // identity RGBA, 6 faces
         constexpr uint32_t kFace = 2u * 2u * 4u;
         td.data_bytes = 6u * kFace;
         std::vector<uint8_t> blob(td.data_bytes);
         for (size_t i = 0; i < blob.size(); i += 4) {
           blob[i] = 32; blob[i + 1] = 32; blob[i + 2] = 32; blob[i + 3] = 255;  // neutral, alpha=1
         }
-        REXLOG_INFO("[highcut-C5g] tex slot={} CUBE base=0x{:X} -> 6-face neutral cube (alpha=1)",
-                    slot, tex_base);
+        REXLOG_INFO("[highcut-C5i] tex slot={} CUBE base=0x{:X} -> 6-face NEUTRAL cube ({})", slot, tex_base, why);
         out_descs.push_back(td); out_blobs.push_back(std::move(blob));
-        continue;
-      }
-      const bool ok2d = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked;
+      };
+      // Allow the cube dimension through the untile path (a cube is k3DOrStacked-ish, not k2DOrStacked).
+      const bool okDim = xenos::DataDimension(tf.dimension) == xenos::DataDimension::k2DOrStacked || isCube;
       const uint8_t* guest =
           (tex_base && memory_) ? memory_->TranslatePhysical<const uint8_t*>(tex_base) : nullptr;
-      if (pfmt == UINT32_MAX || !fi || !ok2d || !guest || !width || !height || width > 8192 ||
+      if (pfmt == UINT32_MAX || !fi || !okDim || !guest || !width || !height || width > 8192 ||
           height > 8192) {
+        if (isCube) { emitNeutralCube("untile precond failed"); continue; }  // keep a valid cube descriptor
         td.width = 2; td.height = 2; td.tex_format = nhl::highcut::kTexRGBA8;
         td.row_pitch_bytes = 2 * 4; td.data_bytes = 2 * 2 * 4; td.swizzle = 0x688;  // identity RGBA
         // C-5h: DEPTH formats (k_24_8/_FLOAT) are resolved shadow/depth maps the main pass samples;
@@ -2183,17 +2204,33 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       uint32_t pitch_texels = tf.pitch ? (uint32_t(tf.pitch) << 5) : ((width + 31u) & ~31u);
       uint32_t pitch_blocks = pitch_texels / bw;
       if (pitch_blocks < blocks_x) pitch_blocks = blocks_x;
-      std::vector<uint8_t> blob(size_t(blocks_y) * blocks_x * bpb);
-      for (uint32_t by = 0; by < blocks_y; ++by) {
-        for (uint32_t bx = 0; bx < blocks_x; ++bx) {
-          size_t src;
-          if (tf.tiled) {
-            src = size_t(uint32_t(rg::texture_util::GetTiledOffset2D(
-                int32_t(bx), int32_t(by), pitch_blocks, bpb_log2)));
-          } else {
-            src = (size_t(by) * pitch_blocks + bx) * bpb;
+      const size_t faceBytes = size_t(blocks_y) * blocks_x * bpb;
+      // C-5i: a cube's 6 faces are array slices spaced array_slice_stride_bytes apart in guest RAM (the
+      // tiled, 4KB-aligned per-face size). Untile each face independently (same GetTiledOffset2D within a
+      // face) and concatenate face-major. A 2D texture is one "face" with stride 0.
+      uint32_t sliceStride = 0;
+      if (isCube) {
+        const auto gl = rg::texture_util::GetGuestTextureLayout(
+            xenos::DataDimension::kCube, tf.pitch, width, height, 6, tf.tiled != 0, fmt,
+            /*has_packed_levels*/ false, /*has_base*/ true, /*max_level*/ 0);
+        sliceStride = gl.base.array_slice_stride_bytes;
+        if (!sliceStride) { emitNeutralCube("zero slice stride"); continue; }  // would alias all 6 faces
+      }
+      std::vector<uint8_t> blob(faceBytes * cubeLayers);
+      for (uint32_t face = 0; face < cubeLayers; ++face) {
+        const uint8_t* fguest = guest + size_t(face) * sliceStride;
+        uint8_t* fdst = blob.data() + size_t(face) * faceBytes;
+        for (uint32_t by = 0; by < blocks_y; ++by) {
+          for (uint32_t bx = 0; bx < blocks_x; ++bx) {
+            size_t src;
+            if (tf.tiled) {
+              src = size_t(uint32_t(rg::texture_util::GetTiledOffset2D(
+                  int32_t(bx), int32_t(by), pitch_blocks, bpb_log2)));
+            } else {
+              src = (size_t(by) * pitch_blocks + bx) * bpb;
+            }
+            std::memcpy(fdst + (size_t(by) * blocks_x + bx) * bpb, fguest + src, bpb);
           }
-          std::memcpy(&blob[(size_t(by) * blocks_x + bx) * bpb], guest + src, bpb);
         }
       }
       // Endian: 8888 / RGBA32F -> 32-bit word swap (each float/uint is a 32-bit word); BCn -> 16-bit
@@ -2216,6 +2253,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       }
       td.width = width; td.height = height; td.tex_format = pfmt;
       td.row_pitch_bytes = blocks_x * bpb; td.data_bytes = uint32_t(blob.size());
+      td.array_layers = cubeLayers;  // C-5i: 6 for a real cube, 1 for 2D
       // Guest component swizzle (e.g. k_8888 menu logo is BGRA -> R<->B). k_8 is replicated to
       // RGBA (v,v,v,v) so it samples right under identity; everything else carries the real swizzle.
       td.swizzle = expand_r8 ? 0x688u : uint32_t(tf.swizzle);
@@ -2231,15 +2269,20 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         td.row_pitch_bytes = blocks_x * 4u;
         td.data_bytes = uint32_t(blob.size());
       }
+      // C-5j: enhanced capture log — base + tiled + mip window + packed_mips, so a corrupt player/
+      // equipment texture (green goalie gear) can be correlated against clean ones by its REAL fetch
+      // config (the naive 2D untile above ignores packed mips / mip_min / the 256B linear pitch align
+      // that GetGuestTextureLayout would apply — only the cube path uses it).
       REXLOG_INFO("[highcut-C4] tex slot={} {}x{} fmt={} pfmt={} tiled={} endian={} pitch_blk={} "
-                  "blob={} is_signed={}",
+                  "blob={} is_signed={} layers={} base=0x{:X} mip={}..{} packed={}",
                   slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
-                  pitch_blocks, td.data_bytes, td.is_signed);
+                  pitch_blocks, td.data_bytes, td.is_signed, cubeLayers, tex_base,
+                  uint32_t(tf.mip_min_level), uint32_t(tf.mip_max_level), uint32_t(tf.packed_mips));
       out_descs.push_back(td); out_blobs.push_back(std::move(blob));
     }
     };  // untileBindings
-    untileBindings(p3_ps_texbinds, tex_descs, tex_blobs);   // set3 (pixel) textures
-    untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs);  // C-5d.3: set2 (vertex/skinning) textures
+    untileBindings(p3_ps_texbinds, tex_descs, tex_blobs, /*is_ps=*/true);   // set3 (pixel) textures
+    untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs, /*is_ps=*/false);  // C-5d.3: set2 (vertex/skinning) textures
 
     // C-5f: per-sampler filter/clamp. For each translated SamplerBinding, resolve the guest sampler
     // state from its texture fetch constant (dword_0 = clamp_x/y/z, dword_3 = mag/min/mip/aniso filter).
@@ -2429,27 +2472,52 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // every guest VdSwap (sub_827F1C88), upstream of all takeover plumbing. We OR the two signals so
     // non-takeover capture (where frame_index_ advances and the guest-present hook may or may not fire)
     // still resets correctly. The first draw after a present starts a fresh frame's bins.
-    if (frame_capture) {
+    // C-5i broadcast-frame guard (opt-out NHL_HIGHCUT_CAPTURE_ANYFRAME): keep ONLY a frame that
+    // contains the full-res broadcast pass. Mark this frame "good" the moment a >=1024-wide-viewport
+    // draw is dumped; at the next boundary, latch a complete good frame and stop capturing.
+    static const bool broadcast_guard = std::getenv("NHL_HIGHCUT_CAPTURE_ANYFRAME") == nullptr;
+    static const uint32_t min_3d_draws = []() {
+      const char* s = std::getenv("NHL_HIGHCUT_CAPTURE_MIN3D");
+      return s ? uint32_t(std::strtoul(s, nullptr, 10)) : 150u;
+    }();
+    const bool skip_capture = frame_capture && broadcast_guard && highcut_captured_good_;
+    if (frame_capture && !skip_capture) {
       const uint64_t present_count = HighcutGuestPresentCount();
       if (present_count != highcut_last_present_count_ ||
           frame_index_ != highcut_last_frame_index_) {
-        // Spike/verify: log the boundary so a live-3D capture proves the guest-present hook advances
-        // (frame_index_ stays frozen under takeover) and shows the per-frame draw count.
-        REXLOG_INFO("[highcut-C5] frame boundary: present={} frame_index_={} prev_frame_draws={}",
-                    present_count, frame_index_, highcut_capture_idx_);
-        highcut_last_present_count_ = present_count;
-        highcut_last_frame_index_ = frame_index_;
-        highcut_capture_idx_ = 0;
-        // C-5d.3: new frame — drop the prior frame's resolve markers and truncate the sidecar so a
-        // frame with no resolves can't replay a stale list (resolves this frame re-append + rewrite).
-        highcut_resolves_.clear();
-        if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
-          const uint32_t magic = nhl::highcut::kResolveSidecarMagic, zero = 0;
-          std::fwrite(&magic, 4, 1, rf);
-          std::fwrite(&zero, 4, 1, rf);
-          std::fclose(rf);
+        // The frame that just ENDED: if it was a DENSE 3D scene (enough wide+depth+indexed draws),
+        // LATCH it (freeze its bins + count, ignore all later frames) — so F10 timing no longer matters;
+        // the first action/close-up frame wins and a trailing sparse/menu/replay frame can't clobber it.
+        if (broadcast_guard && highcut_frame_3d_draws_ >= min_3d_draws && highcut_capture_idx_ > 0) {
+          highcut_captured_good_ = true;
+          REXLOG_INFO("[highcut-C5] LATCHED broadcast frame ({} draws, {} 3D) — later frames ignored",
+                      highcut_capture_idx_, highcut_frame_3d_draws_);
+        } else {
+          if (broadcast_guard && highcut_capture_idx_ > 0)
+            REXLOG_INFO("[highcut-C5] dropping frame ({} draws, {} 3D < {}): not a dense broadcast scene",
+                        highcut_capture_idx_, highcut_frame_3d_draws_, min_3d_draws);
+          // Spike/verify: log the boundary so a live-3D capture proves the guest-present hook advances
+          // (frame_index_ stays frozen under takeover) and shows the per-frame draw count.
+          REXLOG_INFO("[highcut-C5] frame boundary: present={} frame_index_={} prev_frame_draws={}",
+                      present_count, frame_index_, highcut_capture_idx_);
+          highcut_last_present_count_ = present_count;
+          highcut_last_frame_index_ = frame_index_;
+          highcut_capture_idx_ = 0;
+          highcut_frame_3d_draws_ = 0;  // reset 3D-density detection for the new frame
+          // C-5d.3: new frame — drop the prior frame's resolve markers and truncate the sidecar so a
+          // frame with no resolves can't replay a stale list (resolves this frame re-append + rewrite).
+          highcut_resolves_.clear();
+          if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
+            const uint32_t magic = nhl::highcut::kResolveSidecarMagic, zero = 0;
+            std::fwrite(&magic, 4, 1, rf);
+            std::fwrite(&zero, 4, 1, rf);
+            std::fclose(rf);
+          }
         }
       }
+      // Count this draw toward the frame's 3D density: wide viewport + depth-tested + indexed geometry
+      // (excludes flat UI/HUD quads and half-res passes), the signature of real broadcast 3D content.
+      if (hdr.vp_w >= 1024.0f && hdr.depth_enable && hdr.index_format != 0) ++highcut_frame_3d_draws_;
     }
     char pkt_path[64];
     if (frame_capture) {
@@ -2457,6 +2525,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     } else {
       std::snprintf(pkt_path, sizeof(pkt_path), "highcut_p3_draw.bin");
     }
+    // C-5i: once a broadcast frame is latched, stop writing — the good frame's bins + count are frozen.
+    if (!skip_capture)
     if (std::FILE* pf = std::fopen(pkt_path, "wb")) {
       std::fwrite(&hdr, 1, sizeof(hdr), pf);
       std::fwrite(fetch_blob, 1, sizeof(fetch_blob), pf);

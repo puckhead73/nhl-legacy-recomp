@@ -46,6 +46,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "plume_render_interface.h"
@@ -80,6 +81,9 @@ constexpr uint32_t kBufferCount = 2;
 constexpr uint32_t kWidth = 1280;   // the game's logical size (proven in H-1)
 constexpr uint32_t kHeight = 720;
 constexpr RenderFormat kSwapFormat = RenderFormat::B8G8R8A8_UNORM;
+
+// C-5j: forward decl (defined below near the xenos helpers) — opt-out for the signed-BC5 SNORM fix.
+bool NhlBc5NoSnorm();
 // C-5c: the shared depth+stencil attachment format. Every framebuffer carries one, so EVERY pipeline
 // must declare this depthTargetFormat (else its renderpass is incompatible with the framebuffer's).
 constexpr RenderFormat kDepthFormat = RenderFormat::D32_FLOAT_S8_UINT;
@@ -224,6 +228,11 @@ struct RenderableDraw {
     // offscreen RT instead of the swapchain — keeping its depth/stencil writes off the main scene.
     uint32_t surfDepthBase = 0, surfPitch = 0, surfMsaa = 0;
     float vpW = 0, vpH = 0;  // C-5h: per-draw viewport, for full-res primary-surface selection
+    // C-5d.3 composition: PS texture slots whose fetch_base_addr matches a resolve dest_addr. At load
+    // time (after the source surface RTs exist) these set3 slots are re-pointed at the source surface's
+    // sampleable color/depth view, so the draw samples our rendered shadow map / reflection RTT.
+    struct HostCopyBind { uint32_t slot; uint64_t srcKey; bool isDepth; };
+    std::vector<HostCopyBind> hostCopy;
 };
 
 // C-5d.2: pack the v6 surface tuple into one key. color_base is always 0 in this title, so it's
@@ -298,11 +307,25 @@ struct PlumeCtx {
     struct SurfaceRT {
         std::unique_ptr<RenderTexture> color, depth;
         std::unique_ptr<RenderFramebuffer> fb;
-        uint64_t clearedFrame = ~0ull;  // last frame cleared (clear once per frame, LOAD thereafter)
+        // C-5d.3 composition: sampleable views of the color (and depth) attachments, so a later draw
+        // that samples this surface's resolve dest binds OUR rendered content (Resolve=host copy).
+        std::unique_ptr<RenderTextureView> colorSRV, depthSRV;
+        uint32_t w = 0, h = 0;           // sized to the GUEST surface (not the swapchain), so the
+                                         // consumer's [0,1] UV maps onto the full rendered content.
+        uint64_t clearedFrame = ~0ull;   // last frame cleared (clear once per frame, LOAD thereafter)
     };
     std::unordered_map<uint64_t, SurfaceRT> c5surfaces;
     uint64_t c5PrimaryKey = 0;  // the ONE guest surface (depth,pitch,msaa) shown on the swapchain
     bool c5ShotDone = false;    // C-5g: NHL_HIGHCUT_C5_SHOT one-shot framebuffer dump fired
+    // C-5d.3 "Resolve = host copy": a guest EDRAM resolve copies a just-finished surface into a texture
+    // at dest_addr; a later draw samples that addr. Map dest_addr -> the SOURCE surface that produced it
+    // (its SurfaceKey + whether the resolve was depth), loaded from highcut_resolves.bin. When a draw's
+    // texture fetch_base_addr matches a dest_addr, we bind that source surface's offscreen RT attachment
+    // instead of the captured stub — feeding real shadow maps / reflection RTTs into the main pass.
+    struct ResolveEntry { uint64_t srcKey; bool isDepth; };
+    std::unordered_map<uint32_t, ResolveEntry> resolveMap;       // dest_addr -> source surface
+    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> surfaceDims;  // SurfaceKey -> (w,h)
+    std::vector<uint64_t> sampledSrcOrder;  // sampled source SurfaceKeys, first-seen order (render order)
 };
 
 // Guest Present hook bumps this; the plume thread renders one frame per increment.
@@ -495,12 +518,15 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     if (!c.xlatTexPS) { REXLOG_ERROR("[highcut-C4] PS shader module create failed"); return false; }
 
     // Create + upload each texture via a transient command list (the frame's c.cmd is mid-record).
-    auto mapFmt = [](uint32_t f) -> RenderFormat {
+    auto mapFmt = [](uint32_t f, uint32_t is_signed) -> RenderFormat {
+        const bool sgn = is_signed && !NhlBc5NoSnorm();
         switch (f) {
             case nhl::highcut::kTexBC1: return RenderFormat::BC1_UNORM;
             case nhl::highcut::kTexBC2: return RenderFormat::BC2_UNORM;
             case nhl::highcut::kTexBC3: return RenderFormat::BC3_UNORM;
-            case nhl::highcut::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
+            // C-5j: honor the guest TextureSign. A signed BC5/k_DXN binding must use a SNORM view (see
+            // NhlBc5NoSnorm comment) or the normal fetch yields [0,1] where the shader expects [-1,1].
+            case nhl::highcut::kTexBC5: return sgn ? RenderFormat::BC5_SNORM : RenderFormat::BC5_UNORM;
             case nhl::highcut::kTexR16: return RenderFormat::R16_UNORM;  // C-5h: k_16 data/mask map
             default: return RenderFormat::R8G8B8A8_UNORM;
         }
@@ -512,7 +538,7 @@ bool CreateTexturedDraw(PlumeCtx& c) {
     c.xlatTexViews.clear();
     upCmd->begin();
     for (auto& t : texs) {
-        const RenderFormat rf = mapFmt(t.d.tex_format);
+        const RenderFormat rf = mapFmt(t.d.tex_format, t.d.is_signed);
         auto tex = c.device->createTexture(RenderTextureDesc::Texture2D(t.d.width, t.d.height, 1, rf));
         auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.blob.size()));
         if (staging) { void* p = staging->map(); std::memcpy(p, t.blob.data(), t.blob.size()); staging->unmap(); }
@@ -708,6 +734,17 @@ RenderSwizzle xenosSwz(uint32_t s) {
         default: return RenderSwizzle::IDENTITY;
     }
 }
+// C-5j: A/B opt-out for the signed-BC5 -> BC5_SNORM view fix. The rexglue SPIR-V translator emits a
+// separate TextureBinding per (fetch_constant, dimension, is_signed); a signed binding means the shader
+// samples that texture expecting [-1,1], so the host must supply a signed-format view. The k_DXN goalie
+// normal maps are bound signed; reading them through a BC5_UNORM view gives [0,1] -> wrong normals ->
+// the green-on-dark equipment speckle (BC5 packs into R,G). Set NHL_HIGHCUT_BC5_NO_SNORM=1 to force the
+// old UNORM-always behavior for a clean A/B against the fix.
+bool NhlBc5NoSnorm() {
+    static const bool v = std::getenv("NHL_HIGHCUT_BC5_NO_SNORM") != nullptr;
+    return v;
+}
+
 RenderComponentMapping xenosSwizzleMapping(uint32_t swz) {
     return RenderComponentMapping(xenosSwz(swz), xenosSwz(swz >> 3), xenosSwz(swz >> 6),
                                   xenosSwz(swz >> 9));
@@ -817,6 +854,22 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     const bool textured = hdr.texture_count > 0;
     d.textured = textured;
 
+    // C-5d.3: flag PS texture slots that sample a guest resolve dest AND whose captured blob is a 2x2
+    // STUB — i.e. the capture could NOT read real data for that address (depth/shadow maps: k_24_8 is
+    // unsupported by untileBindings -> stubbed). For those we re-point set3 (below, once the source RTs
+    // exist) at the source surface's rendered RT. COLOR resolves, by contrast, were captured as real
+    // full-size images straight from guest RAM (the resolved texels persist there), so the captured blob
+    // is already correct — re-rendering them regresses (broken ice/reflections). Cube stubs
+    // (array_layers==6) are the neutral-env case, handled separately and deferred to the cube step.
+    for (uint32_t i = 0; i < hdr.texture_count && i < texs.size(); ++i) {
+        const auto& td = texs[i].desc;
+        auto rit = c.resolveMap.find(td.fetch_base_addr);
+        if (rit == c.resolveMap.end()) continue;
+        const bool capturedStub = td.width <= 2 && td.height <= 2 && td.array_layers == 1;
+        if (!capturedStub) continue;  // only host-copy genuinely-stubbed bindings (depth/shadow)
+        d.hostCopy.push_back({i, rit->second.srcKey, rit->second.isDepth});
+    }
+
     constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16;
     // C-5c: size the shared-memory (vertex) SSBO to THIS draw's data, not a fixed 64K. 3D meshes
     // pack multiple vertex streams (position/normal/uv/...) and can be hundreds of KB — a fixed 64K
@@ -864,12 +917,14 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                               std::vector<std::unique_ptr<RenderTexture>>& outTex,
                               std::vector<std::unique_ptr<RenderTextureView>>& outView) -> bool {
         if (srcTexs.empty()) return true;
-        auto mapFmt = [](uint32_t f) -> RenderFormat {
+        auto mapFmt = [](uint32_t f, uint32_t is_signed) -> RenderFormat {
+            const bool sgn = is_signed && !NhlBc5NoSnorm();
             switch (f) {
                 case hc::kTexBC1: return RenderFormat::BC1_UNORM;
                 case hc::kTexBC2: return RenderFormat::BC2_UNORM;
                 case hc::kTexBC3: return RenderFormat::BC3_UNORM;
-                case hc::kTexBC5: return RenderFormat::BC5_UNORM;  // C-5g: k_DXN normal maps
+                // C-5j: honor the guest TextureSign — a signed BC5/k_DXN binding needs a SNORM view.
+                case hc::kTexBC5: return sgn ? RenderFormat::BC5_SNORM : RenderFormat::BC5_UNORM;
                 case hc::kTexR16: return RenderFormat::R16_UNORM;  // C-5h: k_16 data/mask map
                 case hc::kTexRGBA32F: return RenderFormat::R32G32B32A32_FLOAT;  // C-5d.3 bone palette
                 default: return RenderFormat::R8G8B8A8_UNORM;
@@ -880,7 +935,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         std::vector<std::unique_ptr<RenderBuffer>> stagings;
         up->begin();
         for (auto& t : srcTexs) {
-            const RenderFormat rf = mapFmt(t.desc.tex_format);
+            const RenderFormat rf = mapFmt(t.desc.tex_format, t.desc.is_signed);
             // C-5g: a CUBE binding (array_layers==6) must be a real cube texture+view, else Vulkan
             // samples our 2D placeholder as garbage and the cube-alpha material term drops the number.
             const bool isCube = t.desc.array_layers == 6;
@@ -891,7 +946,24 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                       RenderTextureFlag::CUBE))
                 : c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
             auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.desc.data_bytes ? t.desc.data_bytes : 4u));
-            if (staging && t.desc.data_bytes) { void* p = staging->map(); std::memcpy(p, t.data, t.desc.data_bytes); staging->unmap(); }
+            if (staging && t.desc.data_bytes) {
+                void* p = staging->map();
+                std::memcpy(p, t.data, t.desc.data_bytes);
+                // DIAGNOSTIC: NHL_HIGHCUT_C5_CUBE=R,G,B overwrites cube faces with a flat test color, to
+                // confirm whether the (currently neutral-stubbed) env reflection cube drives a material's
+                // shading. If the jersey/equipment lights up when this is bright, the cube is the missing
+                // lighting input and the real fix is untiling its 6 faces from guest RAM (capture-side).
+                static const bool cubeOverride = std::getenv("NHL_HIGHCUT_C5_CUBE") != nullptr;
+                if (isCube && cubeOverride && t.desc.tex_format == hc::kTexRGBA8) {
+                    int cr = 200, cg = 200, cb = 200;
+                    if (const char* s = std::getenv("NHL_HIGHCUT_C5_CUBE")) std::sscanf(s, "%d,%d,%d", &cr, &cg, &cb);
+                    uint8_t* bp = static_cast<uint8_t*>(p);
+                    for (uint32_t o = 0; o + 4 <= t.desc.data_bytes; o += 4) {
+                        bp[o + 0] = uint8_t(cr); bp[o + 1] = uint8_t(cg); bp[o + 2] = uint8_t(cb); bp[o + 3] = 255;
+                    }
+                }
+                staging->unmap();
+            }
             if (tex && staging) {
                 up->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
                 // One PlacedFootprint per face/layer; faces are concatenated tight in the blob (the CP
@@ -1105,6 +1177,12 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     return true;
 }
 
+// Defined below LoadC5Frames; forward-declared so LoadC5Frames can call them (defaults live on the
+// definitions). GetOrCreateSurfaceRT lazily creates a per-surface offscreen RT; LoadResolveGraph reads
+// the C-5d.3 resolve sidecar.
+PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key, uint32_t w, uint32_t h);
+void LoadResolveGraph(PlumeCtx& c);
+
 // C-5a: load the captured frame (highcut_frame.count -> highcut_frame_0..N-1.bin) into renderable
 // draws, once. Each file is a self-contained v3 packet.
 void LoadC5Frames(PlumeCtx& c) {
@@ -1114,6 +1192,9 @@ void LoadC5Frames(PlumeCtx& c) {
         std::fclose(cf);
     }
     if (!count) { REXLOG_INFO("[highcut-C5] no highcut_frame.count — run _c5dump.ps1 first"); return; }
+    // C-5d.3: load the resolve graph BEFORE building draws, so BuildRenderableDraw can flag the PS
+    // texture slots that sample a resolve dest (host-copy bindings) as it parses each packet.
+    LoadResolveGraph(c);
     uint32_t built = 0, skipped = 0;
     for (uint32_t i = 0; i < count; ++i) {
         char path[64];
@@ -1159,6 +1240,11 @@ void LoadC5Frames(PlumeCtx& c) {
         if (d.textured) ++keyTexCounts[k];
         const uint64_t area = uint64_t(d.vpW > 0 ? d.vpW : 0) * uint64_t(d.vpH > 0 ? d.vpH : 0);
         if (area > keyMaxVpArea[k]) keyMaxVpArea[k] = area;
+        // C-5d.3: a surface's logical size = the largest per-draw viewport it carries (the surface is
+        // rendered into an offscreen RT of this size so a host-copy consumer's [0,1] UV maps to it).
+        auto& dim = c.surfaceDims[k];
+        dim.first = std::max(dim.first, uint32_t(d.vpW > 0 ? d.vpW : 0));
+        dim.second = std::max(dim.second, uint32_t(d.vpH > 0 ? d.vpH : 0));
     }
     uint64_t bestKey = 0, bestArea = 0; uint32_t bestTex = 0, bestN = 0;
     for (const auto& kv : keyCounts) {
@@ -1195,17 +1281,57 @@ void LoadC5Frames(PlumeCtx& c) {
         REXLOG_INFO("[highcut-C5d]   surface depth={} pitch={} msaa={} -> {} draws ({} textured) ({})",
                     unkDepth(kv.first), unkPitch(kv.first), unkMsaa(kv.first), kv.second,
                     keyTexCounts[kv.first], kv.first == c.c5PrimaryKey ? "PRIMARY -> swapchain" : "offscreen RT");
+
+    // C-5d.3 "Resolve = host copy": for every draw that samples a resolve dest, create the SOURCE
+    // surface's offscreen RT (sized to that surface) and re-point the draw's set3 slot at the source
+    // RT's sampleable color/depth view. The render loop renders these source surfaces before the
+    // primary pass and barriers them to SHADER_READ, so the consumer samples our rendered content.
+    // Gated NHL_HIGHCUT_C5_COMPOSITE (opt-in): off => the known-good primary-only path is unchanged.
+    // NHL_HIGHCUT_C5_COMPOSITE: unset=off; "depth"=only depth (shadow) rebinds; "color"=only color
+    // (reflection/RTT) rebinds; any other value (e.g. "1")=both. The depth/color split isolates which
+    // resolve class causes an artifact (depth→self-shadow, color→reflections).
+    const char* compEnv = std::getenv("NHL_HIGHCUT_C5_COMPOSITE");
+    if (!compEnv) return;
+    const bool wantDepth = std::strcmp(compEnv, "color") != 0;
+    const bool wantColor = std::strcmp(compEnv, "depth") != 0;
+    uint32_t reboundColor = 0, reboundDepth = 0, deferred = 0, skippedClass = 0;
+    std::unordered_set<uint64_t> sampledSeen;
+    for (auto& d : c.c5draws) {
+        for (const auto& hb : d.hostCopy) {
+            // The HUD / self-sampling case (source == the primary swapchain surface) has no offscreen RT
+            // and needs mid-pass snapshot ordering — defer it to the HUD step.
+            if (hb.srcKey == c.c5PrimaryKey) { ++deferred; continue; }
+            if (hb.isDepth ? !wantDepth : !wantColor) { ++skippedClass; continue; }
+            auto dim = c.surfaceDims.count(hb.srcKey) ? c.surfaceDims[hb.srcKey] : std::make_pair(0u, 0u);
+            PlumeCtx::SurfaceRT* rt = GetOrCreateSurfaceRT(c, hb.srcKey, dim.first, dim.second);
+            if (!rt || !d.set3) continue;
+            if (!sampledSeen.count(hb.srcKey)) { sampledSeen.insert(hb.srcKey); c.sampledSrcOrder.push_back(hb.srcKey); }
+            if (hb.isDepth) {
+                d.set3->setTexture(hb.slot, rt->depth.get(), RenderTextureLayout::SHADER_READ, rt->depthSRV.get());
+                ++reboundDepth;
+            } else {
+                d.set3->setTexture(hb.slot, rt->color.get(), RenderTextureLayout::SHADER_READ, rt->colorSRV.get());
+                ++reboundColor;
+            }
+        }
+    }
+    REXLOG_INFO("[highcut-C5d3] composite mode='{}': {} source surfaces; re-pointed {} color + {} depth "
+                "bindings ({} deferred primary-source/HUD, {} skipped by mode)", compEnv,
+                uint32_t(c.sampledSrcOrder.size()), reboundColor, reboundDepth, deferred, skippedClass);
 }
 
 // C-5d.2: lazily create + cache the offscreen color+depth+stencil RT for a NON-primary guest surface.
 // Sized to the swapchain (the draws' ndc already fills clip space regardless of the guest surface
 // size, and per-draw scissors are in swapchain coords). Color=kSwapFormat, depth=kDepthFormat at 1X so
 // it stays renderpass-compatible with the per-draw pipelines (which declare exactly those formats).
-PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key) {
+PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key, uint32_t w = 0, uint32_t h = 0) {
     auto it = c.c5surfaces.find(key);
     if (it != c.c5surfaces.end()) return &it->second;
-    const uint32_t w = c.swap->getWidth(), h = c.swap->getHeight();
+    // Size to the GUEST surface when known (so a consumer sampling [0,1] reads the full rendered
+    // content), else fall back to the swapchain size (legacy isolation-only behavior).
+    if (!w || !h) { w = c.swap->getWidth(); h = c.swap->getHeight(); }
     PlumeCtx::SurfaceRT s;
+    s.w = w; s.h = h;
     s.color = c.device->createTexture(RenderTextureDesc::ColorTarget(w, h, kSwapFormat));
     s.depth = c.device->createTexture(RenderTextureDesc::DepthTarget(w, h, kDepthFormat));
     if (!s.color || !s.depth) { REXLOG_ERROR("[highcut-C5d] offscreen surface RT create failed"); return nullptr; }
@@ -1216,8 +1342,38 @@ PlumeCtx::SurfaceRT* GetOrCreateSurfaceRT(PlumeCtx& c, uint64_t key) {
     fd.depthAttachment = s.depth.get();
     s.fb = c.device->createFramebuffer(fd);
     if (!s.fb) { REXLOG_ERROR("[highcut-C5d] offscreen surface framebuffer create failed"); return nullptr; }
+    // C-5d.3: sampleable views so a host-copy consumer can bind this surface as a texture. The view
+    // aspect is derived from the texture flags (color vs depth) by plume; the depth view samples the
+    // depth aspect of D32_FLOAT_S8_UINT (shadow/depth maps). identity component mapping.
+    s.colorSRV = s.color->createTextureView(RenderTextureViewDesc::Texture2D(kSwapFormat));
+    s.depthSRV = s.depth->createTextureView(RenderTextureViewDesc::Texture2D(kDepthFormat));
     auto res = c.c5surfaces.emplace(key, std::move(s));
     return &res.first->second;
+}
+
+// C-5d.3: load the guest EDRAM resolve graph (highcut_resolves.bin) and build dest_addr -> source
+// surface. Last writer wins for a re-resolved dest (file order == capture stream order); the source
+// SurfaceKey is what we'll render offscreen and host-copy from.
+void LoadResolveGraph(PlumeCtx& c) {
+    namespace hc = nhl::highcut;
+    std::vector<uint8_t> buf;
+    if (FILE* f = std::fopen("highcut_resolves.bin", "rb")) {
+        std::fseek(f, 0, SEEK_END); long sz = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+        if (sz > 0) { buf.resize(size_t(sz)); if (std::fread(buf.data(), 1, size_t(sz), f) != size_t(sz)) buf.clear(); }
+        std::fclose(f);
+    }
+    if (buf.size() < 8) { REXLOG_INFO("[highcut-C5d3] no highcut_resolves.bin — composition has no resolve graph"); return; }
+    uint32_t magic = 0, count = 0;
+    std::memcpy(&magic, &buf[0], 4); std::memcpy(&count, &buf[4], 4);
+    if (magic != hc::kResolveSidecarMagic) { REXLOG_INFO("[highcut-C5d3] highcut_resolves.bin bad magic"); return; }
+    size_t off = 8;
+    for (uint32_t i = 0; i < count && off + sizeof(hc::ResolveMarker) <= buf.size(); ++i, off += sizeof(hc::ResolveMarker)) {
+        hc::ResolveMarker m{};
+        std::memcpy(&m, &buf[off], sizeof(m));
+        const uint64_t srcKey = SurfaceKey(m.src_depth_base, m.src_pitch, m.src_msaa);
+        c.resolveMap[m.dest_addr] = PlumeCtx::ResolveEntry{srcKey, m.is_depth != 0};
+    }
+    REXLOG_INFO("[highcut-C5d3] loaded {} resolve dest mappings from {} markers", uint32_t(c.resolveMap.size()), count);
 }
 
 void RenderClear(PlumeCtx& c) {
@@ -1512,8 +1668,9 @@ void RenderClear(PlumeCtx& c) {
         // Bind+draw one renderable draw into the currently-bound framebuffer (its own pipeline carries
         // blend/depth/stencil/cull + topology). The per-draw scissor is in swapchain coords; offscreen
         // RTs are swapchain-sized so it stays in range.
-        auto renderDraw = [&](RenderableDraw& d) {
-            if (no_scissor) c.cmd->setScissors(RenderRect(0, 0, kWidth, kHeight));
+        auto renderDraw = [&](RenderableDraw& d, const RenderRect* scOverride = nullptr) {
+            if (scOverride) c.cmd->setScissors(*scOverride);  // composite source pass: full-surface clip
+            else if (no_scissor) c.cmd->setScissors(RenderRect(0, 0, kWidth, kHeight));
             else c.cmd->setScissors(RenderRect(d.scLeft, d.scTop, d.scRight, d.scBottom));
             c.cmd->setGraphicsPipelineLayout(d.layout.get());
             c.cmd->setPipeline(d.pipeline.get());
@@ -1534,6 +1691,47 @@ void RenderClear(PlumeCtx& c) {
         auto isPrimary = [&](const RenderableDraw& d) {
             return no_split || SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa) == c.c5PrimaryKey;
         };
+
+        // C-5d.3 "Resolve = host copy": render each SAMPLED source surface (shadow map, reflection RTT)
+        // into its own correctly-sized offscreen RT, then barrier it to SHADER_READ. The primary draws
+        // that sample its resolve dest were re-pointed (at load) at this RT's color/depth view, so they
+        // now read our rendered content. Render order = first-seen sampling order; each source surface
+        // is a full pass (own viewport+clear). Gated NHL_HIGHCUT_C5_COMPOSITE; needs -Full (the source
+        // surface's own draws must replay, so don't isolate a single consumer draw). The HUD / self-
+        // sampling case (source == primary) is deferred and handled in the HUD step.
+        static const bool composite = std::getenv("NHL_HIGHCUT_C5_COMPOSITE") != nullptr;
+        if (composite && !c.sampledSrcOrder.empty()) {
+            for (uint64_t k : c.sampledSrcOrder) {
+                PlumeCtx::SurfaceRT* s = GetOrCreateSurfaceRT(c, k);  // created at load with guest dims
+                if (!s) continue;
+                const RenderTextureBarrier bb[] = {
+                    RenderTextureBarrier(s->color.get(), RenderTextureLayout::COLOR_WRITE),
+                    RenderTextureBarrier(s->depth.get(), RenderTextureLayout::DEPTH_WRITE),
+                };
+                c.cmd->barriers(RenderBarrierStage::GRAPHICS, bb, 2);
+                c.cmd->setFramebuffer(s->fb.get());
+                c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(s->w), float(s->h)));
+                const RenderRect full(0, 0, int32_t(s->w), int32_t(s->h));
+                c.cmd->setScissors(full);
+                c.cmd->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f));
+                c.cmd->clearDepthStencil(true, true, 1.0f, 0);
+                for (uint32_t i = 0; i < c.c5draws.size(); ++i) {
+                    if (!inWindow(i)) continue;
+                    auto& d = c.c5draws[i];
+                    if (SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa) == k) renderDraw(d, &full);
+                }
+                const RenderTextureBarrier rb[] = {
+                    RenderTextureBarrier(s->color.get(), RenderTextureLayout::SHADER_READ),
+                    RenderTextureBarrier(s->depth.get(), RenderTextureLayout::SHADER_READ),
+                };
+                c.cmd->barriers(RenderBarrierStage::GRAPHICS, rb, 2);
+            }
+            // Re-bind the swapchain (still COLOR_WRITE/DEPTH_WRITE from RenderClear; its earlier clear is
+            // LOADed) for the primary pass, which now samples the source RTs via the re-pointed set3.
+            c.cmd->setFramebuffer(c.fbs[idx].get());
+            c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
+            c.cmd->setScissors(RenderRect(0, 0, w, h));
+        }
 
         // C-5d.2 (opt-in via NHL_HIGHCUT_C5_OFFSCREEN): render each NON-primary surface's draws into its
         // own offscreen RT (grouped by surface, capture order preserved within a surface). Each is its
