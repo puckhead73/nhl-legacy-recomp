@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -948,10 +949,11 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16;
     // C-5c: size the shared-memory (vertex) SSBO to THIS draw's data, not a fixed 64K. 3D meshes
     // pack multiple vertex streams (position/normal/uv/...) and can be hundreds of KB — a fixed 64K
-    // truncated them, dropping the tail vertices to garbage -> exploded geometry. Floor 64K (small
-    // draws / safety), cap 16MB (matches the capture cap).
+    // truncated them, dropping the tail vertices to garbage -> exploded geometry. Cap 16MB (matches the
+    // capture cap). Floor only 4K (was 64K): a dense frame creates one of these per draw, so a 64K floor
+    // over-allocated thousands of small draws to 64K each — wasted alloc time + memory at 4000+ draws.
     const uint64_t kShared = std::min<uint64_t>(
-        std::max<uint64_t>(hdr.shared_bytes, 1u << 16), 16u * 0x100000u);
+        std::max<uint64_t>(hdr.shared_bytes, 1u << 12), 16u * 0x100000u);
     auto mkUbo = [&](uint64_t sz, const uint8_t* src, uint32_t srcN) {
         auto b = c.device->createBuffer(RenderBufferDesc::UploadBuffer(sz, RenderBufferFlag::CONSTANT));
         if (b) {
@@ -1349,6 +1351,11 @@ void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraw
     if (live) ParseResolveGraphBytes(c, *liveResolves);
     else LoadResolveGraph(c);
     uint32_t built = 0, skipped = 0;
+    // Consumer-rebuild timing: how long it takes to rebuild ALL draws' renderables (the rate the plume
+    // WINDOW can update at). With shaders/textures/pipelines cached by-id, this is now per-draw buffer +
+    // descriptor-set creation. NHL_HIGHCUT_PROFILE gates the log.
+    static const bool c5_profile = std::getenv("NHL_HIGHCUT_PROFILE") != nullptr;
+    const auto rebuildT0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < count; ++i) {
         std::vector<uint8_t> diskBytes;
         const std::vector<uint8_t>* bytes = nullptr;
@@ -1370,6 +1377,12 @@ void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraw
         RenderableDraw d;
         if (BuildRenderableDraw(c, *bytes, d, i)) { c.c5draws.push_back(std::move(d)); ++built; }
         else ++skipped;
+    }
+    if (c5_profile) {
+        const double ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+                              std::chrono::steady_clock::now() - rebuildT0).count();
+        REXLOG_INFO("[highcut-perf] consumer rebuild: {} draws in {:.0f}ms ({:.2f}ms/draw) — plume window "
+                    "update rate", built, ms, built ? ms / built : 0.0);
     }
     REXLOG_INFO("[highcut-C5{}] loaded {} renderable draws ({} skipped) of {} {} owned draws",
                 live ? "-LIVE" : "", built, skipped, count, live ? "live-fed" : "captured");

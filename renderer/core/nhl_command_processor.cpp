@@ -1672,11 +1672,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // restores the old path for A/B.
   static const bool skip_owned_render = (std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr) &&
                                         (std::getenv("NHL_HIGHCUT_KEEP_OWNED_DRAW") == nullptr);
-  static double s_tXlat = 0.0, s_tUntile = 0.0, s_tPacket = 0.0;
+  static double s_tXlat = 0.0, s_tUntile = 0.0, s_tPacket = 0.0, s_tTotal = 0.0;
   using hc_clock = std::chrono::steady_clock;
   auto hc_secs = [](hc_clock::time_point a, hc_clock::time_point b) {
     return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
   };
+  // Total per-draw producer time; "other" = total - (translate+untile+packet) reveals the unbucketed
+  // setup cost (RT-cache Update, viewport, vertex-blob copy). Accumulated at the skip_owned_render return.
+  const auto _hc_t0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
   const auto _hc_tx0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
@@ -2422,7 +2425,10 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         mix((uint64_t(tf.tiled) << 40) | (uint64_t(tf.endianness) << 32) |
             (uint64_t(expand_r8 ? 1u : 0u) << 16) | cubeLayers);
         mix(uint32_t(tf.swizzle));
-        const size_t prefixN = std::min<size_t>(4096, faceBytes * cubeLayers);
+        // Hash a SMALL source prefix (the per-draw change detector). 512B keeps the per-draw hit cost low
+        // (this re-runs for every texture every frame — was ~0.17ms/draw at 4KB -> ~271ms for a 1431-draw
+        // frame) while still catching dynamic content (e.g. the skinning bone matrices live at the start).
+        const size_t prefixN = std::min<size_t>(512, faceBytes * cubeLayers);
         for (size_t i = 0; i < prefixN; ++i) { h ^= guest[i]; h *= 1099511628211ull; }
         texKey = h;
         td.tex_id = texKey;  // by-ID: consumer caches the uploaded texture+view by this
@@ -2731,18 +2737,21 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           {
             static uint32_t s_fpsFrames = 0;
             static auto s_fpsT0 = std::chrono::steady_clock::now();
-            static double s_prevXlat = 0.0, s_prevUntile = 0.0, s_prevPacket = 0.0;  // per-frame baseline
+            static double s_prevXlat = 0.0, s_prevUntile = 0.0, s_prevPacket = 0.0, s_prevTotal = 0.0;
             static double s_winXlat = 0.0, s_winUntile = 0.0, s_winPacket = 0.0;     // window accumulator
             if (hc_profile) {
               const double fX = s_tXlat - s_prevXlat, fU = s_tUntile - s_prevUntile,
-                           fP = s_tPacket - s_prevPacket;
-              s_prevXlat = s_tXlat; s_prevUntile = s_tUntile; s_prevPacket = s_tPacket;
+                           fP = s_tPacket - s_prevPacket, fT = s_tTotal - s_prevTotal;
+              s_prevXlat = s_tXlat; s_prevUntile = s_tUntile; s_prevPacket = s_tPacket; s_prevTotal = s_tTotal;
               s_winXlat += fX; s_winUntile += fU; s_winPacket += fP;
-              // Per-frame breakdown for SLOW frames: a ~30s dense gameplay frame never reaches the 60-frame
-              // window (= 30 min at 30s/frame), so log its bucket split immediately. >250ms => "slow".
-              if ((fX + fU + fP) * 1000.0 > 250.0)
-                REXLOG_INFO("[highcut-perf] SLOW frame: {} draws  translate={:.0f}ms untile={:.0f}ms "
-                            "packet={:.0f}ms", highcut_capture_idx_, fX * 1000.0, fU * 1000.0, fP * 1000.0);
+              // Per-frame breakdown for SLOW frames: a slow dense gameplay frame never reaches the 60-frame
+              // window, so log its bucket split immediately. "other" = total - the three buckets (the
+              // unbucketed setup: RT-cache Update, viewport, vertex-blob copy). >250ms => "slow".
+              if (fT * 1000.0 > 250.0)
+                REXLOG_INFO("[highcut-perf] SLOW frame: {} draws  total={:.0f}ms (translate={:.0f} "
+                            "untile={:.0f} packet={:.0f} other={:.0f})", highcut_capture_idx_, fT * 1000.0,
+                            fX * 1000.0, fU * 1000.0, fP * 1000.0,
+                            (fT - fX - fU - fP) * 1000.0);
             }
             if (++s_fpsFrames >= 60) {
               const auto now = std::chrono::steady_clock::now();
@@ -2893,7 +2902,11 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // In high-cut live mode the SDK D3D12 owned-draw below is not what's displayed, so skip it entirely —
   // this is what removes the per-draw residency RequestRange thrash + DXBC translate + D3D12 submit that
   // froze dense gameplay. Everything from here to the end of this function is owned-draw rendering.
-  if (skip_owned_render) { ++beta_takeover_rendered_; return; }
+  if (skip_owned_render) {
+    if (hc_profile) s_tTotal += hc_secs(_hc_t0, hc_clock::now());
+    ++beta_takeover_rendered_;
+    return;
+  }
 
   D3D12_VIEWPORT vp{};
   vp.MinDepth = vpi.z_min;
