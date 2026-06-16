@@ -233,6 +233,13 @@ struct RenderableDraw {
     // sampleable color/depth view, so the draw samples our rendered shadow map / reflection RTT.
     struct HostCopyBind { uint32_t slot; uint64_t srcKey; bool isDepth; };
     std::vector<HostCopyBind> hostCopy;
+    // C-5n HUD overlay: a draw that samples the full-screen scene COLOR resolve (the game's final
+    // composite/grade pass re-reads the rendered scene to tone-map it). `sceneGradeSkip` marks the
+    // OPAQUE (One/Zero) ones that would overwrite our clean primary render — we skip those and keep our
+    // scene, but still replay the rest of the overlay surface (stencil masks + the HUD elements:
+    // scorebug, change-lines) so the HUD composites on top.
+    bool samplesFullscreenSceneColor = false;
+    bool sceneGradeSkip = false;
 };
 
 // C-5d.2: pack the v6 surface tuple into one key. color_base is always 0 in this title, so it's
@@ -869,6 +876,20 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         if (!capturedStub) continue;  // only host-copy genuinely-stubbed bindings (depth/shadow)
         d.hostCopy.push_back({i, rit->second.srcKey, rit->second.isDepth});
     }
+    // C-5n: flag a draw that samples the FULL-SCREEN scene COLOR resolve (the composite/grade pass).
+    for (uint32_t i = 0; i < hdr.texture_count && i < texs.size(); ++i) {
+        const auto& td = texs[i].desc;
+        auto rit = c.resolveMap.find(td.fetch_base_addr);
+        if (rit == c.resolveMap.end() || rit->second.isDepth) continue;   // color resolves only
+        if (td.array_layers != 1 || td.width < 960) continue;             // full-screen 2D only
+        d.samplesFullscreenSceneColor = true;
+    }
+    // The OPAQUE (One/Zero copy) scene-samplers are the grade pass that re-writes the whole frame; the
+    // HUD overlay must skip them so our clean primary render survives. Alpha-blended overlay draws and
+    // stencil-mask setups (which sample the scene but are masked/discarded) are kept.
+    d.sceneGradeSkip = d.samplesFullscreenSceneColor &&
+                       hdr.blend_src == nhl::highcut::kBlendOne &&
+                       hdr.blend_dst == nhl::highcut::kBlendZero;
 
     constexpr uint64_t kSys = 2048, kBool = 256, kFetch = 768, kFloat = 256 * 16;
     // C-5c: size the shared-memory (vertex) SSBO to THIS draw's data, not a fixed 64K. 3D meshes
@@ -1782,6 +1803,46 @@ void RenderClear(PlumeCtx& c) {
             if (!inWindow(i)) continue;
             if (!isPrimary(c.c5draws[i])) continue;  // non-primary went to its offscreen RT (or skipped)
             renderDraw(c.c5draws[i]);
+        }
+
+        // C-5n HUD overlay (default on; opt out NHL_HIGHCUT_NO_HUD). The game's final composite/HUD pass
+        // renders to a SEPARATE full-res surface that we don't present as primary (presenting it samples
+        // the scene from guest RAM and degrades it vs our re-render). Instead, replay that overlay
+        // surface's HUD elements (scorebug, change-lines: stencil-masked quads over small UI atlases) ON
+        // TOP of our clean swapchain scene, SKIPPING the opaque scene-grade draws (sceneGradeSkip) that
+        // would overwrite it. Overlay surface(s) = any NON-primary surface containing a full-screen
+        // scene-color sampler (the composite pass).
+        static const bool hud_overlay = std::getenv("NHL_HIGHCUT_NO_HUD") == nullptr;
+        if (hud_overlay) {
+            std::unordered_set<uint64_t> hudKeys;
+            for (const auto& d : c.c5draws) {
+                if (!d.samplesFullscreenSceneColor) continue;
+                const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
+                if (k != c.c5PrimaryKey) hudKeys.insert(k);
+            }
+            if (!hudKeys.empty()) {
+                c.cmd->setFramebuffer(c.fbs[idx].get());
+                c.cmd->setViewports(RenderViewport(0.0f, 0.0f, float(w), float(h)));
+                // Fresh stencil for the HUD pass (its masks were authored on the guest overlay surface,
+                // not our swapchain). Keep color (our scene) + depth.
+                c.cmd->clearDepthStencil(false, true, 1.0f, 0);
+                uint32_t hudDrawn = 0, hudSkipped = 0;
+                for (uint32_t i = 0; i < c.c5draws.size(); ++i) {
+                    if (!inWindow(i)) continue;
+                    auto& d = c.c5draws[i];
+                    const uint64_t k = SurfaceKey(d.surfDepthBase, d.surfPitch, d.surfMsaa);
+                    if (!hudKeys.count(k)) continue;                  // only the overlay/HUD surface(s)
+                    if (d.sceneGradeSkip) { ++hudSkipped; continue; } // keep our clean scene
+                    renderDraw(d);
+                    ++hudDrawn;
+                }
+                static bool hudLogged = false;
+                if (!hudLogged) {
+                    hudLogged = true;
+                    REXLOG_INFO("[highcut-C5n] HUD overlay: {} surface(s), drew {} overlay draws, "
+                                "skipped {} scene-grade", uint32_t(hudKeys.size()), hudDrawn, hudSkipped);
+                }
+            }
         }
     }
 
