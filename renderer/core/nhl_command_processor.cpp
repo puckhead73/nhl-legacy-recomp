@@ -2285,14 +2285,19 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // time (measured via NHL_HIGHCUT_PROFILE). Cache the untiled blob + its derived desc fields keyed by
     // (texture identity + a cheap 4 KB source-prefix hash that detects content changes). A byte budget
     // bounds memory: when exceeded the cache is cleared (one frame re-untiles, then steady-state hits).
+    // Keyed by ADDRESS+shape (NOT content) so per-frame-changing textures (skinning bone palettes) reuse
+    // ONE slot instead of accumulating a new entry every frame — that growth used to blow the byte budget
+    // and force a full re-untile of the static textures too (the gameplay untile≈200ms thrash). contentHash
+    // (512B prefix) is stored to detect when a slot's data changed (dynamic) vs is reusable (static).
     struct HcTexCacheEntry {
       std::vector<uint8_t> blob;
       uint32_t width = 0, height = 0, tex_format = 0, row_pitch_bytes = 0, data_bytes = 0,
                array_layers = 0, swizzle = 0;
+      uint64_t contentHash = 0;
     };
     static std::unordered_map<uint64_t, HcTexCacheEntry> s_texCache;
     static size_t s_texCacheBytes = 0;
-    constexpr size_t kTexCacheBudget = 256u * 1024u * 1024u;  // 256 MB of untiled blobs
+    constexpr size_t kTexCacheBudget = 512u * 1024u * 1024u;  // 512 MB safety cap (rarely hit now)
     // C-4/C-5d.3: untile each texture binding (PS or VS) into a LINEAR blob + a TexturePacketDesc.
     // Factored into a lambda so the SAME path serves PS textures (set3) and the VS skinning bone
     // palette (set2). Xenos textures are tiled in 32x32-block tiles; GetTiledOffset2D gives the
@@ -2415,31 +2420,32 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         sliceStride = gl.base.array_slice_stride_bytes;
         if (!sliceStride) { emitNeutralCube("zero slice stride"); continue; }  // would alias all 6 faces
       }
-      // Untile-cache lookup: hash texture identity + a 4 KB source prefix (cheap change detector). On a
-      // hit, reuse the cached untiled blob + desc fields and skip the whole gather/endian/expand below.
-      uint64_t texKey;
+      // Untile-cache lookup. KEY = address+shape (bounded: one slot per texture, reused every frame even
+      // for dynamic content). contentHash (512B prefix) decides reuse-vs-redecode within that slot. td.tex_id
+      // = addrKey^contentHash so the CONSUMER's id changes only when the content changes (static -> cache
+      // hit; dynamic -> re-upload), without the producer cache growing.
+      uint64_t addrKey, contentHash;
       {
-        uint64_t h = 1469598103934665603ull;
-        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        uint64_t a = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { a ^= v; a *= 1099511628211ull; };
         mix(tex_base); mix(uint32_t(fmt)); mix((uint64_t(width) << 32) | height);
         mix((uint64_t(tf.tiled) << 40) | (uint64_t(tf.endianness) << 32) |
             (uint64_t(expand_r8 ? 1u : 0u) << 16) | cubeLayers);
         mix(uint32_t(tf.swizzle));
-        // Hash a SMALL source prefix (the per-draw change detector). 512B keeps the per-draw hit cost low
-        // (this re-runs for every texture every frame — was ~0.17ms/draw at 4KB -> ~271ms for a 1431-draw
-        // frame) while still catching dynamic content (e.g. the skinning bone matrices live at the start).
+        addrKey = a;
+        uint64_t ch = 1469598103934665603ull;
         const size_t prefixN = std::min<size_t>(512, faceBytes * cubeLayers);
-        for (size_t i = 0; i < prefixN; ++i) { h ^= guest[i]; h *= 1099511628211ull; }
-        texKey = h;
-        td.tex_id = texKey;  // by-ID: consumer caches the uploaded texture+view by this
-        auto it = s_texCache.find(texKey);
-        if (it != s_texCache.end()) {
+        for (size_t i = 0; i < prefixN; ++i) { ch ^= guest[i]; ch *= 1099511628211ull; }
+        contentHash = ch;
+        td.tex_id = addrKey ^ contentHash;  // consumer id: changes iff content changes
+        auto it = s_texCache.find(addrKey);
+        if (it != s_texCache.end() && it->second.contentHash == contentHash) {
           const auto& e = it->second;
           td.width = e.width; td.height = e.height; td.tex_format = e.tex_format;
           td.row_pitch_bytes = e.row_pitch_bytes; td.data_bytes = e.data_bytes;
           td.array_layers = e.array_layers; td.swizzle = e.swizzle;
           out_descs.push_back(td);
-          out_blobs.push_back(e.blob);  // linear copy — far cheaper than re-untiling
+          out_blobs.push_back(e.blob);  // static hit — reuse the untiled blob, skip the gather
           continue;
         }
       }
@@ -2505,11 +2511,17 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                   slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
                   pitch_blocks, td.data_bytes, td.is_signed, cubeLayers, tex_base,
                   uint32_t(tf.mip_min_level), uint32_t(tf.mip_max_level), uint32_t(tf.packed_mips));
-      // Store the freshly untiled blob in the cache (bounded by a byte budget — clear when exceeded).
-      if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; }
-      s_texCacheBytes += blob.size();
-      s_texCache[texKey] = HcTexCacheEntry{blob, td.width, td.height, td.tex_format,
-                                           td.row_pitch_bytes, td.data_bytes, td.array_layers, td.swizzle};
+      // Store/overwrite this address slot (bounded by address count — dynamic content reuses the slot, so
+      // no growth). The byte counter tracks net size when a slot's blob size changes; a generous safety cap
+      // clears if the working set of distinct addresses is genuinely huge.
+      {
+        auto it = s_texCache.find(addrKey);
+        if (it != s_texCache.end()) s_texCacheBytes -= it->second.blob.size();  // replacing this slot
+        if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; }
+        s_texCacheBytes += blob.size();
+        s_texCache[addrKey] = HcTexCacheEntry{blob, td.width, td.height, td.tex_format, td.row_pitch_bytes,
+                                              td.data_bytes, td.array_layers, td.swizzle, contentHash};
+      }
       out_descs.push_back(td); out_blobs.push_back(std::move(blob));
     }
     };  // untileBindings
