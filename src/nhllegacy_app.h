@@ -29,6 +29,16 @@
 #include <rex/ui/presenter.h>
 
 #include "renderer/core/nhl_graphics_system.h"
+// SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend
+// is a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips).
+// The header always installs; the implementation only links against an SDK built
+// with the flag ON. NHL_HAVE_VULKAN_BACKEND is defined by the build that links
+// such an SDK, gating both the include and the runtime NHL_VK_BACKEND env gate so
+// the default (D3D12-only) build stays link-clean.
+#ifdef NHL_HAVE_VULKAN_BACKEND
+#include <rex/graphics/vulkan/graphics_system.h>
+#include "renderer/core/nhl_vk_backend.h"
+#endif
 #include "tools/replay/src/image_dump.h"
 #include "tools/replay/src/xtr_player.h"
 #include "overall_weights_dump.h"
@@ -43,6 +53,12 @@ REXCVAR_DECLARE(bool, protect_zero);
 REXCVAR_DECLARE(bool, scribble_heap);
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+// Resolve readback: download EDRAM resolve results back to guest RAM so later
+// texture fetches see the resolved data (e.g. NHL Legacy's runtime-composited,
+// recolorable goalie/player equipment maps) instead of stale garbage. Shared
+// string cvar ("none"|"fast"|"full"); the beta D3D12 path used "full". The
+// Vulkan enable is vulkan_readback_resolve (already declared in <rex/graphics/flags.h>).
+REXCVAR_DECLARE(std::string, readback_resolve);
 // D3D12 render-target path: "rtv" (fast host path) vs "rov" (rasterizer-
 // ordered-views, accurate per-sample EDRAM — handles the in-game scene's
 // predicated tiling/overlapping resolves the rtv path renders black).
@@ -82,6 +98,43 @@ class NhllegacyApp : public rex::ReXApp {
     // SetupPresentation() set config.graphics to a stock D3D12GraphicsSystem
     // just before calling this hook; replace it with our subclass, which reuses
     // the SDK guest-GPU front-end and (for now) logs-and-delegates every draw.
+#ifdef NHL_HAVE_VULKAN_BACKEND
+    // SPIKE: opt-in env gate to drive the SDK's native Vulkan ROV/EDRAM backend
+    // instead of our D3D12 subclass. Phase A is the stock backend (no subclass) —
+    // does the recomp boot→menu→gameplay on Vulkan, and how fast? Default (unset)
+    // path is unchanged. NHL_VK_RT_PATH overrides the RT path ("rov"|"fsi").
+    if (std::getenv("NHL_VK_BACKEND")) {
+      // Our subclass (NhlVkGraphicsSystem) installs NhlVkCommandProcessor, which
+      // taps IssueSwap/IssueDraw for the [nhl-vk-fps] report. Forwards to the base
+      // Vulkan backend otherwise, so rendering matches the stock path.
+      config.graphics = std::make_unique<nhl::graphics::NhlVkGraphicsSystem>();
+      // NOTE: the Vulkan backend only honors "fsi" (Path::kPixelShaderInterlock —
+      // the real per-tile EDRAM path the in-game 3D scene needs). ANY other value
+      // (incl. "rov") falls through to kHostRenderTargets (== D3D12 "rtv"), which
+      // renders the in-game scene black/missing. So default to fsi, not rov.
+      const char* vk_rt = std::getenv("NHL_VK_RT_PATH");
+      REXCVAR_SET(render_target_path_vulkan, std::string(vk_rt ? vk_rt : "fsi"));
+      // Perf measurement wants the present rate uncapped: vsync is forced on below
+      // (console-pacing experiment) and would peg fps at the refresh rate, hiding
+      // both headroom and dense-scene drops. NHL_VK_NO_VSYNC=1 frees it.
+      if (std::getenv("NHL_VK_NO_VSYNC")) {
+        REXCVAR_SET(vsync, false);
+        REXLOG_INFO("[nhl-vk-spike] vsync disabled for perf measurement");
+      }
+      // Goalie/player equipment maps are runtime-composited via EDRAM resolves;
+      // without reading the resolve result back to guest RAM, later texture fetches
+      // sample stale garbage (green/striped pads). Mirror the beta D3D12 fix
+      // (readback_resolve=full + the backend enable) on Vulkan. NHL_VK_NO_READBACK
+      // disables it for A/B.
+      if (!std::getenv("NHL_VK_NO_READBACK")) {
+        REXCVAR_SET(readback_resolve, std::string("full"));
+        REXCVAR_SET(vulkan_readback_resolve, true);
+        REXLOG_INFO("[nhl-vk-spike] resolve readback enabled (readback_resolve=full)");
+      }
+      REXLOG_INFO("[nhl-vk-spike] Vulkan backend selected (render_target_path_vulkan={})",
+                  vk_rt ? vk_rt : "fsi");
+    } else
+#endif
     config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
     REXCVAR_SET(protect_zero, false);  // see comment at REXCVAR_DECLARE above
     // NHL Legacy reads heap fields it never wrote (sub_82705510 record walk);
@@ -89,8 +142,11 @@ class NhllegacyApp : public rex::ReXApp {
     REXCVAR_SET(scribble_heap, false);
     // Session-7 experiment: the FE script/Flash timeline runs ~5-6x slow with
     // the main loop unthrottled at ~125fps. Pace like a console (60Hz vsync)
-    // to test whether the dt divergence is pacing-coupled.
-    REXCVAR_SET(vsync, true);
+    // to test whether the dt divergence is pacing-coupled. (Skip when the Vulkan
+    // spike asked for uncapped present via NHL_VK_NO_VSYNC, set above.)
+    if (!std::getenv("NHL_VK_NO_VSYNC")) {
+      REXCVAR_SET(vsync, true);
+    }
     // Xenia warns "Texture fetch constant has 'invalid' type" on the boot
     // screens and renders anyway with this enabled; testing whether the
     // green flash/overlay artifacts come from skipped fetches.

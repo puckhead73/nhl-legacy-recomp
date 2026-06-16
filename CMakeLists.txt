@@ -67,6 +67,19 @@ endif()
 
 rexglue_setup_target(nhllegacy)
 
+# SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend is
+# a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips). When
+# CMAKE_PREFIX_PATH points at an SDK built with it ON, enable this to compile the
+# NHL_VK_BACKEND env gate (src/nhllegacy_app.h) and link the Vulkan graphics system.
+option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" OFF)
+if(NHLLEGACY_VULKAN_BACKEND)
+    target_compile_definitions(nhllegacy PRIVATE NHL_HAVE_VULKAN_BACKEND=1)
+    # Compiled ONLY in the Vulkan build dir — links the SDK's Vulkan backend symbols
+    # that the default (D3D12-only) SDK does not export.
+    target_sources(nhllegacy PRIVATE renderer/core/nhl_vk_backend.cpp)
+    message(STATUS "nhllegacy: Vulkan backend gate ENABLED (NHL_HAVE_VULKAN_BACKEND)")
+endif()
+
 # High-cut engine (H-2): vendored plume RHI (MIT, third_party/plume). Built as a
 # static lib in its own directory scope (C++17, its own backends) and linked into
 # nhllegacy so gpu/hooks/plume_present.cpp can drive an in-process plume swapchain

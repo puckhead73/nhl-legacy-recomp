@@ -1,0 +1,128 @@
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index c51ea54..cc070dd 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -33,7 +33,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
+     // prototyping stage (easier to do small granular updates with an
+     // incremental counter).
+-    static constexpr uint32_t kVersion = 12;
++    // Bumped to 14 for the NHL Legacy texture exp_adjust fix (read fetch-constant
++    // word 3, not word 4) in spirv_translator_fetch.cpp — invalidates old cached
++    // SPIR-V so the fix isn't masked by stale shader storage. (13 was a reverted
++    // cube experiment.) See docs/vulkan-migration-plan.md.
++    static constexpr uint32_t kVersion = 14;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..a3de031 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2029,11 +2029,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           }
+         }
+ 
+-        // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // Apply the exponent bias (exp_adjust) from bits 13:18 of fetch constant
++        // word 3. FIX: this previously read word 4, but word 4 bits 13:18 are part
++        // of lod_bias (dword_4 +12), NOT exp_adjust. Per xenos.h, exp_adjust lives
++        // at dword_3 +13 (and the DXBC translator reads word 3). Misreading word 4
++        // made any texture with a nonzero lod_bias — e.g. the NHL Legacy jersey
++        // name/number font atlas (lod_bias = -0.75) — sample at ~2^-12, blacking
++        // out names/numbers. Read word 3 to match hardware and the DXBC path.
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3 = builder_->createLoad(
++            builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_,
++                                        id_vector_temp_),
++            spv::NoPrecision);
++        spv::Id fetch_constant_word_3_signed =
++            builder_->createUnaryOp(spv::OpBitcast, type_int_, fetch_constant_word_3);
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index fc46bf8..471d3ef 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -313,10 +313,16 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kBestHostFormats[64
+     // k_16_16_MPEG_INTERLACED
+     {{kLoadShaderIndexUnknown}, {kLoadShaderIndexUnknown}, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
+     // k_DXN
+-    // VK_FORMAT_BC5_UNORM_BLOCK is optional.
++    // VK_FORMAT_BC5_UNORM_BLOCK / BC5_SNORM_BLOCK are optional. NHL Legacy binds
++    // SIGNED DXN normal maps for goalie/player equipment; without a signed host
++    // pair the guest-signed normal samples the UNORM view and never reconstructs
++    // to [-1,1] -> green speckle on equipment. Provide the BC5_SNORM signed pair
++    // (ported from high-cut C-5j; see docs/vulkan-migration-plan.md D1). A runtime
++    // guard below disables it if BC5_SNORM is unsupported on the host.
+     {{kLoadShaderIndex128bpb, VK_FORMAT_BC5_UNORM_BLOCK, true},
+-     {kLoadShaderIndexUnknown},
+-     xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
++     {kLoadShaderIndex128bpb, VK_FORMAT_BC5_SNORM_BLOCK, true},
++     xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG,
++     true},
+     // k_8_8_8_8_AS_16_16_16_16
+     {{kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_UNORM},
+      {kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_SNORM},
+@@ -2473,6 +2479,18 @@ bool VulkanTextureCache::Initialize() {
+     host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
+     host_format_dxn.format_unsigned.block_compressed = false;
+   }
++  // Signed BC5 for DXN equipment normal maps (NHL Legacy). BC5_SNORM is optional;
++  // if unsupported/unfilterable on this host, disable the signed pair so we fall
++  // back to UNORM sampling rather than binding an undefined format.
++  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_SNORM_BLOCK,
++                                          &format_properties);
++  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures ||
++      host_format_dxn.format_unsigned.format != VK_FORMAT_BC5_UNORM_BLOCK) {
++    host_format_dxn.format_signed.load_shader = kLoadShaderIndexUnknown;
++    host_format_dxn.format_signed.format = VK_FORMAT_UNDEFINED;
++    host_format_dxn.format_signed.block_compressed = false;
++    host_format_dxn.unsigned_signed_compatible = false;
++  }
+   HostFormatPair& host_format_dxt5a = host_formats_[uint32_t(xenos::TextureFormat::k_DXT5A)];
+   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
+   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
+@@ -2484,7 +2502,10 @@ bool VulkanTextureCache::Initialize() {
+   }
+   // Keep signed format support aligned with D3D12 for texture formats where
+   // D3D12 doesn't expose signed sampling paths.
+-  constexpr std::array<xenos::TextureFormat, 19> kD3D12SignedUnsupportedFormats = {
++  // NOTE: k_DXN is intentionally NOT in this list anymore — NHL Legacy needs the
++  // signed BC5_SNORM view for equipment normal maps (see the k_DXN host-format
++  // entry above and docs/vulkan-migration-plan.md D1).
++  constexpr std::array<xenos::TextureFormat, 18> kD3D12SignedUnsupportedFormats = {
+       xenos::TextureFormat::k_1_5_5_5,
+       xenos::TextureFormat::k_5_6_5,
+       xenos::TextureFormat::k_6_5_5,
+@@ -2495,7 +2516,6 @@ bool VulkanTextureCache::Initialize() {
+       xenos::TextureFormat::k_DXT1,
+       xenos::TextureFormat::k_DXT2_3,
+       xenos::TextureFormat::k_DXT4_5,
+-      xenos::TextureFormat::k_DXN,
+       xenos::TextureFormat::k_DXT5A,
+       xenos::TextureFormat::k_CTX1,
+       xenos::TextureFormat::k_DXT1_AS_16_16_16_16,
+diff --git a/thirdparty/libmspack b/thirdparty/libmspack
+--- a/thirdparty/libmspack
++++ b/thirdparty/libmspack
+@@ -1 +1 @@
+-Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837
++Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837-dirty
+diff --git a/thirdparty/o1heap b/thirdparty/o1heap
+--- a/thirdparty/o1heap
++++ b/thirdparty/o1heap
+@@ -1 +1 @@
+-Subproject commit 388a73fd9007300e5130c5fe352d9ce3288b6dde
++Subproject commit 388a73fd9007300e5130c5fe352d9ce3288b6dde-dirty
