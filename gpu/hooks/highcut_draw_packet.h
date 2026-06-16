@@ -30,7 +30,9 @@
 namespace nhl::highcut {
 
 constexpr uint32_t kDrawPacketMagic = 0x48334450;  // 'H3DP'
-constexpr uint32_t kDrawPacketVersion = 10;         // C-5g: + cube textures (array_layers; env reflection)
+constexpr uint32_t kDrawPacketVersion = 11;         // by-ID: shader/texture resource IDs for the consumer
+                                                    // cache (reuse GPU objects across frames + draws —
+                                                    // fixes the dense-gameplay consumer-rebuild crash)
 
 // Plume topology for the host draw. Xenos RectangleList -> kRectangleListAsTriangleStrip (4-vert
 // strip). kQuadList (menu text/glyphs) has no host-shader expansion in the translator, so the plume
@@ -80,6 +82,10 @@ struct TexturePacketDesc {
                                // pass RESOLVED to this address (ResolveMarker.dest_addr), the replay
                                // binds OUR offscreen surface RT (host-copy) instead of this captured
                                // blob — so render-to-texture passes (reflection/shadow) feed this draw.
+    uint64_t tex_id;           // by-ID: stable identity+content hash of this texture (the producer's
+                               // untile-cache key). The consumer caches the uploaded GPU texture+view by
+                               // this id and reuses it across draws/frames; data_bytes may be 0 when the
+                               // producer has already streamed this texture's blob (resource dictionary).
     uint32_t array_layers;     // C-5g: 1 = normal 2D; 6 = CUBE map (data is 6 faces of width*height
                                // concatenated, +X,-X,+Y,-Y,+Z,-Z). Player materials sample an env cube
                                // for reflection AND use its ALPHA as a material factor (NHL12 finding):
@@ -126,6 +132,11 @@ constexpr uint32_t kResolveSidecarMagic = 0x48335256;  // 'H3RV'
 struct DrawPacketHeader {
     uint32_t magic;            // kDrawPacketMagic
     uint32_t version;          // kDrawPacketVersion
+    // by-ID: stable identity of the translated VS/PS (the producer's SPIR-V cache key = ucode hash ^ mod).
+    // The consumer caches the compiled shader module + the graphics pipeline by these; vs/ps_spirv_bytes
+    // may be 0 when the producer has already streamed the SPIR-V (resource dictionary, Step 2).
+    uint64_t vs_shader_id;
+    uint64_t ps_shader_id;
     uint32_t vertex_count;     // host vertices to draw (drawInstanced count)
     uint32_t topology;         // DrawTopology — the plume primitive topology
     uint32_t fetch_bytes;      // size of the fetch-constants blob (192 dwords = 768)

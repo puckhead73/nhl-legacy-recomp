@@ -203,20 +203,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // graphics pipeline built with this draw's blend + topology). A captured frame = a vector of these,
 // replayed in order into one flat RT with per-draw blend. (The C-4 single-draw path stays separate.)
 struct RenderableDraw {
-    std::unique_ptr<RenderShader> vs, ps;
+    // by-ID: shaders/pipeline/layout/textures are SHARED (cached in PlumeCtx, reused across draws+frames
+    // so a 4000-draw scene doesn't recreate every GPU object every frame). shared_ptr keeps the render
+    // loop's `.get()` calls unchanged; the per-draw buffers/descriptor-sets/samplers stay unique.
+    std::shared_ptr<RenderShader> vs, ps;
     std::unique_ptr<RenderBuffer> sysBuf, boolBuf, fetchBuf, sharedBuf, vsFloatBuf, psFloatBuf;
-    std::vector<std::unique_ptr<RenderTexture>> textures;
-    std::vector<std::unique_ptr<RenderTextureView>> texViews;
+    std::vector<std::shared_ptr<RenderTexture>> textures;
+    std::vector<std::shared_ptr<RenderTextureView>> texViews;
     // C-5f: ONE sampler per PS sampler binding (was a single LINEAR+CLAMP for all). The jersey
     // nameplate-layout map is POINT-sampled by the guest; LINEAR-blending it broke the back number.
     std::vector<std::unique_ptr<RenderSampler>> samplers;
     // C-5d.3: VERTEX-shader textures (skinning bone palette) -> descriptor set 2.
-    std::vector<std::unique_ptr<RenderTexture>> vsTextures;
-    std::vector<std::unique_ptr<RenderTextureView>> vsTexViews;
+    std::vector<std::shared_ptr<RenderTexture>> vsTextures;
+    std::vector<std::shared_ptr<RenderTextureView>> vsTexViews;
     std::vector<std::unique_ptr<RenderSampler>> vsSamplers;  // C-5f: per-binding (was single)
-    std::unique_ptr<RenderPipelineLayout> layout;
+    std::shared_ptr<RenderPipelineLayout> layout;
     std::unique_ptr<RenderDescriptorSet> set0, set1, set2, set3;
-    std::unique_ptr<RenderPipeline> pipeline;
+    std::shared_ptr<RenderPipeline> pipeline;
     std::unique_ptr<RenderBuffer> indexBuf;  // quad-list expansion (C-5a.1) OR kGuestDMA (C-5d)
     uint32_t vertexCount = 0;
     uint32_t indexCount = 0;  // >0 => drawIndexedInstanced (quad expand / DMA); else drawInstanced
@@ -302,6 +305,20 @@ struct PlumeCtx {
     std::unique_ptr<RenderSampler> xlatSampler;
     std::unique_ptr<RenderDescriptorSet> xlatTexSet0, xlatTexSet1, xlatTexSet3;
     bool xlatTexDrawReady = false;
+    // by-ID resource caches (the dense-gameplay crash fix). These OWN the GPU objects; RenderableDraw
+    // holds shared_ptr copies. Persist across frames + draws so a 4000-draw scene reuses the ~hundreds of
+    // unique shaders/textures/pipelines instead of recreating thousands of GPU objects every frame
+    // (which exhausted memory -> crash). Keyed by the producer's resource IDs (packet vs/ps_shader_id,
+    // TexturePacketDesc.tex_id) + the small bits that vary the GPU object (texture swizzle/sign; full
+    // pipeline state). Never cleared during a session (device persists across swapchain resize).
+    std::unordered_map<uint64_t, std::shared_ptr<RenderShader>> shaderCache;
+    struct CachedTex { std::shared_ptr<RenderTexture> tex; std::shared_ptr<RenderTextureView> view; };
+    std::unordered_map<uint64_t, CachedTex> texCache;
+    std::unordered_map<uint64_t, std::shared_ptr<RenderPipelineLayout>> layoutCache;
+    std::unordered_map<uint64_t, std::shared_ptr<RenderPipeline>> pipelineCache;
+    // Step 2: raw resource bytes streamed once via the dictionary (shader SPIR-V / texture blobs), keyed
+    // by id. A packet referencing an id with 0 inline bytes resolves its bytes here. Persistent.
+    std::unordered_map<uint64_t, std::vector<uint8_t>> resourceBytes;
     // C-5a: the captured frame's draws, replayed in order into the swapchain with per-draw blend.
     std::vector<RenderableDraw> c5draws;
     bool c5loaded = false;
@@ -360,6 +377,13 @@ std::vector<std::vector<uint8_t>> g_livePendingDraws;// committed frame ready fo
 std::vector<uint8_t> g_liveBuildResolves;            // CP thread: this frame's resolve sidecar bytes
 std::vector<uint8_t> g_livePendingResolves;
 std::atomic<uint64_t> g_liveSeq{0};                  // bumped on each committed frame
+// Step 2 RESOURCE DICTIONARY: persistent, append-only channel (NOT double-buffered / latest-wins like
+// draws). The producer pushes each unique shader SPIR-V and texture blob ONCE, keyed by its resource id;
+// the consumer drains it before every rebuild and caches the raw bytes (c.resourceBytes), so a draw whose
+// packet carries the id but 0 inline bytes still resolves. This removes the ~130KB shader + texture blobs
+// the packet used to inline per draw (≈1 GB/frame of memcpy + bridge memory at 4000+ draws → the crash).
+std::mutex g_resMutex;
+std::vector<std::pair<uint64_t, std::vector<uint8_t>>> g_resourcePending;
 // Don't touch D3D12 until the game is steadily presenting (past GPU init), or the
 // second device creation races rexglue's init and resets its device.
 constexpr uint64_t kInitAfterGuestFrames = 30;
@@ -805,7 +829,8 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     hc::DrawPacketHeader hdr{};
     std::memcpy(&hdr, bytes.data(), sizeof(hdr));
     if (hdr.magic != hc::kDrawPacketMagic || hdr.version != hc::kDrawPacketVersion) return false;
-    if (hdr.vs_spirv_bytes == 0 || hdr.ps_spirv_bytes == 0) return false;  // need VS + color PS
+    // need a VS + a color PS. Step 2: the bytes may be 0 (streamed via the dictionary) — gate on the ids.
+    if (hdr.vs_shader_id == 0 || hdr.ps_shader_id == 0) return false;
     const RenderShaderFormat fmt = c.ri->getCapabilities().shaderFormat;
     if (fmt != RenderShaderFormat::SPIRV) return false;
 
@@ -863,14 +888,29 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     const uint8_t* idxData = hdr.index_bytes ? take(hdr.index_bytes) : nullptr;
     if (hdr.index_bytes && !idxData) return false;
 
-    d.vs = c.device->createShader(vsSpirv, hdr.vs_spirv_bytes, "main", fmt);
+    // by-ID: reuse the compiled shader module across draws/frames (keyed by the producer's shader id).
+    // On a miss we compile the inline SPIR-V (Step 1 still ships bytes every draw; Step 2 ships once).
+    auto getShader = [&](uint64_t id, const uint8_t* spv, uint32_t n) -> std::shared_ptr<RenderShader> {
+        if (id) { auto it = c.shaderCache.find(id); if (it != c.shaderCache.end()) return it->second; }
+        // Step 2: when the packet carries no inline bytes, resolve them from the streamed dictionary.
+        if ((!spv || !n) && id) {
+            auto r = c.resourceBytes.find(id);
+            if (r != c.resourceBytes.end()) { spv = r->second.data(); n = uint32_t(r->second.size()); }
+        }
+        if (!spv || !n) return nullptr;  // not inline AND not (yet) in the dictionary
+        std::shared_ptr<RenderShader> sh = c.device->createShader(spv, n, "main", fmt);
+        if (sh && id) c.shaderCache.emplace(id, sh);
+        return sh;
+    };
+    d.vs = getShader(hdr.vs_shader_id, vsSpirv, hdr.vs_spirv_bytes);
     // C-5g: optionally override this draw's PS with an instrumented .spv from disk (the number-layer
     // probe). The instrumented shader keeps the same descriptor interface, so all bindings still line up.
     std::vector<uint8_t> dbgPS = MaybeLoadDebugPS(drawIndex);
-    if (!dbgPS.empty())
-        d.ps = c.device->createShader(dbgPS.data(), dbgPS.size(), "main", fmt);
+    const bool dbgPSactive = !dbgPS.empty();
+    if (dbgPSactive)
+        d.ps = c.device->createShader(dbgPS.data(), dbgPS.size(), "main", fmt);  // debug: fresh, uncached
     else
-        d.ps = c.device->createShader(psSpirv, hdr.ps_spirv_bytes, "main", fmt);
+        d.ps = getShader(hdr.ps_shader_id, psSpirv, hdr.ps_spirv_bytes);
     if (!d.vs || !d.ps) return false;
     const bool textured = hdr.texture_count > 0;
     d.textured = textured;
@@ -949,8 +989,8 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     // Factored so PS textures (set3) and the VS skinning bone palette (set2) use one path. Samplers are
     // built separately (C-5f: one per guest SamplerBinding, honoring its filter/clamp).
     auto createTextures = [&](const std::vector<TexLoad>& srcTexs,
-                              std::vector<std::unique_ptr<RenderTexture>>& outTex,
-                              std::vector<std::unique_ptr<RenderTextureView>>& outView) -> bool {
+                              std::vector<std::shared_ptr<RenderTexture>>& outTex,
+                              std::vector<std::shared_ptr<RenderTextureView>>& outView) -> bool {
         if (srcTexs.empty()) return true;
         auto mapFmt = [](uint32_t f, uint32_t is_signed) -> RenderFormat {
             const bool sgn = is_signed && !NhlBc5NoSnorm();
@@ -968,6 +1008,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
         auto up = c.queue->createCommandList();
         auto fence = c.device->createCommandFence();
         std::vector<std::unique_ptr<RenderBuffer>> stagings;
+        bool anyUpload = false;
         up->begin();
         for (auto& t : srcTexs) {
             const RenderFormat rf = mapFmt(t.desc.tex_format, t.desc.is_signed);
@@ -975,15 +1016,36 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             // samples our 2D placeholder as garbage and the cube-alpha material term drops the number.
             const bool isCube = t.desc.array_layers == 6;
             const uint32_t layers = isCube ? 6u : 1u;
+            // by-ID cache: reuse the uploaded texture+view across draws/frames. Fold in the bits that
+            // change the GPU object (format/swizzle/cube). tex_id==0 (2x2 stub fallbacks) => uncached.
+            uint64_t tkey = 0;
+            if (t.desc.tex_id)
+                tkey = t.desc.tex_id ^ (uint64_t(t.desc.swizzle) * 0x9E3779B1ull) ^
+                       (uint64_t(uint32_t(rf)) << 40) ^ (uint64_t(isCube) << 52);
+            if (tkey) {
+                auto it = c.texCache.find(tkey);
+                if (it != c.texCache.end()) {
+                    outTex.push_back(it->second.tex);
+                    outView.push_back(it->second.view);
+                    continue;  // already uploaded in a prior draw/frame — skip recreate + upload
+                }
+            }
+            // Step 2: the blob is inline (disk capture / 2x2 stubs) OR streamed via the dictionary (live).
+            const uint8_t* texData = t.data;
+            uint32_t texBytes = t.desc.data_bytes;
+            if ((!texData || !texBytes) && t.desc.tex_id) {
+                auto r = c.resourceBytes.find(t.desc.tex_id);
+                if (r != c.resourceBytes.end()) { texData = r->second.data(); texBytes = uint32_t(r->second.size()); }
+            }
             auto tex = isCube
                 ? c.device->createTexture(RenderTextureDesc::Texture(
                       RenderTextureDimension::TEXTURE_2D, t.desc.width, t.desc.height, 1, 1, 6, rf,
                       RenderTextureFlag::CUBE))
                 : c.device->createTexture(RenderTextureDesc::Texture2D(t.desc.width, t.desc.height, 1, rf));
-            auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(t.desc.data_bytes ? t.desc.data_bytes : 4u));
-            if (staging && t.desc.data_bytes) {
+            auto staging = c.device->createBuffer(RenderBufferDesc::UploadBuffer(texBytes ? texBytes : 4u));
+            if (staging && texBytes) {
                 void* p = staging->map();
-                std::memcpy(p, t.data, t.desc.data_bytes);
+                std::memcpy(p, texData, texBytes);
                 // DIAGNOSTIC: NHL_HIGHCUT_C5_CUBE=R,G,B overwrites cube faces with a flat test color, to
                 // confirm whether the (currently neutral-stubbed) env reflection cube drives a material's
                 // shading. If the jersey/equipment lights up when this is bright, the cube is the missing
@@ -993,7 +1055,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                     int cr = 200, cg = 200, cb = 200;
                     if (const char* s = std::getenv("NHL_HIGHCUT_C5_CUBE")) std::sscanf(s, "%d,%d,%d", &cr, &cg, &cb);
                     uint8_t* bp = static_cast<uint8_t*>(p);
-                    for (uint32_t o = 0; o + 4 <= t.desc.data_bytes; o += 4) {
+                    for (uint32_t o = 0; o + 4 <= texBytes; o += 4) {
                         bp[o + 0] = uint8_t(cr); bp[o + 1] = uint8_t(cg); bp[o + 2] = uint8_t(cb); bp[o + 3] = 255;
                     }
                 }
@@ -1003,7 +1065,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                 up->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(tex.get(), RenderTextureLayout::COPY_DEST));
                 // One PlacedFootprint per face/layer; faces are concatenated tight in the blob (the CP
                 // writes them face-major), so layer N starts at N * faceBytes.
-                const uint32_t faceBytes = t.desc.data_bytes / layers;
+                const uint32_t faceBytes = texBytes / layers;
                 for (uint32_t layer = 0; layer < layers; ++layer) {
                     up->copyTextureRegion(
                         RenderTextureCopyLocation::Subresource(tex.get(), 0, layer),
@@ -1012,19 +1074,25 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                                                                    uint64_t(layer) * faceBytes));
                 }
                 up->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
+                anyUpload = true;
             }
             RenderTextureViewDesc vd = isCube ? RenderTextureViewDesc::TextureCube(rf)
                                               : RenderTextureViewDesc::Texture2D(rf);
             vd.componentMapping = xenosSwizzleMapping(t.desc.swizzle);  // apply the guest swizzle
-            auto view = tex ? tex->createTextureView(vd) : nullptr;
-            outTex.push_back(std::move(tex));
-            outView.push_back(std::move(view));
+            std::shared_ptr<RenderTexture> texS = std::move(tex);
+            std::shared_ptr<RenderTextureView> viewS;
+            if (texS) viewS = texS->createTextureView(vd);
+            if (tkey && texS) c.texCache.emplace(tkey, PlumeCtx::CachedTex{texS, viewS});
+            outTex.push_back(texS);
+            outView.push_back(viewS);
             stagings.push_back(std::move(staging));
         }
         up->end();
-        const RenderCommandList* cl = up.get();
-        c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
-        c.queue->waitForCommandFence(fence.get());
+        if (anyUpload) {  // only submit when at least one texture was actually (re)uploaded this call
+            const RenderCommandList* cl = up.get();
+            c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
+            c.queue->waitForCommandFence(fence.get());
+        }
         return true;
     };
     // C-5f: build `count` samplers from the guest SamplerBindings (honor filter+clamp per binding). The
@@ -1082,18 +1150,32 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     };
     // set2 must EXIST whenever set3 does (so PS textures land on set 3) OR when the VS has textures.
     const bool need_set2 = vs_textured || textured;
-    RenderPipelineLayoutBuilder lb;
-    lb.begin(false, false);
-    { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); lb.addDescriptorSet(s); }  // set0
-    { RenderDescriptorSetBuilder s; bSet1(s); lb.addDescriptorSet(s); }                                       // set1
-    if (need_set2) {                                                                                          // set2
-        RenderDescriptorSetBuilder s;
-        if (vs_textured) bSet2(s); else { s.begin(); s.end(); }  // VS textures, else empty placeholder
-        lb.addDescriptorSet(s);
+    // by-ID: cache the pipeline LAYOUT by its shape (descriptor-set presence + texture/sampler counts) —
+    // identical across all draws with the same counts, so build it once instead of per draw.
+    const uint64_t layoutKey =
+        (uint64_t(need_set2 ? 1 : 0)) | (uint64_t(vs_textured ? 1 : 0) << 1) |
+        (uint64_t(textured ? 1 : 0) << 2) | (uint64_t(nTex & 0xFFu) << 8) |
+        (uint64_t(nSamp & 0xFFu) << 16) | (uint64_t(nVsTex & 0xFFu) << 24) |
+        (uint64_t(nVsSamp & 0xFFu) << 32);
+    if (auto it = c.layoutCache.find(layoutKey); it != c.layoutCache.end()) {
+        d.layout = it->second;
+    } else {
+        RenderPipelineLayoutBuilder lb;
+        lb.begin(false, false);
+        { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); lb.addDescriptorSet(s); }  // set0
+        { RenderDescriptorSetBuilder s; bSet1(s); lb.addDescriptorSet(s); }                                       // set1
+        if (need_set2) {                                                                                          // set2
+            RenderDescriptorSetBuilder s;
+            if (vs_textured) bSet2(s); else { s.begin(); s.end(); }  // VS textures, else empty placeholder
+            lb.addDescriptorSet(s);
+        }
+        if (textured) { RenderDescriptorSetBuilder s; bSet3(s); lb.addDescriptorSet(s); }                         // set3
+        lb.end();
+        std::shared_ptr<RenderPipelineLayout> L = lb.create(c.device.get());
+        if (!L) return false;
+        c.layoutCache.emplace(layoutKey, L);
+        d.layout = L;
     }
-    if (textured) { RenderDescriptorSetBuilder s; bSet3(s); lb.addDescriptorSet(s); }                         // set3
-    lb.end();
-    d.layout = lb.create(c.device.get());
     if (!d.layout) return false;
 
     { RenderDescriptorSetBuilder s; s.begin(); s.addByteAddressBuffer(0); s.end(); d.set0 = s.create(c.device.get()); }
@@ -1197,8 +1279,34 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
     if (flip_face) front_ccw_screen = !front_ccw_screen;
     pd.frontFace = front_ccw_screen ? RenderFrontFace::COUNTER_CLOCKWISE
                                     : RenderFrontFace::CLOCKWISE;
-    d.pipeline = c.device->createGraphicsPipeline(pd);
-    if (!d.pipeline) return false;
+    // by-ID: cache the graphics PIPELINE — PSO creation is the most expensive per-draw op, and a
+    // 4000-draw scene shares only a few hundred unique pipelines (this is the main consumer-crash fix).
+    // Key = shaders + full pipeline state + layout shape. The debug-PS override uses a fresh uncached
+    // module, so it bypasses the cache.
+    if (dbgPSactive) {
+        d.pipeline = c.device->createGraphicsPipeline(pd);
+        if (!d.pipeline) return false;
+    } else {
+        uint64_t pk = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { pk ^= v; pk *= 1099511628211ull; };
+        mix(hdr.vs_shader_id); mix(hdr.ps_shader_id); mix(layoutKey);
+        mix(hdr.blend_enable); mix(hdr.blend_src); mix(hdr.blend_dst); mix(hdr.blend_op);
+        mix(hdr.blend_src_a); mix(hdr.blend_dst_a); mix(hdr.blend_op_a); mix(hdr.color_write_mask);
+        mix(uint32_t(topo));
+        mix(hdr.depth_enable); mix(hdr.depth_write); mix(hdr.depth_func);
+        mix(hdr.stencil_enable); mix(hdr.stencil_read_mask); mix(hdr.stencil_write_mask); mix(hdr.stencil_ref);
+        mix(hdr.front_fail_op); mix(hdr.front_pass_op); mix(hdr.front_depth_fail_op); mix(hdr.front_func);
+        mix(hdr.back_fail_op); mix(hdr.back_pass_op); mix(hdr.back_depth_fail_op); mix(hdr.back_func);
+        mix(hdr.cull_mode); mix(hdr.front_ccw);
+        if (auto it = c.pipelineCache.find(pk); it != c.pipelineCache.end()) {
+            d.pipeline = it->second;
+        } else {
+            std::shared_ptr<RenderPipeline> P = c.device->createGraphicsPipeline(pd);
+            if (!P) return false;
+            c.pipelineCache.emplace(pk, P);
+            d.pipeline = P;
+        }
+    }
     d.vertexCount = hdr.vertex_count ? hdr.vertex_count : 3;
     d.surfDepthBase = hdr.surface_depth_base;  // C-5d.2: surface bucket key
     d.surfPitch = hdr.surface_pitch;
@@ -1449,6 +1557,13 @@ void RenderClear(PlumeCtx& c) {
     if (c5_mode && live_feed) {
         const uint64_t seq = g_liveSeq.load(std::memory_order_acquire);
         if (seq != c.liveSeqSeen) {
+            // Step 2: drain the resource dictionary FIRST (append-only, never dropped), so every shader/
+            // texture id a draw references is in c.resourceBytes before the rebuild looks it up.
+            {
+                std::vector<std::pair<uint64_t, std::vector<uint8_t>>> drained;
+                { std::lock_guard<std::mutex> lk(g_resMutex); drained.swap(g_resourcePending); }
+                for (auto& kv : drained) c.resourceBytes[kv.first] = std::move(kv.second);
+            }
             std::vector<std::vector<uint8_t>> draws;
             std::vector<uint8_t> resolves;
             { std::lock_guard<std::mutex> lk(g_liveMutex);
@@ -1933,10 +2048,23 @@ void RenderClear(PlumeCtx& c) {
     // first (the scene/uploads settle), then copy tex -> a READBACK buffer this frame; mapped + written
     // after the fence wait below. Row pitch is 256-byte aligned (D3D12-safe; harmless on Vulkan).
     static const char* c5shot = std::getenv("NHL_HIGHCUT_C5_SHOT");
+    // FILMSTRIP (restart §5.2 — "see the live output per screen"): NHL_HIGHCUT_FILMSTRIP=<dir> dumps the
+    // presented swapchain to <dir>/f<frame>.png every NHL_HIGHCUT_FILMSTRIP_EVERY frames (default 30), so
+    // a whole live run becomes a sequence of readable PNGs (one per ~screen) without a human at the window.
+    // Same readback path as the one-shot C5_SHOT; recurring instead of one-shot. Zero cost when unset.
+    static const char* filmDir = std::getenv("NHL_HIGHCUT_FILMSTRIP");
+    static const uint32_t filmEvery = []() {
+        const char* s = std::getenv("NHL_HIGHCUT_FILMSTRIP_EVERY");
+        uint32_t n = s ? uint32_t(std::strtoul(s, nullptr, 10)) : 0u;
+        return n ? n : 30u;
+    }();
+    static bool filmDirMade = false;
+    if (filmDir && !filmDirMade) { CreateDirectoryA(filmDir, nullptr); filmDirMade = true; }
+    const bool doFilm = filmDir && c.frame >= 16 && (c.frame % filmEvery == 0);
     std::unique_ptr<RenderBuffer> shotBuf;
     uint32_t shotPitch = 0;
     const bool doShot = c5shot && !c.c5ShotDone && c.frame >= 16;
-    if (doShot) {
+    if (doShot || doFilm) {
         shotPitch = ((w * 4u) + 255u) & ~255u;
         shotBuf = c.device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(shotPitch) * h));
         if (shotBuf) {
@@ -1972,6 +2100,20 @@ void RenderClear(PlumeCtx& c) {
                         ok ? "WROTE" : "FAILED", c5shot, w, h);
         }
         c.c5ShotDone = true;
+    }
+    // FILMSTRIP: write this frame's presented image to <dir>/f<frame>.png. (doShot may also have fired
+    // this frame; they share the one readback buffer — write both.)
+    if (doFilm && shotBuf) {
+        if (const void* p = shotBuf->map()) {
+            char fpath[1024];
+            std::snprintf(fpath, sizeof(fpath), "%s\\f%06llu.png", filmDir,
+                          static_cast<unsigned long long>(c.frame));
+            bool ok = WriteImagePNG(fpath, w, h, shotPitch, static_cast<const uint8_t*>(p), /*bgra=*/true);
+            shotBuf->unmap();
+            REXLOG_INFO("[highcut-film] {} {} (guest frame {}, {} live draws this rebuild)",
+                        ok ? "WROTE" : "FAILED", fpath, static_cast<unsigned long long>(c.frame),
+                        uint32_t(c.c5draws.size()));
+        }
     }
 
     // C-3b.2 verify: the GPU is now idle (fence waited), so the PS's atomic writes to the host-
@@ -2049,6 +2191,13 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size) {
 extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size) {
     if (!g_enabled || !data || !size) return;
     g_liveBuild.emplace_back(data, data + size);
+}
+// Step 2: CP thread streams a unique shader/texture's bytes ONCE (append-only, persistent). The plume
+// thread drains g_resourcePending into c.resourceBytes before each rebuild.
+extern "C" void HighcutLivePushResource(uint64_t id, const uint8_t* data, size_t size) {
+    if (!g_enabled || !data || !size) return;
+    std::lock_guard<std::mutex> lk(g_resMutex);
+    g_resourcePending.emplace_back(id, std::vector<uint8_t>(data, data + size));
 }
 // C-6 live feed: CP thread commits the in-progress frame at the guest-present boundary — move it into
 // g_livePending under the lock and bump the seq so the plume thread picks it up. resolves may be null.

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rex/graphics/d3d12/pipeline_cache.h>
@@ -1359,16 +1361,24 @@ void NhlD3D12CommandProcessor::HighcutCaptureResolve() {
   m.src_pitch = register_file_->Get<reg::RB_SURFACE_INFO>().surface_pitch;
   m.src_msaa = uint32_t(register_file_->Get<reg::RB_SURFACE_INFO>().msaa_samples);
   highcut_resolves_.push_back(m);
-  if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
-    const uint32_t magic = nhl::highcut::kResolveSidecarMagic;
-    const uint32_t count = uint32_t(highcut_resolves_.size());
-    std::fwrite(&magic, 4, 1, rf);
-    std::fwrite(&count, 4, 1, rf);
-    std::fwrite(highcut_resolves_.data(), sizeof(nhl::highcut::ResolveMarker), count, rf);
-    std::fclose(rf);
+  // The disk sidecar is only for DISK replay; the LIVE feed carries resolves over the bridge each frame
+  // (HighcutLiveCommitFrame), so skip the per-resolve file rewrite when live. The per-draw log is gated
+  // too (it spams the CP thread in live gameplay).
+  static const bool live_feed = std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr;
+  static const bool hc_verbose = std::getenv("NHL_HIGHCUT_VERBOSE") != nullptr;
+  if (!live_feed) {
+    if (std::FILE* rf = std::fopen("highcut_resolves.bin", "wb")) {
+      const uint32_t magic = nhl::highcut::kResolveSidecarMagic;
+      const uint32_t count = uint32_t(highcut_resolves_.size());
+      std::fwrite(&magic, 4, 1, rf);
+      std::fwrite(&count, 4, 1, rf);
+      std::fwrite(highcut_resolves_.data(), sizeof(nhl::highcut::ResolveMarker), count, rf);
+      std::fclose(rf);
+    }
   }
-  REXLOG_INFO("[highcut-C5d3] resolve after draw {}: dest=0x{:X} is_depth={} src(depth={} pitch={} msaa={})",
-              m.after_draw, m.dest_addr, m.is_depth, m.src_depth_base, m.src_pitch, m.src_msaa);
+  if (hc_verbose)
+    REXLOG_INFO("[highcut-C5d3] resolve after draw {}: dest=0x{:X} is_depth={} src(depth={} pitch={} msaa={})",
+                m.after_draw, m.dest_addr, m.is_depth, m.src_depth_base, m.src_pitch, m.src_msaa);
 }
 
 // Defined in gpu/hooks/plume_present.cpp — C-2 shader bridge: hand a translated Xenos VS's
@@ -1378,6 +1388,8 @@ extern "C" void HighcutPublishTranslatedVS(const uint8_t* data, size_t size);
 // bytes (the same bytes written to highcut_frame_<N>.bin) to the plume thread's in-progress frame;
 // CommitFrame finalizes it at the guest-present boundary. No-op unless the plume thread is enabled.
 extern "C" void HighcutLivePushDraw(const uint8_t* data, size_t size);
+// Step 2: stream one unique shader/texture's bytes to the consumer's resource dictionary (once per id).
+extern "C" void HighcutLivePushResource(uint64_t id, const uint8_t* data, size_t size);
 extern "C" void HighcutLiveCommitFrame(const uint8_t* resolves, size_t rsize);
 
 // Defined in gpu/hooks/d3d9_resources.cpp — C-5d frame delimiter. Bumped on every guest VdSwap
@@ -1625,6 +1637,9 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   bool p3_dump_data = false;  // C-3b.2: dump this draw's data packet (set when it's the selected draw)
   // C-4: the selected draw's translated VS+PS + the PS texture/sampler interface, captured in the
   // survey block and consumed by the packet dump below (after vpi). Empty => VS-only C-3 path.
+  // by-ID: the translated VS/PS resource IDs (= SPIR-V cache keys) written into the packet header so the
+  // consumer caches the compiled shader module + pipeline by them (reuse across draws/frames).
+  uint64_t p3_vs_id = 0, p3_ps_id = 0;
   std::vector<uint8_t> p3_vs_spirv;  // C-5a: masked VS dumped INLINE per draw (frame capture)
   std::vector<uint8_t> p3_ps_spirv;
   std::vector<rex::graphics::SpirvShader::TextureBinding> p3_ps_texbinds;
@@ -1640,8 +1655,31 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
   // C-5a: NHL_HIGHCUT_FRAME_CAPTURE dumps EVERY interesting owned draw of the frame (to
   // highcut_frame_<idx>.bin) for the multi-draw plume replay, not just the C-4 single selected draw.
   const bool frame_capture = std::getenv("NHL_HIGHCUT_FRAME_CAPTURE") != nullptr;
+  // Per-draw capture logging is ~3 lines x ~2600 draws/frame in live gameplay — thousands of synchronous
+  // disk writes per frame on the guest CP thread, which both rotates the log past anything useful and adds
+  // real stall. Default OFF; set NHL_HIGHCUT_VERBOSE=1 to restore the per-draw C4/C3b3/resolve logs. The
+  // once-per-unique-shader "NEW VS/PS xlat" lines stay on (low volume, show the cache populating).
+  static const bool hc_verbose = std::getenv("NHL_HIGHCUT_VERBOSE") != nullptr;
+  // PROFILE (NHL_HIGHCUT_PROFILE): bucket per-draw producer cost (translate / texture-untile / packet
+  // build+push) and report it with the FPS readout, so the remaining live-takeover cost is MEASURED, not
+  // guessed. Accumulated across draws, logged + reset every 60 committed frames. Cheap when off.
+  static const bool hc_profile = std::getenv("NHL_HIGHCUT_PROFILE") != nullptr;
+  // LIVE-TAKEOVER FREEZE FIX (owned-draw cut): in high-cut LIVE mode plume renders from the captured
+  // packets, so the SDK's D3D12 owned-draw that follows the capture is NOT displayed — yet it costs the
+  // most per draw on the guest CP thread (per-draw residency RequestRange thrash against the 16MB live
+  // shmem, the SDK DXBC translate, and a real D3D12 draw submit), scaling with draw count -> dense
+  // gameplay froze on frame 1. Skip that owned render after the packet is built. NHL_HIGHCUT_KEEP_OWNED_DRAW=1
+  // restores the old path for A/B.
+  static const bool skip_owned_render = (std::getenv("NHL_HIGHCUT_LIVE_FEED") != nullptr) &&
+                                        (std::getenv("NHL_HIGHCUT_KEEP_OWNED_DRAW") == nullptr);
+  static double s_tXlat = 0.0, s_tUntile = 0.0, s_tPacket = 0.0;
+  using hc_clock = std::chrono::steady_clock;
+  auto hc_secs = [](hc_clock::time_point a, hc_clock::time_point b) {
+    return std::chrono::duration_cast<std::chrono::duration<double>>(b - a).count();
+  };
   static std::atomic<int> highcut_p3_count{0};
   constexpr int kP3MaxDraws = 32;
+  const auto _hc_tx0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
   if (std::getenv("NHL_HIGHCUT_XLAT_TEST") || frame_capture) {
     // C-4: only survey INTERESTING draws (a vfetch VS or a textured PS) — skip the many trivial
     // boot-overlay draws so textured menu draws are reached. (Bindings come from the SDK's shader
@@ -1653,6 +1691,130 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // Frame capture surveys EVERY interesting draw (no 32-draw cap); the C-4 single-draw survey caps.
     if (p3_interesting && (frame_capture || (p3_idx >= 0 && p3_idx < kP3MaxDraws))) {
     namespace rg = rex::graphics;
+    if (frame_capture) {
+      // ===== LIVE-TAKEOVER FREEZE FIX (restart) =====================================================
+      // The producer runs on the guest command-processor thread. Live GAMEPLAY issues ~2600 draws per
+      // frame, but they share only a handful of unique (ucode, modification) shaders (every skinned
+      // player uses the same VS/PS). The original survey path (the else branch below) rebuilt a fresh
+      // SpirvShader, AnalyzeUcode'd it, and ran the full Xenos->SPIR-V translate for EVERY draw EVERY
+      // frame (~10 ms each) -> ~20 s/frame -> the game appears FROZEN in live takeover while audio runs
+      // on its own thread. Fix: cache the translated SPIR-V + post-translation bindings keyed by
+      // (ucode content hash, modification value); on a cache HIT we skip construction, analysis, AND
+      // translation entirely. The KEY is formed from the SDK shaders (beta_current_vs_/eff_ps), which
+      // are already analyzed for their DXBC path, so no SpirvShader analysis is needed just to look up.
+      // Process-lifetime cache; the CP thread is the only writer (same single-thread assumption as the
+      // g_liveBuild live-feed accumulator).
+      struct HcXlatEntry {
+        std::vector<uint8_t> spirv;
+        std::vector<rg::SpirvShader::TextureBinding> tex;
+        std::vector<rg::SpirvShader::SamplerBinding> samp;
+        bool valid = false;
+      };
+      static std::unordered_map<uint64_t, HcXlatEntry> s_vsXlat;
+      static std::unordered_map<uint64_t, HcXlatEntry> s_psXlat;
+      auto hcKey = [](uint64_t h, uint64_t mod) -> uint64_t {
+        return h * 0x9E3779B97F4A7C15ull ^ (mod + 0x9DDFEA08EB382D69ull);
+      };
+      // Translator features (match the else path: plume's device lacks float-controls, which crash
+      // vkCreateGraphicsPipelines if the shader declares the denorm/rounding/NaN-preserve modes).
+      rg::SpirvShaderTranslator::Features feats(/*all=*/true);
+      feats.signed_zero_inf_nan_preserve_float32 = false;
+      feats.denorm_flush_to_zero_float32 = false;
+      feats.rounding_mode_rte_float32 = false;
+      rg::SpirvShaderTranslator xlat(feats, /*native_2x_msaa_with_attachments=*/false,
+                                     /*native_2x_msaa_no_attachments=*/false,
+                                     /*edram_fragment_shader_interlock=*/false);
+      // Host vertex shader type — rect-list expands to a triangle strip on plume (no rect primitive).
+      auto hvst = result.host_vertex_shader_type;
+      if (result.guest_primitive_type == xenos::PrimitiveType::kRectangleList &&
+          hvst == rg::Shader::HostVertexShaderType::kVertex) {
+        hvst = rg::Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
+      }
+      // Register count + ucode hash from the already-analyzed SDK shaders -> the cache KEY needs no
+      // SpirvShader analysis (writes_interpolators()/GetInterpolatorInputMask() above already required
+      // these shaders to be analyzed).
+      const uint32_t vs_num_reg = register_file_->Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg;
+      const uint32_t vs_reg_count = beta_current_vs_->GetDynamicAddressableRegisterCount(vs_num_reg);
+      rg::SpirvShaderTranslator::Modification vs_modw(
+          xlat.GetDefaultVertexShaderModification(vs_reg_count, hvst));
+      vs_modw.vertex.interpolator_mask = interpolator_mask;
+      const uint64_t vs_key = hcKey(beta_current_vs_->ucode_data_hash(), vs_modw.value);
+      p3_vs_id = vs_key;  // by-ID: consumer caches the VS module + pipeline by this
+
+      // ---- Masked VS: cache lookup, translate only on miss ----
+      auto vsIt = s_vsXlat.find(vs_key);
+      if (vsIt == s_vsXlat.end()) {
+        HcXlatEntry e;
+        rg::SpirvShader vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
+                           beta_current_vs_->ucode_dwords(), beta_current_vs_->ucode_dword_count(),
+                           std::endian::native);
+        rex::string::StringBuffer disasm;
+        vs.AnalyzeUcode(disasm);
+        bool is_new = false;
+        rg::Shader::Translation* tr = vs.GetOrCreateTranslation(vs_modw.value, &is_new);
+        if (xlat.TranslateAnalyzedShader(*tr) && tr->is_valid() && !tr->translated_binary().empty()) {
+          const auto& bin = tr->translated_binary();
+          e.spirv.assign(bin.begin(), bin.end());
+          e.tex = vs.GetTextureBindingsAfterTranslation();
+          e.samp = vs.GetSamplerBindingsAfterTranslation();
+          e.valid = true;
+        }
+        REXLOG_INFO("[highcut-P3] NEW VS xlat: hash=0x{:X} mod=0x{:X} valid={} spirv={} (vs-cache={})",
+                    beta_current_vs_->ucode_data_hash(), vs_modw.value, e.valid,
+                    uint32_t(e.spirv.size()), uint32_t(s_vsXlat.size() + 1));
+        vsIt = s_vsXlat.emplace(vs_key, std::move(e)).first;
+      }
+      if (vsIt->second.valid) {
+        p3_vs_spirv = vsIt->second.spirv;
+        p3_vs_texbinds = vsIt->second.tex;
+        p3_vs_sampbinds = vsIt->second.samp;
+        p3_vs_sampler_count = uint32_t(p3_vs_sampbinds.size());
+        p3_dump_data = true;  // a valid VS -> this draw's packet is built + pushed below
+      }
+
+      // ---- PS: only when a pixel shader is bound and the VS was valid ----
+      if (p3_dump_data && eff_ps) {
+        const uint32_t ps_num_reg = register_file_->Get<reg::SQ_PROGRAM_CNTL>().ps_num_reg;
+        const uint32_t ps_reg_count = eff_ps->GetDynamicAddressableRegisterCount(ps_num_reg);
+        rg::SpirvShaderTranslator::Modification ps_modw(
+            xlat.GetDefaultPixelShaderModification(ps_reg_count));
+        ps_modw.pixel.interpolator_mask = interpolator_mask;
+        if (param_gen_pos != UINT32_MAX) {
+          ps_modw.pixel.param_gen_enable = 1;
+          ps_modw.pixel.param_gen_interpolator = param_gen_pos & 0xF;
+          ps_modw.pixel.param_gen_point = primitive_type == xenos::PrimitiveType::kPointList ? 1 : 0;
+        }
+        const uint64_t ps_key = hcKey(eff_ps->ucode_data_hash(), ps_modw.value);
+        p3_ps_id = ps_key;  // by-ID: consumer caches the PS module + pipeline by this
+        auto psIt = s_psXlat.find(ps_key);
+        if (psIt == s_psXlat.end()) {
+          HcXlatEntry e;
+          rg::SpirvShader ps(eff_ps->type(), eff_ps->ucode_data_hash(), eff_ps->ucode_dwords(),
+                             eff_ps->ucode_dword_count(), std::endian::native);
+          rex::string::StringBuffer disasm;
+          ps.AnalyzeUcode(disasm);
+          bool is_new = false;
+          rg::Shader::Translation* tr = ps.GetOrCreateTranslation(ps_modw.value, &is_new);
+          if (xlat.TranslateAnalyzedShader(*tr) && tr->is_valid() && !tr->translated_binary().empty()) {
+            const auto& bin = tr->translated_binary();
+            e.spirv.assign(bin.begin(), bin.end());
+            e.tex = ps.GetTextureBindingsAfterTranslation();
+            e.samp = ps.GetSamplerBindingsAfterTranslation();
+            e.valid = true;
+          }
+          REXLOG_INFO("[highcut-P3] NEW PS xlat: hash=0x{:X} mod=0x{:X} valid={} spirv={} (ps-cache={})",
+                      eff_ps->ucode_data_hash(), ps_modw.value, e.valid, uint32_t(e.spirv.size()),
+                      uint32_t(s_psXlat.size() + 1));
+          psIt = s_psXlat.emplace(ps_key, std::move(e)).first;
+        }
+        if (psIt->second.valid) {
+          p3_ps_spirv = psIt->second.spirv;
+          p3_ps_texbinds = psIt->second.tex;
+          p3_ps_sampbinds = psIt->second.samp;
+          p3_ps_sampler_count = uint32_t(p3_ps_sampbinds.size());
+        }
+      }
+    } else {
     rg::SpirvShader p3_vs(beta_current_vs_->type(), beta_current_vs_->ucode_data_hash(),
                           beta_current_vs_->ucode_dwords(),
                           beta_current_vs_->ucode_dword_count(), std::endian::native);
@@ -1787,17 +1949,32 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         }
       }
     }
+    }  // end else: original (!frame_capture) C-4 single-draw survey path
     }
   }
 
+  if (hc_profile) s_tXlat += hc_secs(_hc_tx0, hc_clock::now());
+
+  // LIVE-TAKEOVER FREEZE FIX: the SDK DXBC translate + the per-new-shader async-translation / PSO
+  // SPIN-WAITS below (Sleep-loops up to ~200ms each + a 1000ms PSO wait) are owned-draw prep ONLY. On
+  // "load into game" EVERY shader is new -> ~140 cold shaders each spinning -> a multi-second-to-minute
+  // hard freeze on the guest CP thread (the actual "froze on load into game"). High-cut live skips the
+  // owned draw, so skip this whole region. pso_handle/root_sig/configured are hoisted so the (also
+  // skipped) owned render below can still reference them when KEEP_OWNED_DRAW restores the old path.
+  void* pso_handle = nullptr;
+  ID3D12RootSignature* root_sig = nullptr;
+  bool configured = false;
+  ID3D12PipelineState* pso_ready = nullptr;
+  d3d12::D3D12Shader::D3D12Translation* vs_tr = nullptr;
+  d3d12::D3D12Shader::D3D12Translation* ps_tr = nullptr;
+  if (!skip_owned_render) {
   const uint64_t vs_mod = beta_pipeline_cache_
                               ->GetCurrentVertexShaderModification(
                                   *beta_current_vs_, result.host_vertex_shader_type,
                                   interpolator_mask)
                               .value;
-  auto* vs_tr = static_cast<d3d12::D3D12Shader::D3D12Translation*>(
+  vs_tr = static_cast<d3d12::D3D12Shader::D3D12Translation*>(
       beta_current_vs_->GetOrCreateTranslation(vs_mod));
-  d3d12::D3D12Shader::D3D12Translation* ps_tr = nullptr;
   if (eff_ps) {
     const uint64_t ps_mod = beta_pipeline_cache_
                                 ->GetCurrentPixelShaderModification(*eff_ps, interpolator_mask,
@@ -1835,8 +2012,6 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
                 eff_ps->GetTextureBindingsAfterTranslation().size(),
                 eff_ps->GetSamplerBindingsAfterTranslation().size());
   }
-  void* pso_handle = nullptr;
-  ID3D12RootSignature* root_sig = nullptr;
   // EndSubmission() flushes our pipeline cache's queued work (the base flushes only
   // its OWN cache); the spin waits until the PSO + the shader's async translation
   // are done. CRITICAL: keep the MSAA=1X override in effect until the PSO is fully
@@ -1850,7 +2025,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       Sleep(1);
     }
   };
-  bool configured = beta_pipeline_cache_->ConfigurePipeline(
+  configured = beta_pipeline_cache_->ConfigurePipeline(
       vs_tr, ps_tr, result, ndc, ncm, bound_rt_bits, rt_formats, &pso_handle, &root_sig);
   flush_and_wait();
   // ConfigurePipeline builds the root signature from the shader's texture/sampler
@@ -1865,13 +2040,16 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         vs_tr, ps_tr, result, ndc, ncm, bound_rt_bits, rt_formats, &pso_handle, &root_sig);
     flush_and_wait();
   }
-  ID3D12PipelineState* pso_ready = beta_pipeline_cache_->GetD3D12PipelineByHandle(pso_handle);
-  (*register_file_)[kSurfInfoIdx] = saved_surface_info;  // restore AFTER PSO is built
+  pso_ready = beta_pipeline_cache_->GetD3D12PipelineByHandle(pso_handle);
+  }  // end if(!skip_owned_render): owned-draw DXBC translate + PSO build + spin-waits
+  // Restore the MSAA/blend/cull register overrides (always — balances the apply above), BEFORE the
+  // viewport/packet read RB_SURFACE_INFO, so the packet captures the real guest surface state.
+  (*register_file_)[kSurfInfoIdx] = saved_surface_info;
   if (beta_noblend) {
     for (uint32_t i = 0; i < 4; ++i) (*register_file_)[beta_reg::kBlendControl[i]] = saved_blend[i];
   }
   if (beta_nocull) (*register_file_)[kModeCntlIdx] = saved_mode_cntl;
-  if (!configured || !pso_handle || !root_sig || !pso_ready) {
+  if (!skip_owned_render && (!configured || !pso_handle || !root_sig || !pso_ready)) {
     REXLOG_ERROR("[nhl-beta] owned-draw: ConfigurePipeline/PSO not ready (configured={} pso={})",
                  configured, pso_handle);
     return;
@@ -2099,6 +2277,19 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     std::vector<std::vector<uint8_t>> tex_blobs;
     std::vector<nhl::highcut::TexturePacketDesc> vs_tex_descs;  // C-5d.3: VS (set2) textures
     std::vector<std::vector<uint8_t>> vs_tex_blobs;
+    // UNTILE CACHE (live-takeover freeze fix): re-untiling every sampled texture every frame (per-block
+    // tiled gather + endian swap, e.g. 131k blocks for a 2048x1024 background) is ~75% of producer frame
+    // time (measured via NHL_HIGHCUT_PROFILE). Cache the untiled blob + its derived desc fields keyed by
+    // (texture identity + a cheap 4 KB source-prefix hash that detects content changes). A byte budget
+    // bounds memory: when exceeded the cache is cleared (one frame re-untiles, then steady-state hits).
+    struct HcTexCacheEntry {
+      std::vector<uint8_t> blob;
+      uint32_t width = 0, height = 0, tex_format = 0, row_pitch_bytes = 0, data_bytes = 0,
+               array_layers = 0, swizzle = 0;
+    };
+    static std::unordered_map<uint64_t, HcTexCacheEntry> s_texCache;
+    static size_t s_texCacheBytes = 0;
+    constexpr size_t kTexCacheBudget = 256u * 1024u * 1024u;  // 256 MB of untiled blobs
     // C-4/C-5d.3: untile each texture binding (PS or VS) into a LINEAR blob + a TexturePacketDesc.
     // Factored into a lambda so the SAME path serves PS textures (set3) and the VS skinning bone
     // palette (set2). Xenos textures are tiled in 32x32-block tiles; GetTiledOffset2D gives the
@@ -2172,7 +2363,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         for (size_t i = 0; i < blob.size(); i += 4) {
           blob[i] = 32; blob[i + 1] = 32; blob[i + 2] = 32; blob[i + 3] = 255;  // neutral, alpha=1
         }
-        REXLOG_INFO("[highcut-C5i] tex slot={} CUBE base=0x{:X} -> 6-face NEUTRAL cube ({})", slot, tex_base, why);
+        if (hc_verbose) REXLOG_INFO("[highcut-C5i] tex slot={} CUBE base=0x{:X} -> 6-face NEUTRAL cube ({})", slot, tex_base, why);
         out_descs.push_back(td); out_blobs.push_back(std::move(blob));
       };
       // Allow the cube dimension through the untile path (a cube is k3DOrStacked-ish, not k2DOrStacked).
@@ -2195,7 +2386,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         for (size_t i = 0; i < blob.size(); i += 4) {
           blob[i] = 255; blob[i + 1] = sg; blob[i + 2] = 255; blob[i + 3] = 255;  // magenta / white
         }
-        REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 {}",
+        if (hc_verbose) REXLOG_INFO("[highcut-C4] tex slot={} UNSUPPORTED fmt={} dim={} base=0x{:X} -> 2x2 {}",
                     slot, uint32_t(fmt), uint32_t(tf.dimension), tex_base,
                     is_depth ? "white (depth)" : "magenta");
         out_descs.push_back(td); out_blobs.push_back(std::move(blob));
@@ -2220,6 +2411,31 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
             /*has_packed_levels*/ false, /*has_base*/ true, /*max_level*/ 0);
         sliceStride = gl.base.array_slice_stride_bytes;
         if (!sliceStride) { emitNeutralCube("zero slice stride"); continue; }  // would alias all 6 faces
+      }
+      // Untile-cache lookup: hash texture identity + a 4 KB source prefix (cheap change detector). On a
+      // hit, reuse the cached untiled blob + desc fields and skip the whole gather/endian/expand below.
+      uint64_t texKey;
+      {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        mix(tex_base); mix(uint32_t(fmt)); mix((uint64_t(width) << 32) | height);
+        mix((uint64_t(tf.tiled) << 40) | (uint64_t(tf.endianness) << 32) |
+            (uint64_t(expand_r8 ? 1u : 0u) << 16) | cubeLayers);
+        mix(uint32_t(tf.swizzle));
+        const size_t prefixN = std::min<size_t>(4096, faceBytes * cubeLayers);
+        for (size_t i = 0; i < prefixN; ++i) { h ^= guest[i]; h *= 1099511628211ull; }
+        texKey = h;
+        td.tex_id = texKey;  // by-ID: consumer caches the uploaded texture+view by this
+        auto it = s_texCache.find(texKey);
+        if (it != s_texCache.end()) {
+          const auto& e = it->second;
+          td.width = e.width; td.height = e.height; td.tex_format = e.tex_format;
+          td.row_pitch_bytes = e.row_pitch_bytes; td.data_bytes = e.data_bytes;
+          td.array_layers = e.array_layers; td.swizzle = e.swizzle;
+          out_descs.push_back(td);
+          out_blobs.push_back(e.blob);  // linear copy — far cheaper than re-untiling
+          continue;
+        }
       }
       std::vector<uint8_t> blob(faceBytes * cubeLayers);
       for (uint32_t face = 0; face < cubeLayers; ++face) {
@@ -2278,16 +2494,23 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       // equipment texture (green goalie gear) can be correlated against clean ones by its REAL fetch
       // config (the naive 2D untile above ignores packed mips / mip_min / the 256B linear pitch align
       // that GetGuestTextureLayout would apply — only the cube path uses it).
-      REXLOG_INFO("[highcut-C4] tex slot={} {}x{} fmt={} pfmt={} tiled={} endian={} pitch_blk={} "
+      if (hc_verbose) REXLOG_INFO("[highcut-C4] tex slot={} {}x{} fmt={} pfmt={} tiled={} endian={} pitch_blk={} "
                   "blob={} is_signed={} layers={} base=0x{:X} mip={}..{} packed={}",
                   slot, width, height, uint32_t(fmt), pfmt, uint32_t(tf.tiled), uint32_t(end),
                   pitch_blocks, td.data_bytes, td.is_signed, cubeLayers, tex_base,
                   uint32_t(tf.mip_min_level), uint32_t(tf.mip_max_level), uint32_t(tf.packed_mips));
+      // Store the freshly untiled blob in the cache (bounded by a byte budget — clear when exceeded).
+      if (s_texCacheBytes + blob.size() > kTexCacheBudget) { s_texCache.clear(); s_texCacheBytes = 0; }
+      s_texCacheBytes += blob.size();
+      s_texCache[texKey] = HcTexCacheEntry{blob, td.width, td.height, td.tex_format,
+                                           td.row_pitch_bytes, td.data_bytes, td.array_layers, td.swizzle};
       out_descs.push_back(td); out_blobs.push_back(std::move(blob));
     }
     };  // untileBindings
+    const auto _hc_tu0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
     untileBindings(p3_ps_texbinds, tex_descs, tex_blobs, /*is_ps=*/true);   // set3 (pixel) textures
     untileBindings(p3_vs_texbinds, vs_tex_descs, vs_tex_blobs, /*is_ps=*/false);  // C-5d.3: set2 (vertex/skinning) textures
+    if (hc_profile) s_tUntile += hc_secs(_hc_tu0, hc_clock::now());
 
     // C-5f: per-sampler filter/clamp. For each translated SamplerBinding, resolve the guest sampler
     // state from its texture fetch constant (dword_0 = clamp_x/y/z, dword_3 = mag/min/mip/aniso filter).
@@ -2315,7 +2538,7 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     buildSamplerDescs(p3_ps_sampbinds, ps_samp_descs);
     buildSamplerDescs(p3_vs_sampbinds, vs_samp_descs);
 
-    REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
+    if (hc_verbose) REXLOG_INFO("[highcut-C3b3] draw types: guest_prim={} host_prim={} hvst={} host_vtx_count={} "
                 "index_count(param)={} idx_type={}",
                 uint32_t(result.guest_primitive_type), uint32_t(result.host_primitive_type),
                 uint32_t(result.host_vertex_shader_type), result.host_draw_vertex_count,
@@ -2323,6 +2546,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     nhl::highcut::DrawPacketHeader hdr{};
     hdr.magic = nhl::highcut::kDrawPacketMagic;
     hdr.version = nhl::highcut::kDrawPacketVersion;
+    hdr.vs_shader_id = p3_vs_id;  // by-ID: consumer caches VS module + pipeline by these
+    hdr.ps_shader_id = p3_ps_id;
     // C-3b.3: pick the plume topology + host vertex count to match the translated VS. For a rect
     // list translated as kRectangleListAsTriangleStrip, each guest rect (3 verts) becomes a
     // 4-vertex triangle strip; otherwise draw the guest verts as a triangle list.
@@ -2501,6 +2726,41 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
           ap(&rmagic, 4); ap(&rcount, 4);
           for (const auto& m : highcut_resolves_) ap(&m, sizeof(m));
           HighcutLiveCommitFrame(rbytes.data(), rbytes.size());
+          // Live FPS readout (producer side) — directly shows whether takeover keeps up with the game.
+          // Logs every 60 committed frames with the measured frames/sec and that window's draw count.
+          {
+            static uint32_t s_fpsFrames = 0;
+            static auto s_fpsT0 = std::chrono::steady_clock::now();
+            static double s_prevXlat = 0.0, s_prevUntile = 0.0, s_prevPacket = 0.0;  // per-frame baseline
+            static double s_winXlat = 0.0, s_winUntile = 0.0, s_winPacket = 0.0;     // window accumulator
+            if (hc_profile) {
+              const double fX = s_tXlat - s_prevXlat, fU = s_tUntile - s_prevUntile,
+                           fP = s_tPacket - s_prevPacket;
+              s_prevXlat = s_tXlat; s_prevUntile = s_tUntile; s_prevPacket = s_tPacket;
+              s_winXlat += fX; s_winUntile += fU; s_winPacket += fP;
+              // Per-frame breakdown for SLOW frames: a ~30s dense gameplay frame never reaches the 60-frame
+              // window (= 30 min at 30s/frame), so log its bucket split immediately. >250ms => "slow".
+              if ((fX + fU + fP) * 1000.0 > 250.0)
+                REXLOG_INFO("[highcut-perf] SLOW frame: {} draws  translate={:.0f}ms untile={:.0f}ms "
+                            "packet={:.0f}ms", highcut_capture_idx_, fX * 1000.0, fU * 1000.0, fP * 1000.0);
+            }
+            if (++s_fpsFrames >= 60) {
+              const auto now = std::chrono::steady_clock::now();
+              const double secs =
+                  std::chrono::duration_cast<std::chrono::duration<double>>(now - s_fpsT0).count();
+              REXLOG_INFO("[highcut-perf] live takeover: {:.1f} fps over {} frames ({} draws last frame)",
+                          secs > 0.0 ? s_fpsFrames / secs : 0.0, s_fpsFrames, highcut_capture_idx_);
+              if (hc_profile) {
+                const double ms = 1000.0;
+                REXLOG_INFO("[highcut-perf]   window cost: translate={:.0f}ms untile={:.0f}ms "
+                            "packet={:.0f}ms (of {:.0f}ms wall)",
+                            s_winXlat * ms, s_winUntile * ms, s_winPacket * ms, secs * ms);
+                s_winXlat = s_winUntile = s_winPacket = 0.0;
+              }
+              s_fpsFrames = 0;
+              s_fpsT0 = now;
+            }
+          }
         }
         // The frame that just ENDED: if it was a DENSE 3D scene (enough wide+depth+indexed draws),
         // LATCH it (freeze its bins + count, ignore all later frames) — so F10 timing no longer matters;
@@ -2549,7 +2809,30 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
     // C-6 LIVE FEED: build the packet bytes once (the .bin layout), then either write the file (disk
     // capture / replay) OR hand them to the plume live-feed bridge (HighcutLivePushDraw). Live never
     // latches (skip_capture stays false) so it pushes every frame's draws. (live_feed declared above.)
+    const auto _hc_tp0 = hc_profile ? hc_clock::now() : hc_clock::time_point{};
     if (!skip_capture) {
+      // Step 2: in LIVE mode, stream each unique shader/texture to the consumer's resource dictionary
+      // ONCE and zero its inline byte count, so the per-draw packet no longer carries the ~130KB shader +
+      // texture blobs (≈1 GB/frame of memcpy + bridge memory at 4000+ draws — the crash + 8.3s packet).
+      if (live_feed) {
+        static std::unordered_set<uint64_t> s_sentRes;  // resource ids already streamed (CP thread only)
+        auto stream = [&](uint64_t id, const uint8_t* data, uint32_t n) {
+          if (!id || !data || !n) return;
+          if (s_sentRes.insert(id).second) HighcutLivePushResource(id, data, n);
+        };
+        if (hdr.vs_spirv_bytes) { stream(hdr.vs_shader_id, p3_vs_spirv.data(), hdr.vs_spirv_bytes); hdr.vs_spirv_bytes = 0; }
+        if (hdr.ps_spirv_bytes) { stream(hdr.ps_shader_id, p3_ps_spirv.data(), hdr.ps_spirv_bytes); hdr.ps_spirv_bytes = 0; }
+        for (size_t i = 0; i < tex_descs.size(); ++i)
+          if (tex_descs[i].tex_id && tex_descs[i].data_bytes) {
+            stream(tex_descs[i].tex_id, tex_blobs[i].data(), tex_descs[i].data_bytes);
+            tex_descs[i].data_bytes = 0;  // consumer resolves the blob from the dictionary
+          }
+        for (size_t i = 0; i < vs_tex_descs.size(); ++i)
+          if (vs_tex_descs[i].tex_id && vs_tex_descs[i].data_bytes) {
+            stream(vs_tex_descs[i].tex_id, vs_tex_blobs[i].data(), vs_tex_descs[i].data_bytes);
+            vs_tex_descs[i].data_bytes = 0;
+          }
+      }
       std::vector<uint8_t> pkt;
       auto app = [&](const void* p, size_t n) {
         const uint8_t* b = static_cast<const uint8_t*>(p);
@@ -2564,8 +2847,8 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
       if (hdr.ps_float_bytes) app(ps_floats.data(), hdr.ps_float_bytes);
       if (hdr.vs_spirv_bytes) app(p3_vs_spirv.data(), hdr.vs_spirv_bytes);
       if (hdr.ps_spirv_bytes) app(p3_ps_spirv.data(), hdr.ps_spirv_bytes);
-      for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); app(tex_blobs[i].data(), tex_blobs[i].size()); }
-      for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); app(vs_tex_blobs[i].data(), vs_tex_blobs[i].size()); }  // C-5d.3 VS (set2) after PS textures
+      for (size_t i = 0; i < tex_descs.size(); ++i) { app(&tex_descs[i], sizeof(tex_descs[i])); if (tex_descs[i].data_bytes) app(tex_blobs[i].data(), tex_descs[i].data_bytes); }
+      for (size_t i = 0; i < vs_tex_descs.size(); ++i) { app(&vs_tex_descs[i], sizeof(vs_tex_descs[i])); if (vs_tex_descs[i].data_bytes) app(vs_tex_blobs[i].data(), vs_tex_descs[i].data_bytes); }  // C-5d.3 VS (set2) after PS textures
       for (const auto& sd : ps_samp_descs) app(&sd, sizeof(sd));  // C-5f per-sampler descs (PS then VS)
       for (const auto& sd : vs_samp_descs) app(&sd, sizeof(sd));
       if (hdr.index_bytes) app(index_blob.data(), hdr.index_bytes);  // C-5d, last
@@ -2603,7 +2886,14 @@ void NhlD3D12CommandProcessor::RenderBetaOwnedDraw(
         }
       }
     }
+    if (hc_profile) s_tPacket += hc_secs(_hc_tp0, hc_clock::now());
   }
+
+  // LIVE-TAKEOVER FREEZE FIX: the plume packet for this draw is now captured (or intentionally skipped).
+  // In high-cut live mode the SDK D3D12 owned-draw below is not what's displayed, so skip it entirely —
+  // this is what removes the per-draw residency RequestRange thrash + DXBC translate + D3D12 submit that
+  // froze dense gameplay. Everything from here to the end of this function is owned-draw rendering.
+  if (skip_owned_render) { ++beta_takeover_rendered_; return; }
 
   D3D12_VIEWPORT vp{};
   vp.MinDepth = vpi.z_min;
