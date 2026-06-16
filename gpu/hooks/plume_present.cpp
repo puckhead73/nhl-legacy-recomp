@@ -824,7 +824,8 @@ RenderTextureAddressMode xenosClamp(uint32_t c) {
 // layout/sets/pipeline) so many can be replayed into one RT. Draws with no translated PS are skipped
 // (return false) — C-5a needs a color PS. Returns false on any resource-creation failure.
 bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, RenderableDraw& d,
-                         uint32_t drawIndex = ~0u) {
+                         uint32_t drawIndex, RenderCommandList* upCmd,
+                         std::vector<std::unique_ptr<RenderBuffer>>* upStagings) {
     namespace hc = nhl::highcut;
     if (bytes.size() < sizeof(hc::DrawPacketHeader)) return false;
     hc::DrawPacketHeader hdr{};
@@ -1007,11 +1008,12 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                 default: return RenderFormat::R8G8B8A8_UNORM;
             }
         };
-        auto up = c.queue->createCommandList();
-        auto fence = c.device->createCommandFence();
-        std::vector<std::unique_ptr<RenderBuffer>> stagings;
-        bool anyUpload = false;
-        up->begin();
+        // Perf: record uploads into the FRAME-shared upload command list (executed + fence-waited ONCE
+        // after all draws are built), instead of a per-draw list + per-draw fence wait. A dense frame has
+        // hundreds of dynamic-texture uploads (bone palettes), so per-draw waits were hundreds of GPU
+        // round-trips/frame. Staging buffers live in the frame-shared vector until that single wait.
+        RenderCommandList* up = upCmd;
+        auto& stagings = *upStagings;
         for (auto& t : srcTexs) {
             const RenderFormat rf = mapFmt(t.desc.tex_format, t.desc.is_signed);
             // C-5g: a CUBE binding (array_layers==6) must be a real cube texture+view, else Vulkan
@@ -1076,7 +1078,6 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
                                                                    uint64_t(layer) * faceBytes));
                 }
                 up->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.get(), RenderTextureLayout::SHADER_READ));
-                anyUpload = true;
             }
             RenderTextureViewDesc vd = isCube ? RenderTextureViewDesc::TextureCube(rf)
                                               : RenderTextureViewDesc::Texture2D(rf);
@@ -1089,13 +1090,7 @@ bool BuildRenderableDraw(PlumeCtx& c, const std::vector<uint8_t>& bytes, Rendera
             outView.push_back(viewS);
             stagings.push_back(std::move(staging));
         }
-        up->end();
-        if (anyUpload) {  // only submit when at least one texture was actually (re)uploaded this call
-            const RenderCommandList* cl = up.get();
-            c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, fence.get());
-            c.queue->waitForCommandFence(fence.get());
-        }
-        return true;
+        return true;  // uploads are submitted + waited ONCE by LoadC5Frames after all draws are built
     };
     // C-5f: build `count` samplers from the guest SamplerBindings (honor filter+clamp per binding). The
     // descriptor set declares `count` sampler bindings at nTex+i; bind sampler i = descs[i]. When the
@@ -1356,6 +1351,12 @@ void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraw
     // descriptor-set creation. NHL_HIGHCUT_PROFILE gates the log.
     static const bool c5_profile = std::getenv("NHL_HIGHCUT_PROFILE") != nullptr;
     const auto rebuildT0 = std::chrono::steady_clock::now();
+    // Perf: ONE upload command list + ONE fence wait for ALL of this frame's texture uploads (was a
+    // per-draw list + per-draw wait → hundreds of GPU round-trips/frame on dynamic textures).
+    auto upCmd = c.queue->createCommandList();
+    auto upFence = c.device->createCommandFence();
+    std::vector<std::unique_ptr<RenderBuffer>> upStagings;
+    upCmd->begin();
     for (uint32_t i = 0; i < count; ++i) {
         std::vector<uint8_t> diskBytes;
         const std::vector<uint8_t>* bytes = nullptr;
@@ -1375,8 +1376,15 @@ void LoadC5Frames(PlumeCtx& c, const std::vector<std::vector<uint8_t>>* liveDraw
         }
         if (bytes->empty()) { ++skipped; continue; }
         RenderableDraw d;
-        if (BuildRenderableDraw(c, *bytes, d, i)) { c.c5draws.push_back(std::move(d)); ++built; }
+        if (BuildRenderableDraw(c, *bytes, d, i, upCmd.get(), &upStagings)) { c.c5draws.push_back(std::move(d)); ++built; }
         else ++skipped;
+    }
+    // Perf: submit + wait the whole frame's texture uploads ONCE (replaces per-draw fence waits).
+    upCmd->end();
+    {
+        const RenderCommandList* cl = upCmd.get();
+        c.queue->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, upFence.get());
+        c.queue->waitForCommandFence(upFence.get());
     }
     if (c5_profile) {
         const double ms = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
