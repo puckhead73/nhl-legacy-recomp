@@ -7,6 +7,7 @@
 #include <rex/ui/keybinds.h>
 
 #include "renderer/core/nhl_input_gate.h"
+#include "renderer/core/nhl_settings.h"
 
 // SDK GPU cvars driven by the cheap-win knobs. draw_resolution_scale_* are
 // defined in the SDK texture cache and read at backend init (VulkanTextureCache::
@@ -154,10 +155,11 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       if (ImGui::SliderInt("Supersampling", &scale, 1, 4, "%dx")) {
         REXCVAR_SET(draw_resolution_scale_x, scale);
         REXCVAR_SET(draw_resolution_scale_y, scale);
+        nhl::SaveSupersampling(scale);  // persist so it applies on the next launch
       }
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "[restart]");
-      ImGui::TextDisabled("internal %dx%d, downsampled to the window",
+      ImGui::TextDisabled("internal %dx%d \xE2\x80\x94 saved; applies on next launch",
                           1280 * scale, 720 * scale);
 
       bool vsync_on = REXCVAR_GET(vsync);

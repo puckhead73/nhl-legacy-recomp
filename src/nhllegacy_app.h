@@ -44,6 +44,7 @@
 #include <rex/ui/imgui_drawer.h>     // OnCreateDialogs param
 #include "renderer/core/nhl_vk_backend.h"
 #include "renderer/core/nhl_overlay.h"
+#include "renderer/core/nhl_settings.h"
 #endif
 #include "tools/replay/src/image_dump.h"
 #include "tools/replay/src/xtr_player.h"
@@ -204,14 +205,19 @@ class NhllegacyApp : public rex::ReXApp {
     // rebuild. Only meaningful on the Vulkan fsi path; clamp 1..4 (4 = 2880p
     // internal, VRAM-heavy). Falls back to the default 1 when unset/invalid.
     if (std::getenv("NHL_VK_BACKEND")) {
+      // Supersampling scale: the persisted overlay choice (nhl_enhancements.ini)
+      // takes effect at launch; NHL_VK_SS env is a dev override. 0 => unset, leave
+      // the default 1x. Restart-required (read once at backend init).
+      int32_t scale = nhl::LoadSupersampling(/*fallback=*/0);
       if (const char* ss = std::getenv("NHL_VK_SS"); ss && *ss) {
-        int32_t scale = int32_t(std::strtol(ss, nullptr, 10));
-        if (scale < 1) scale = 1;
+        scale = int32_t(std::strtol(ss, nullptr, 10));
+      }
+      if (scale >= 1) {
         if (scale > 4) scale = 4;
         REXCVAR_SET(draw_resolution_scale_x, scale);
         REXCVAR_SET(draw_resolution_scale_y, scale);
         REXLOG_INFO("[nhl-vk-ss] internal-resolution supersampling {}x "
-                    "(internal {}x{}) via NHL_VK_SS",
+                    "(internal {}x{})",
                     scale, 1280 * scale, 720 * scale);
       }
     }
