@@ -246,25 +246,51 @@ std::shared_ptr<const std::vector<uint8_t>> LooseTreeDevice::BuildSynth(
 #if NHLLEGACY_HAVE_RX2FFI
   if (override_root_.empty()) return nullptr;
   std::error_code ec;
-  const std::filesystem::path ovr_dir = override_root_ / std::filesystem::path(rel);
-  if (!std::filesystem::is_directory(ovr_dir, ec)) return nullptr;
+  // Resolve the override location, accepting two layouts:
+  //   A) a folder named exactly as the .rx2 INCLUDING the extension —
+  //      "<rel>/<NN>.dds" (the original hand-authored loose-override convention);
+  //   B) the bulk texture exporter's layout (tdb-gui-api export_all_textures):
+  //      a folder named after the .rx2 STEM (no extension) holding
+  //      "<NN>_<name>.dds" slot files, or — for a single-texture .rx2 — a flat
+  //      sibling file "<stem>.dds" (treated as slot 0).
+  // Slot index is the LEADING digits of the .dds stem, so stoul("07_diffuse")
+  // yields 7 and the exporter's "<NN>_<name>.dds" naming works unchanged.
+  const std::filesystem::path rel_path(rel);
+  std::filesystem::path rel_noext = rel_path;
+  rel_noext.replace_extension();  // drop ".rx2"
 
   std::vector<std::pair<uint32_t, std::vector<uint8_t>>> dds;
-  for (const auto& de : std::filesystem::directory_iterator(ovr_dir, ec)) {
-    if (ec) break;
-    if (!de.is_regular_file(ec)) continue;
-    const std::filesystem::path& p = de.path();
-    if (!EndsWithCi(p.extension().string(), ".dds")) continue;
-    uint32_t slot = 0;
-    try {
-      // On MSVC `unsigned long` is 32-bit, so stoul's range == uint32_t's and an
-      // overflow throws std::out_of_range (caught below); the cast is lossless here.
-      slot = static_cast<uint32_t>(std::stoul(p.stem().string()));
-    } catch (...) {
-      continue;  // non-numeric stem or out-of-range -> skip this slot file
+  auto scan_dir = [&](const std::filesystem::path& dir) {
+    if (!std::filesystem::is_directory(dir, ec)) return;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+      if (ec) break;
+      if (!de.is_regular_file(ec)) continue;
+      const std::filesystem::path& p = de.path();
+      if (!EndsWithCi(p.extension().string(), ".dds")) continue;
+      uint32_t slot = 0;
+      try {
+        // On MSVC `unsigned long` is 32-bit, so stoul's range == uint32_t's and an
+        // overflow throws std::out_of_range (caught below); the cast is lossless here.
+        slot = static_cast<uint32_t>(std::stoul(p.stem().string()));
+      } catch (...) {
+        continue;  // no leading digits or out-of-range -> skip this slot file
+      }
+      std::vector<uint8_t> bytes = ReadFile(p);
+      if (!bytes.empty()) dds.emplace_back(slot, std::move(bytes));
     }
-    std::vector<uint8_t> bytes = ReadFile(p);
-    if (!bytes.empty()) dds.emplace_back(slot, std::move(bytes));
+  };
+
+  // Folder A (with extension) wins; fall back to the exporter's stem folder (B).
+  scan_dir(override_root_ / rel_path);
+  if (dds.empty()) scan_dir(override_root_ / rel_noext);
+  // Single-texture exporter output: a flat sibling "<stem>.dds" == slot 0.
+  if (dds.empty()) {
+    std::filesystem::path flat = override_root_ / rel_noext;
+    flat += ".dds";
+    if (std::filesystem::is_regular_file(flat, ec)) {
+      std::vector<uint8_t> bytes = ReadFile(flat);
+      if (!bytes.empty()) dds.emplace_back(0u, std::move(bytes));
+    }
   }
   if (dds.empty()) return nullptr;
 

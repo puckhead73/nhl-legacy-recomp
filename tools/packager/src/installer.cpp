@@ -13,6 +13,10 @@
 #include "iso_source.h"
 #include "manifest.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace packager {
 
 namespace fs = std::filesystem;
@@ -57,6 +61,39 @@ bool IsInsideOf(const fs::path& inner, const fs::path& outer) {
     if (ai == a.end() || *ai != *bi) return false;
   }
   return true;
+}
+
+// Launch a child process and block until it exits; returns its exit code, or -1
+// if it could not be launched. Each argv element is wrapped in quotes (our paths
+// never contain quotes), which is sufficient for spaced install/game paths.
+int RunProcessWait(const std::vector<std::wstring>& argv) {
+#ifdef _WIN32
+  std::wstring cmd;
+  for (size_t i = 0; i < argv.size(); ++i) {
+    if (i) cmd += L' ';
+    cmd += L'"';
+    cmd += argv[i];
+    cmd += L'"';
+  }
+  std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+  buf.push_back(L'\0');
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                      nullptr, &si, &pi)) {
+    return -1;
+  }
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1;
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  return static_cast<int>(code);
+#else
+  (void)argv;
+  return -1;
+#endif
 }
 
 }  // namespace
@@ -190,6 +227,40 @@ int RunInstall(const InstallOptions& opts) {
     err = {ErrorCode::kBadPayload,
            manifest.port_exe + " missing from the payload"};
     return Fail(err);
+  }
+
+  // --- Unpack the .big archives into their loose file structure ---
+  // The port runs from the .big directly; this loose tree (game/_compiled) is the
+  // overlay the engine reads FIRST, so modders can browse/replace assets. Needs
+  // the QuickBMS-based extractor bundled in the payload under extractor/; if it
+  // isn't present (older payloads) we skip cleanly. Non-fatal either way — the
+  // game still runs from the archives if unpacking fails.
+  {
+    const fs::path extractor_dir = opts.payload_dir / "extractor";
+    const fs::path big_cli = extractor_dir / "extract_big_cli.exe";
+    const fs::path quickbms = extractor_dir / "quickbms.exe";
+    const fs::path bms = extractor_dir / "fightnight.bms";
+    if (fs::is_regular_file(big_cli, ec) && fs::is_regular_file(quickbms, ec) &&
+        fs::is_regular_file(bms, ec)) {
+      const fs::path compiled = game_dir / "_compiled";
+      fprintf(stdout,
+              "Unpacking .big archives into their file structure "
+              "(this enables loose-file modding) ...\n");
+      const int rc = RunProcessWait({
+          big_cli.wstring(),
+          L"--quickbms", quickbms.wstring(),
+          L"--script", bms.wstring(),
+          L"--source", game_dir.wstring(),
+          L"--target", compiled.wstring(),
+      });
+      if (rc != 0) {
+        fprintf(stdout,
+                "  (note: .big unpacking returned %d; the game still runs from the "
+                "archives, but the loose modding tree under game\\_compiled was not "
+                "produced)\n",
+                rc);
+      }
+    }
   }
 
   fs::remove(marker, ec);

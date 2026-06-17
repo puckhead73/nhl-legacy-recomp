@@ -17,7 +17,9 @@ param(
     [string]$LlvmBin   = "C:\Program Files\LLVM\bin",
     [switch]$RunCodegen,             # re-run rexglue codegen before building
     [string]$TestInput = "",         # ISO or extracted folder for the post-zip self-check
-    [string]$OutDir    = ""
+    [string]$OutDir    = "",
+    [string]$StudioDir = "E:\Repositories\nhl-database-studio",  # for the .big/texture extractor
+    [switch]$NoExtractor             # skip bundling the .big extractor (smaller payload)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -124,6 +126,33 @@ Copy-Item (Join-Path $BuildDir $TracyDll) $Payload
 Get-ChildItem $BuildDir -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue |
     ForEach-Object { Copy-Item $_.FullName $Payload }
 Set-Content -Path (Join-Path $Payload "manifest.toml") -Value $ManifestText -Encoding ascii
+
+# payload/extractor/: the QuickBMS-based .big unpacker the installer runs after
+# extracting the disc (game/ -> game/_compiled), so end users get the loose-file
+# modding tree. The .big are EA's EB\x00\x03 format, which only QuickBMS +
+# fightnight.bms decodes; extract_big_cli wraps it (built from nhl-database-studio).
+if (-not $NoExtractor) {
+    Step "Bundle .big extractor"
+    $StudioRes = Join-Path $StudioDir "app\src-tauri\resources\extractor"
+    $BigCli    = Join-Path $StudioDir "target\release\extract_big_cli.exe"
+    if (-not (Test-Path $BigCli)) {
+        Write-Host "Building extract_big_cli (nhl-database-studio) ..."
+        Push-Location $StudioDir
+        cargo build -p tdb-gui-api --bin extract_big_cli --release
+        Pop-Location
+    }
+    $missing = @($BigCli, (Join-Path $StudioRes "quickbms.exe"), (Join-Path $StudioRes "fightnight.bms")) |
+        Where-Object { -not (Test-Path $_) }
+    if ($missing) {
+        throw "extractor bundle missing: $($missing -join ', '). Pass -NoExtractor to skip, or fix -StudioDir."
+    }
+    $ExtractorOut = Join-Path $Payload "extractor"
+    New-Item -ItemType Directory -Force $ExtractorOut | Out-Null
+    Copy-Item $BigCli $ExtractorOut
+    Copy-Item (Join-Path $StudioRes "quickbms.exe") $ExtractorOut
+    Copy-Item (Join-Path $StudioRes "fightnight.bms") $ExtractorOut
+    Write-Host "Bundled extractor -> payload\extractor\ (extract_big_cli, quickbms, fightnight.bms)"
+}
 
 # --- 5. Zip ---
 Step "Zip"
