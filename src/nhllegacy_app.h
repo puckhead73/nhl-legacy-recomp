@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -37,7 +38,12 @@
 // the default (D3D12-only) build stays link-clean.
 #ifdef NHL_HAVE_VULKAN_BACKEND
 #include <rex/graphics/vulkan/graphics_system.h>
+#include <rex/input/flags.h>         // guide_button cvar
+#include <rex/input/input.h>         // X_INPUT_STATE, X_INPUT_GAMEPAD_GUIDE
+#include <rex/input/input_system.h>  // rex::input::InputSystem::GetState
+#include <rex/ui/imgui_drawer.h>     // OnCreateDialogs param
 #include "renderer/core/nhl_vk_backend.h"
+#include "renderer/core/nhl_overlay.h"
 #endif
 #include "tools/replay/src/image_dump.h"
 #include "tools/replay/src/xtr_player.h"
@@ -82,6 +88,14 @@ REXCVAR_DECLARE(int32_t, window_height);
 // into this widely-included header). Used only by the replay-mode fast-exit.
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
 extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, unsigned int code);
+
+#ifdef NHL_PGO_INSTRUMENT
+// PGO instrumentation profile writer (compiler-rt profile runtime, auto-linked by
+// -fprofile-generate). Our exit paths hard-exit via TerminateProcess, which skips
+// the atexit handler that normally writes the .profraw — so we must flush it by
+// hand before terminating. Only declared/called in the instrumented build.
+extern "C" int __llvm_profile_write_file(void);
+#endif
 
 class NhllegacyApp : public rex::ReXApp {
  public:
@@ -131,6 +145,11 @@ class NhllegacyApp : public rex::ReXApp {
         REXCVAR_SET(vulkan_readback_resolve, true);
         REXLOG_INFO("[nhl-vk-spike] resolve readback enabled (readback_resolve=full)");
       }
+      // Enable Guide/PS button pass-through so the host can read it
+      // (XInputGetStateEx ordinal 100 / SDL mapping) to toggle the enhancements
+      // overlay. The guest never reads Guide (the 360 reserved it for the
+      // dashboard), so capturing it host-side never conflicts with gameplay.
+      REXCVAR_SET(guide_button, true);
       REXLOG_INFO("[nhl-vk-spike] Vulkan backend selected (render_target_path_vulkan={})",
                   vk_rt ? vk_rt : "fsi");
     } else
@@ -168,6 +187,26 @@ class NhllegacyApp : public rex::ReXApp {
     REXCVAR_SET(draw_resolution_scale_y, 1);
     REXCVAR_SET(window_width, 1920);
     REXCVAR_SET(window_height, 1080);
+#ifdef NHL_HAVE_VULKAN_BACKEND
+    // Enhancement A (docs/vulkan-enhancements-kickoff-prompt.md §3.A): internal-
+    // resolution supersampling. The SDK renders the guest 1280x720 internally and
+    // downsamples to the window; draw_resolution_scale is an integer multiplier
+    // (2 => 1440p, 3 => 2160p internal). Env-driven so 1x/2x/3x A/B needs no
+    // rebuild. Only meaningful on the Vulkan fsi path; clamp 1..4 (4 = 2880p
+    // internal, VRAM-heavy). Falls back to the default 1 when unset/invalid.
+    if (std::getenv("NHL_VK_BACKEND")) {
+      if (const char* ss = std::getenv("NHL_VK_SS"); ss && *ss) {
+        int32_t scale = int32_t(std::strtol(ss, nullptr, 10));
+        if (scale < 1) scale = 1;
+        if (scale > 4) scale = 4;
+        REXCVAR_SET(draw_resolution_scale_x, scale);
+        REXCVAR_SET(draw_resolution_scale_y, scale);
+        REXLOG_INFO("[nhl-vk-ss] internal-resolution supersampling {}x "
+                    "(internal {}x{}) via NHL_VK_SS",
+                    scale, 1280 * scale, 720 * scale);
+      }
+    }
+#endif
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
     // provider creates the device. Used to get the exact device-removal reason
     // while debugging the beta owned-draw path.
@@ -292,6 +331,71 @@ class NhllegacyApp : public rex::ReXApp {
     }
   }
 
+#ifdef NHL_HAVE_VULKAN_BACKEND
+  // Stand up the in-game enhancements overlay (Vulkan-path only). Called by the
+  // SDK from SetupPresentation after the ImGui drawer exists. The dialog is
+  // always registered with the drawer so its per-frame OnDraw can poll the
+  // controller Guide/PS button (toggle) even while hidden. We hand it two hooks:
+  // a controller poll (host-side InputSystem::GetState — catches both Xbox
+  // XInput and PlayStation/SDL pads, both mapped to X_INPUT_GAMEPAD_GUIDE) and
+  // the Vulkan fps/draws snapshot for the perf HUD.
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    if (!std::getenv("NHL_VK_BACKEND")) {
+      return;  // enhancements overlay belongs to the Vulkan-fsi enhancement set
+    }
+    auto poll_pad = [this]() -> nhl::ui::PadState {
+      nhl::ui::PadState pad;
+      auto* input = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+      if (!input) {
+        return pad;
+      }
+      float best_mag = 0.0f;
+      for (uint32_t user = 0; user < 4; ++user) {
+        rex::input::X_INPUT_STATE state{};
+        // GetState returns rex::X_RESULT; 0 == X_ERROR_SUCCESS. (The macro itself
+        // expands to an unqualified X_RESULT cast that only resolves inside
+        // namespace rex, so compare the literal here.)
+        if (input->GetState(user, &state) != 0) {
+          continue;
+        }
+        pad.connected = true;
+        pad.buttons |= static_cast<uint16_t>(state.gamepad.buttons);
+        // Left stick from whichever connected pad is deflected most, so any
+        // controller drives the menu.
+        const float lx = static_cast<float>(state.gamepad.thumb_lx) / 32767.0f;
+        const float ly = static_cast<float>(state.gamepad.thumb_ly) / 32767.0f;
+        const float mag = std::fabs(lx) + std::fabs(ly);
+        if (mag > best_mag) {
+          best_mag = mag;
+          pad.lx = lx;
+          pad.ly = ly;
+        }
+      }
+      return pad;
+    };
+    auto perf = []() -> nhl::ui::PerfSnapshot {
+      const nhl::graphics::NhlVkPerfSnapshot s = nhl::graphics::ReadVkPerf();
+      return nhl::ui::PerfSnapshot{s.fps, s.frame_ms, s.draws_per_frame,
+                                   s.frames_total, s.valid};
+    };
+    auto on_exit = []() {
+      // The recomp's normal app/kernel/GPU teardown (QuitFromUIThread -> OnDestroy,
+      // which joins the still-running guest thread) HANGS when torn down mid-guest-
+      // lifecycle — the trace-replay path documents the same hazard and deliberately
+      // hard-exits. A graceful quit here hung on "Exit Game". The game has nothing
+      // unsaved at this point, so flush the log and terminate the process directly.
+#ifdef NHL_PGO_INSTRUMENT
+      __llvm_profile_write_file();  // capture the PGO profile before hard-exit
+#endif
+      rex::ShutdownLogging();
+      ::TerminateProcess(::GetCurrentProcess(), 0u);
+    };
+    enh_overlay_ = std::make_unique<nhl::ui::NhlEnhancementsDialog>(
+        drawer, std::move(poll_pad), std::move(perf), std::move(on_exit));
+    REXLOG_INFO("[nhl-vk] enhancements overlay ready (Guide/PS button or F1 to toggle)");
+  }
+#endif
+
   // Replay-and-screenshot mode. With NHL_REPLAY_XTR=<frame.xtr>, replay the
   // captured frame through the live backend + presenter (instead of launching
   // the guest), read back the presented image, and write replay_frame.png next
@@ -299,6 +403,22 @@ class NhllegacyApp : public rex::ReXApp {
   // processor, so the resolves + scaler complete — unlike the headless tool,
   // where IssueSwap had no presenter to flush into (black output).
   void LaunchModule() override {
+#ifdef NHL_PGO_INSTRUMENT
+    // PGO capture helper: with NHL_PGO_DUMP_AFTER=<seconds>, play normally, then
+    // auto-flush the profile and hard-exit after that long — makes profile capture
+    // scriptable and independent of overlay/Exit-Game navigation. Spawn the timer,
+    // then fall through to the normal launch so the game actually runs.
+    if (const char* s = std::getenv("NHL_PGO_DUMP_AFTER"); s && *s) {
+      const unsigned secs = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+      std::thread([secs]() {
+        ::Sleep(secs * 1000u);
+        std::fprintf(stderr, "[nhl-pgo] auto-dumping profile after %u s\n", secs);
+        __llvm_profile_write_file();
+        rex::ShutdownLogging();
+        ::TerminateProcess(::GetCurrentProcess(), 0u);
+      }).detach();
+    }
+#endif
     // Stage B of the Overall-formula hunt (overall_weights_dump.h). With
     // NHL_DUMP_OVERALL_WEIGHTS set, the image is already mapped into guest
     // memory by Setup, so scan it for the gCardOverallWeights_* anchors +
@@ -360,12 +480,21 @@ class NhllegacyApp : public rex::ReXApp {
       return;
     }
     const std::string xtr_path = xtr;
+    // NHL_REPLAY_BENCH=<iterations>: deterministic CPU benchmark of the SDK command
+    // processor (PM4 decode + state translation + submission) — re-replays the
+    // frame N times and logs warm min/median/mean ms. Used to A/B an optimized SDK
+    // rebuild (replay bypasses the guest recomp, so it isolates the SDK layer).
+    int bench_iters = 0;
+    if (const char* b = std::getenv("NHL_REPLAY_BENCH"); b && *b) {
+      bench_iters = int(std::strtol(b, nullptr, 10));
+    }
     // Defer to the UI thread (presenter fully live), then replay on a background
     // thread (it blocks awaiting the GPU worker), keeping the UI message loop
     // pumping meanwhile.
-    app_context().CallInUIThreadDeferred([this, xtr_path]() {
-      replay_thread_ = std::thread([this, xtr_path]() {
-        const bool ok = ReplayAndCapture(xtr_path);
+    app_context().CallInUIThreadDeferred([this, xtr_path, bench_iters]() {
+      replay_thread_ = std::thread([this, xtr_path, bench_iters]() {
+        const bool ok = bench_iters > 0 ? BenchmarkReplayMode(xtr_path, bench_iters)
+                                        : ReplayAndCapture(xtr_path);
         // Replay mode never launched the guest module, so the normal
         // app/kernel/GPU teardown path — which assumes a running guest lifecycle
         // — double-frees and corrupts the heap on exit (0xC0000374 in ntdll,
@@ -381,6 +510,17 @@ class NhllegacyApp : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+#ifdef NHL_PGO_INSTRUMENT
+    // Safety net: OnShutdown runs at the START of OnDestroy, before the teardown
+    // that hangs — so flush the PGO profile here too (covers an X-close exit).
+    __llvm_profile_write_file();
+#endif
+#ifdef NHL_HAVE_VULKAN_BACKEND
+    // ReXApp::OnDestroy() calls OnShutdown() BEFORE it resets the ImGui drawer,
+    // so destroy our dialog here while the drawer is still alive (the dialog dtor
+    // calls drawer->RemoveDialog). Resetting it after teardown would dangle.
+    enh_overlay_.reset();
+#endif
     // Only reached on the normal (non-replay) path; replay mode fast-exits above.
     if (replay_thread_.joinable()) {
       replay_thread_.join();
@@ -393,6 +533,22 @@ class NhllegacyApp : public rex::ReXApp {
   // void OnCreateDialogs(ui::ImGuiDrawer* drawer) override {}
 
  private:
+  // Deterministic CPU benchmark of the SDK command processor (NHL_REPLAY_BENCH).
+  // Replays the frame `iters` times and logs warm min/median/mean ms.
+  bool BenchmarkReplayMode(const std::string& xtr_path, int iters) {
+    auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+    if (!gs) {
+      REXLOG_ERROR("[nhl-bench] no graphics system");
+      return false;
+    }
+    const nhl::replay::ReplayStats stats =
+        nhl::replay::BenchmarkReplay(*gs, xtr_path, iters);
+    if (!stats.ok) {
+      REXLOG_ERROR("[nhl-bench] failed: {}", stats.error);
+    }
+    return stats.ok;
+  }
+
   // Returns true only if the replay produced and wrote the PNG, so the caller can
   // surface a nonzero exit code on failure (CI/automation otherwise sees success).
   bool ReplayAndCapture(const std::string& xtr_path) {
@@ -441,4 +597,9 @@ class NhllegacyApp : public rex::ReXApp {
   }
 
   std::thread replay_thread_;
+#ifdef NHL_HAVE_VULKAN_BACKEND
+  // In-game enhancements overlay (created in OnCreateDialogs under NHL_VK_BACKEND,
+  // destroyed in OnShutdown before the SDK tears down the ImGui drawer).
+  std::unique_ptr<nhl::ui::NhlEnhancementsDialog> enh_overlay_;
+#endif
 };

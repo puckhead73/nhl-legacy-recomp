@@ -38,3 +38,7 @@
 # but third_party/plume/ is an EMBEDDED git repo (vendored clone), so the parent repo cannot
 # track files inside it. The change is recorded in docs/plume-readback-patch.md (re-apply after
 # any plume re-vendor). Not un-ignoring it here since git can't add it through the nested repo.
+
+# PGO capture data (regenerable via _build_vk_pgogen.bat + llvm-profdata; see
+# the vk-perf-profile-findings memory). Large binary profiles, not for git.
+/pgo/

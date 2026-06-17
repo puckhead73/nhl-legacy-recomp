@@ -1,5 +1,7 @@
 #include "xtr_player.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -340,6 +342,84 @@ ReplayStats ReplayTrace(gfx::GraphicsSystem& graphics_system, const std::string&
     done.set_value();
   });
   fut.wait();
+  return stats;
+}
+
+ReplayStats BenchmarkReplay(gfx::GraphicsSystem& graphics_system,
+                            const std::string& trace_path, int iterations,
+                            int warmup) {
+  ReplayStats stats;
+  if (iterations < 1) iterations = 1;
+  if (warmup < 0) warmup = 0;
+
+  std::ifstream f(trace_path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    stats.error = "could not open trace file";
+    return stats;
+  }
+  const std::streamsize len = f.tellg();
+  f.seekg(0);
+  std::vector<uint8_t> data(static_cast<size_t>(len));
+  if (!f.read(reinterpret_cast<char*>(data.data()), len)) {
+    stats.error = "could not read trace file";
+    return stats;
+  }
+
+  auto* memory = graphics_system.memory();
+  auto* cp = graphics_system.command_processor();
+  if (!memory || !cp) {
+    stats.error = "graphics system has no memory / command processor";
+    return stats;
+  }
+
+  std::vector<double> times;
+  times.reserve(static_cast<size_t>(iterations));
+
+  // Run the whole loop on the CP worker thread (DriveStream MUST run there), so
+  // there is no per-iteration cross-thread post overhead in the timing. The trace
+  // is read+held once; each iteration re-applies the frame's memory/EDRAM/regs and
+  // re-executes all packets — a complete, deterministic frame replay.
+  std::promise<void> done;
+  std::future<void> fut = done.get_future();
+  cp->CallInThread([&]() {
+    for (int i = 0; i < iterations; ++i) {
+      ReplayStats it;
+      const auto t0 = std::chrono::steady_clock::now();
+      DriveStream(data, *memory, *cp, it);
+      const auto t1 = std::chrono::steady_clock::now();
+      times.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+      stats = it;  // keep the last iteration's counts
+    }
+    done.set_value();
+  });
+  fut.wait();
+
+  // Summarize the warm iterations (skip the cold cache / PSO-creation runs).
+  const size_t skip = std::min(static_cast<size_t>(warmup), times.size());
+  std::vector<double> warm(times.begin() + skip, times.end());
+  if (warm.empty()) {
+    warm = times;
+  }
+  std::sort(warm.begin(), warm.end());
+  const double wmin = warm.front();
+  const double wmax = warm.back();
+  const double wmed = warm[warm.size() / 2];
+  double wsum = 0.0;
+  for (double v : warm) {
+    wsum += v;
+  }
+  const double wmean = wsum / static_cast<double>(warm.size());
+
+  REXLOG_INFO(
+      "[nhl-bench] {} iters ({} warm) draws/frame={} | warm ms: "
+      "min={:.3f} median={:.3f} mean={:.3f} max={:.3f}",
+      iterations, warm.size(), stats.draw_packets, wmin, wmed, wmean, wmax);
+  std::fprintf(stderr,
+               "[nhl-bench] %d iters (%zu warm) draws=%u | warm ms: "
+               "min=%.3f median=%.3f mean=%.3f max=%.3f\n",
+               iterations, warm.size(), stats.draw_packets, wmin, wmed, wmean, wmax);
+  std::fflush(stderr);
+  stats.ok = true;
   return stats;
 }
 

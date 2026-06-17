@@ -77,6 +77,14 @@ if(NHLLEGACY_VULKAN_BACKEND)
     # Compiled ONLY in the Vulkan build dir — links the SDK's Vulkan backend symbols
     # that the default (D3D12-only) SDK does not export.
     target_sources(nhllegacy PRIVATE renderer/core/nhl_vk_backend.cpp)
+    # In-game enhancements/settings overlay (Guide-button toggle + perf HUD +
+    # supersampling). VK-gated: it reads the Vulkan fps tap and is only created
+    # under NHL_VK_BACKEND. Uses the SDK ImGui drawer (rexui/imgui, already linked).
+    target_sources(nhllegacy PRIVATE renderer/core/nhl_overlay.cpp)
+    # Guest controller-input block while the overlay is open (overrides the guest
+    # XamInputGetState import). VK-build-only so the default D3D12 build's input
+    # path is unchanged.
+    target_sources(nhllegacy PRIVATE src/input_block.cpp)
     message(STATUS "nhllegacy: Vulkan backend gate ENABLED (NHL_HAVE_VULKAN_BACKEND)")
 endif()
 

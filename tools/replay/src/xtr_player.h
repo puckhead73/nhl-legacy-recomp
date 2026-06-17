@@ -38,4 +38,15 @@ struct ReplayStats {
 ReplayStats ReplayTrace(rex::graphics::GraphicsSystem& graphics_system,
                         const std::string& trace_path);
 
+// Deterministic CPU benchmark of the command processor's per-frame work
+// (PM4 decode + state translation + draw submission). Reads the trace ONCE, then
+// replays it `iterations` times on the CP worker thread, timing each. Skips the
+// first `warmup` iterations (cold caches / PSO creation) and reports min/median/
+// mean ms of the warm runs via the logger. This exercises ONLY the SDK command
+// processor path (no guest recomp), so it is the right A/B for an optimized SDK
+// rebuild. Returns the last iteration's stats (draw_packets etc.).
+ReplayStats BenchmarkReplay(rex::graphics::GraphicsSystem& graphics_system,
+                            const std::string& trace_path, int iterations,
+                            int warmup = 3);
+
 }  // namespace nhl::replay

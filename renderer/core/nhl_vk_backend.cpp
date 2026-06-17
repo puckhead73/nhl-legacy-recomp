@@ -1,8 +1,25 @@
 #include "renderer/core/nhl_vk_backend.h"
 
+#include <mutex>
+
 #include <rex/logging.h>
 
 namespace nhl::graphics {
+
+namespace {
+std::mutex g_perf_mutex;
+NhlVkPerfSnapshot g_perf;
+}  // namespace
+
+void PublishVkPerf(const NhlVkPerfSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(g_perf_mutex);
+  g_perf = snapshot;
+}
+
+NhlVkPerfSnapshot ReadVkPerf() {
+  std::lock_guard<std::mutex> lock(g_perf_mutex);
+  return g_perf;
+}
 
 std::string NhlVkGraphicsSystem::name() const {
   return "nhl-vulkan (rexglue ROV + fps tap)";
@@ -57,6 +74,8 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         "[nhl-vk-fps] fps={:.1f} frame_ms={:.2f} draws/frame={:.0f} (last_frame_draws={}) "
         "frames_total={}",
         fps, frame_ms, avg_draws, last_frame_draws_, frames_total_);
+    // Publish for the enhancements overlay's perf HUD.
+    PublishVkPerf(NhlVkPerfSnapshot{fps, frame_ms, avg_draws, frames_total_, true});
     window_start_ = now;
     window_frames_ = 0;
     window_draws_ = 0;

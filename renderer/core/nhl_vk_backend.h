@@ -25,6 +25,18 @@
 
 namespace nhl::graphics {
 
+// Latest 1 Hz perf window published by NhlVkCommandProcessor::IssueSwap (CP
+// thread) and read by the enhancements overlay (UI thread). Thread-safe.
+struct NhlVkPerfSnapshot {
+  double fps = 0.0;
+  double frame_ms = 0.0;
+  double draws_per_frame = 0.0;
+  uint64_t frames_total = 0;
+  bool valid = false;
+};
+void PublishVkPerf(const NhlVkPerfSnapshot& snapshot);
+NhlVkPerfSnapshot ReadVkPerf();
+
 class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcessor {
  public:
   // Inherit the (VulkanGraphicsSystem*, KernelState*) constructor.
