@@ -141,25 +141,32 @@ $Payload   = Join-Path $Stage "payload"
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 New-Item -ItemType Directory -Force $Payload | Out-Null
 
-# Top level: builder CLI + its runtime DLLs + docs.
+# Resolve the FidelityFX runtime DLL(s). rexruntime on the FFX build hard-imports
+# amd_fidelityfx_vk.dll, so BOTH the port and the builder fail to load without it
+# (0xC0000135 STATUS_DLL_NOT_FOUND). The build scripts don't always stage it next
+# to the exe, so fall back to the SDK install's bin/ when it's not in $BuildDir.
+$FfxDlls = @(Get-ChildItem $BuildDir -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue)
+if (-not $FfxDlls) {
+    $SdkBin = Join-Path $SdkDir "bin"
+    $FfxDlls = @(Get-ChildItem $SdkBin -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue)
+}
+if (-not $FfxDlls) {
+    throw "amd_fidelityfx*.dll not found in '$BuildDir' or '$SdkDir\bin' - the FFX build needs it. Stage it beside the exe or fix -SdkDir."
+}
+
+# Top level: builder CLI + its runtime DLLs (incl. FFX) + docs.
 Copy-Item $BuilderExe $Stage
 Copy-Item (Join-Path $BuildDir "tools\packager\$RuntimeDll") $Stage
 Copy-Item (Join-Path $BuildDir "tools\packager\$TracyDll") $Stage
-# The builder links the same rexruntime as the port, which on the FFX build
-# imports amd_fidelityfx_vk.dll - so the builder needs it beside its exe too
-# (without it the loader fails with 0xC0000135 STATUS_DLL_NOT_FOUND).
-Get-ChildItem $BuildDir -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue |
-    ForEach-Object { Copy-Item $_.FullName $Stage }
+$FfxDlls | ForEach-Object { Copy-Item $_.FullName $Stage }
 Copy-Item (Join-Path $PSScriptRoot "README.payload.md") (Join-Path $Stage "README.txt")
 Copy-Item (Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt") $Stage
 
-# payload/: the prebuilt port + its runtime DLLs + manifest.
+# payload/: the prebuilt port + its runtime DLLs (incl. FFX) + manifest.
 Copy-Item $PortExe $Payload
 Copy-Item (Join-Path $BuildDir $RuntimeDll) $Payload
 Copy-Item (Join-Path $BuildDir $TracyDll) $Payload
-# FidelityFX DLLs ship next to the port exe when the runtime uses them.
-Get-ChildItem $BuildDir -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue |
-    ForEach-Object { Copy-Item $_.FullName $Payload }
+$FfxDlls | ForEach-Object { Copy-Item $_.FullName $Payload }
 Set-Content -Path (Join-Path $Payload "manifest.toml") -Value $ManifestText -Encoding ascii
 
 # payload/extractor/: the QuickBMS-based .big unpacker the installer runs after
