@@ -4,17 +4,27 @@
 # vanilla default.xex hash from assets/), stages the end-user layout and
 # zips it. PowerShell 5.1 compatible.
 #
+# THE canonical release ships the Vulkan-fsi `win-amd64-vk-ffx` build (see
+# docs/current-status.md). That build has NO cmake preset - it's configured
+# directly by _game_ffx_build.bat - so this script packages the prebuilt,
+# play-tested dir as-is (vk presets auto-imply -SkipBuild). Build/refresh it
+# first with `_game_ffx_build.bat` (and `_ffx_sdk_build_install.bat` if the SDK
+# source changed), then run this. The nhl-legacy-builder packager target must
+# also be present in that tree (build with `cmake --build out\build\win-amd64-vk-ffx
+# --target nhl-legacy-builder` under a vcvars64 + Vulkan SDK shell).
+#
 # Usage:
-#   .\release\package.ps1 -Version 0.1.0
-#   .\release\package.ps1 -Version 0.1.0 -RunCodegen          # fresh codegen first
+#   .\release\package.ps1 -Version 0.1.0                       # package prebuilt vk-ffx
 #   .\release\package.ps1 -Version 0.1.0 -TestInput "H:\...\NHL Legacy - Vanilla"
+#   .\release\package.ps1 -Version 0.1.0 -Preset win-amd64-relwithdebinfo  # legacy D3D12 (builds via preset)
 
 [CmdletBinding()]
 param(
-    [string]$Version   = "0.1.0",
-    [string]$Preset    = "win-amd64-relwithdebinfo",
-    [string]$SdkDir    = "E:\Tools\rexglue-sdk\0.8.0\win-amd64",
-    [string]$LlvmBin   = "C:\Program Files\LLVM\bin",
+    [string]$Version    = "0.1.0",
+    [string]$Preset     = "win-amd64-vk-ffx",
+    [string]$SdkDir     = "E:\Tools\rexglue-sdk\src\out\install\win-amd64-ffx",
+    [string]$SdkVersion = "0.8.1",
+    [string]$LlvmBin    = "C:\Program Files\LLVM\bin",
     [switch]$RunCodegen,             # re-run rexglue codegen before building
     [string]$TestInput = "",         # ISO or extracted folder for the post-zip self-check
     [string]$OutDir    = "",
@@ -37,6 +47,14 @@ if ($Preset -like "*release")              { $Flavor = "" }
 elseif ($Preset -like "*debug")            { $Flavor = "d" }
 elseif ($Preset -like "*relwithdebinfo" -or $Preset -like "*vk*") { $Flavor = "rd" }
 else { throw "Unrecognized preset '$Preset'" }
+
+# The Vulkan builds (win-amd64-vk*) have no CMakePresets entry - they are
+# configured by _game_ffx_build.bat. There is nothing for `cmake --preset` to
+# build, so a vk preset always packages the prebuilt dir as-is.
+if ($Preset -like "*vk*" -and -not $SkipBuild) {
+    Write-Host "Note: '$Preset' is configured by _game_ffx_build.bat (no cmake preset); packaging the prebuilt dir. Rebuild it first if stale." -ForegroundColor Yellow
+    $SkipBuild = $true
+}
 
 function Step([string]$Name) {
     Write-Host ""
@@ -81,8 +99,11 @@ $PortExe     = Join-Path $BuildDir "nhllegacy.exe"
 $BuilderExe  = Join-Path $BuildDir "tools\packager\nhl-legacy-builder.exe"
 $RuntimeDll  = "rexruntime$Flavor.dll"
 $TracyDll    = "TracyClient$Flavor.dll"
-foreach ($f in @($PortExe, $BuilderExe)) {
-    if (-not (Test-Path $f)) { throw "Expected build output missing: $f" }
+if (-not (Test-Path $PortExe)) {
+    throw "Port exe missing: $PortExe. Build it with _game_ffx_build.bat first."
+}
+if (-not (Test-Path $BuilderExe)) {
+    throw "Packager missing: $BuilderExe. Build it under a vcvars64 + Vulkan SDK shell:`n  cmake --build `"$BuildDir`" --target nhl-legacy-builder"
 }
 
 # --- 3. Hashes + payload manifest ---
@@ -98,7 +119,7 @@ $ManifestText = @"
 
 [tool]
 version      = "$Version"
-sdk_version  = "0.8.0"
+sdk_version  = "$SdkVersion"
 port_build   = "$Preset"
 runtime_dll  = "$RuntimeDll"
 
@@ -124,6 +145,11 @@ New-Item -ItemType Directory -Force $Payload | Out-Null
 Copy-Item $BuilderExe $Stage
 Copy-Item (Join-Path $BuildDir "tools\packager\$RuntimeDll") $Stage
 Copy-Item (Join-Path $BuildDir "tools\packager\$TracyDll") $Stage
+# The builder links the same rexruntime as the port, which on the FFX build
+# imports amd_fidelityfx_vk.dll - so the builder needs it beside its exe too
+# (without it the loader fails with 0xC0000135 STATUS_DLL_NOT_FOUND).
+Get-ChildItem $BuildDir -Filter "amd_fidelityfx*.dll" -ErrorAction SilentlyContinue |
+    ForEach-Object { Copy-Item $_.FullName $Stage }
 Copy-Item (Join-Path $PSScriptRoot "README.payload.md") (Join-Path $Stage "README.txt")
 Copy-Item (Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt") $Stage
 

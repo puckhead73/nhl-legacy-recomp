@@ -42,3 +42,26 @@
 # PGO capture data (regenerable via _build_vk_pgogen.bat + llvm-profdata; see
 # the vk-perf-profile-findings memory). Large binary profiles, not for git.
 /pgo/
+
+# === Local dev/diagnostic driver scripts (scratch; the canonical build .bat
+# files — _game_ffx_build.bat, _ffx_sdk_*.bat, _build_*.bat — ARE tracked) ===
+/_*.ps1
+/run_*.ps1
+/_*.png
+/nullcall_ctx.txt
+
+# Python diagnostic scratch + bytecode caches (real tools like cba_parse.py
+# and highcut_packet_decode.py do NOT start with "_", so stay tracked).
+/tools/__pycache__/
+/tools/_*.py
+
+# Rust scratch-tool build output + working game DBs (regenerable / game-derived).
+/tools/stick_widen/target/
+/tools/stick_widen/scratch/
+/tools/vp6-converter/target/
+
+# NHL12 sibling-dev decompilation reference: the vendored Xenia-derived GPU
+# source tree + its archive are third-party and large — reference only, not our
+# build. (The hand-written RE markdown notes alongside it stay visible.)
+/docs/nhl12-decomp-reference/gpu/
+/docs/nhl12-decomp-reference/gpu.7z
