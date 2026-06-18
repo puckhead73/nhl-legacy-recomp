@@ -16,6 +16,11 @@ set(NHLLEGACY_SOURCES
     src/main.cpp
     src/kernel_stubs.cpp
     src/diag_hooks.cpp
+    # Intel hybrid (P/E-core) thread placement: pins the process default CPU set to
+    # the Performance cores so the recomp's heavy threads don't land on E-cores.
+    # Env-gated (NHL_PIN_PCORES, default ON); no-op on AMD / non-hybrid CPUs. Called
+    # from NhllegacyApp::OnPreSetup before any threads spin up.
+    src/cpu_affinity.cpp
     # High-cut engine (H-1): D3D9 logical resource graph — pass-through hooks that
     # build the EDRAM-free RT/texture/resolve graph. Env-gated (NHL_HIGHCUT); no
     # behavior change. Supersedes the M1 correlation tap (gpu/hooks/d3d9_tap.cpp,

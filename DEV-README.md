@@ -58,10 +58,20 @@ Run the dev build against a game folder:
 out\build\win-amd64-vk-ffx\nhllegacy.exe --game_data_root "H:\...\NHL Legacy - Vanilla"
 ```
 
-**Optimized / PGO builds** (the #1 perf lever) link the same FFX SDK:
-`scripts\_build_vk_opt.bat` (`-O3 -march=native`) and the 3-stage PGO flow
-(`scripts\_build_vk_pgogen.bat` → play a session → `llvm-profdata merge` →
-`scripts\_build_vk_pgo.bat`, profile at `pgo/nhllegacy.profdata`).
+**Optimized / PGO builds** (the #1 perf lever) link the same FFX SDK and are now
+`Release`-based (`-O3 -DNDEBUG -march=x86-64-v3 -flto=thin`, lld). Use a PORTABLE
+arch, **never `-march=native`** — native on the AMD dev box emits SSE4a `EXTRQ`
+that `#UD`s on Intel (commit `49e6650`). `scripts\_build_vk_opt.bat` is the
+non-PGO optimized build; the 3-stage PGO flow is `scripts\_build_vk_pgogen.bat` →
+play a session → `llvm-profdata merge -output=pgo/nhllegacy.profdata *.profraw` →
+`scripts\_build_vk_pgo.bat`. Re-capture the profile after any base/flag change.
+
+The shipped runtime DLL is the SDK's `Release` config (rexruntime.dll, no `rd`
+suffix), which strips the Tracy/perf-counter instrumentation that the
+RelWithDebInfo dev runtime carries (`REXGLUE_ENABLE_TRACY=OFF` at configure +
+the `$<NOT:$<CONFIG:Release>>` profiling gate). On Intel hybrid CPUs the port
+pins itself to the P-cores at startup (`NHL_PIN_PCORES`, default on; set `=0` to
+disable).
 
 ## Cutting a release
 

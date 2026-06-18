@@ -125,6 +125,12 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, un
 extern "C" int __llvm_profile_write_file(void);
 #endif
 
+// Intel hybrid (P/E-core) thread placement — defined in src/cpu_affinity.cpp.
+// Pins the process default CPU set to the Performance cores so the recomp's heavy
+// threads don't land on E-cores. Env-gated (NHL_PIN_PCORES, default ON); no-op on
+// AMD / non-hybrid CPUs. Confined to its own TU so <windows.h> stays out of here.
+void rex_pin_pcores_if_hybrid();
+
 class NhllegacyApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -136,6 +142,10 @@ class NhllegacyApp : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // PERF (Intel hybrid): pin the process to P-cores before any guest/SDK threads
+    // spin up. Env-gated (NHL_PIN_PCORES, default ON); no-op on AMD / non-hybrid.
+    rex_pin_pcores_if_hybrid();
+
     // Substitute our renderer for the SDK's default D3D12 backend. The base
     // SetupPresentation() set config.graphics to a stock D3D12GraphicsSystem
     // just before calling this hook; replace it with our subclass, which reuses

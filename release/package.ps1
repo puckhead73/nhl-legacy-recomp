@@ -40,13 +40,20 @@ if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "out\release" }
 $BuildDir = Join-Path $RepoRoot "out\build\$Preset"
 if ($BuildDirOverride) { $BuildDir = $BuildDirOverride }
 
-# Runtime DLL flavor suffix follows the preset. relwithdebinfo ("rd") is the
-# only flavor that has been play-tested; switch to release only after a full
-# smoke pass. The Vulkan builds (win-amd64-vk*) use a RelWithDebInfo base -> "rd".
-if ($Preset -like "*release")              { $Flavor = "" }
-elseif ($Preset -like "*debug")            { $Flavor = "d" }
-elseif ($Preset -like "*relwithdebinfo" -or $Preset -like "*vk*") { $Flavor = "rd" }
+# Runtime DLL flavor suffix follows the preset. The shipping Vulkan builds
+# (win-amd64-vk-pgo / -opt) are now Release-based -> rexruntime.dll (no suffix);
+# the dev build win-amd64-vk-ffx is still RelWithDebInfo -> "rd".
+if     ($Preset -like "*vk-pgo" -or $Preset -like "*vk-opt" -or $Preset -like "*release") { $Flavor = "" }
+elseif ($Preset -like "*debug")                                                           { $Flavor = "d" }
+elseif ($Preset -like "*vk-ffx" -or $Preset -like "*relwithdebinfo")                      { $Flavor = "rd" }
+elseif ($Preset -like "*vk*")                                                             { $Flavor = "rd" }
 else { throw "Unrecognized preset '$Preset'" }
+
+# Guard against shipping the slow exe: win-amd64-vk-ffx is the unoptimized dev
+# build (-O2, no PGO/LTO). The release should be cut from the PGO build.
+if ($Preset -like "*vk-ffx") {
+    Write-Host "WARNING: '$Preset' is the unoptimized DEV build (-O2, no PGO/LTO). For a real release, build and package -Preset win-amd64-vk-pgo (see DEV-README)." -ForegroundColor Yellow
+}
 
 # The Vulkan builds (win-amd64-vk*) have no CMakePresets entry - they are
 # configured by scripts\_game_ffx_build.bat. There is nothing for `cmake --preset` to
@@ -98,6 +105,9 @@ if (-not $SkipBuild) {
 $PortExe     = Join-Path $BuildDir "nhllegacy.exe"
 $BuilderExe  = Join-Path $BuildDir "tools\packager\nhl-legacy-builder.exe"
 $RuntimeDll  = "rexruntime$Flavor.dll"
+# TracyClient is only present when the SDK was built with REXGLUE_ENABLE_TRACY=ON.
+# The canonical Release SDK build turns it OFF (no profiling instrumentation in
+# the shipped runtime), so this DLL may not exist — every copy below is guarded.
 $TracyDll    = "TracyClient$Flavor.dll"
 if (-not (Test-Path $PortExe)) {
     throw "Port exe missing: $PortExe. Build it with scripts\_game_ffx_build.bat first."
@@ -157,7 +167,8 @@ if (-not $FfxDlls) {
 # Top level: builder CLI + its runtime DLLs (incl. FFX) + docs.
 Copy-Item $BuilderExe $Stage
 Copy-Item (Join-Path $BuildDir "tools\packager\$RuntimeDll") $Stage
-Copy-Item (Join-Path $BuildDir "tools\packager\$TracyDll") $Stage
+$BuilderTracy = Join-Path $BuildDir "tools\packager\$TracyDll"
+if (Test-Path $BuilderTracy) { Copy-Item $BuilderTracy $Stage }
 $FfxDlls | ForEach-Object { Copy-Item $_.FullName $Stage }
 Copy-Item (Join-Path $PSScriptRoot "README.payload.md") (Join-Path $Stage "README.txt")
 Copy-Item (Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt") $Stage
@@ -165,7 +176,8 @@ Copy-Item (Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt") $Stage
 # payload/: the prebuilt port + its runtime DLLs (incl. FFX) + manifest.
 Copy-Item $PortExe $Payload
 Copy-Item (Join-Path $BuildDir $RuntimeDll) $Payload
-Copy-Item (Join-Path $BuildDir $TracyDll) $Payload
+$PayloadTracy = Join-Path $BuildDir $TracyDll
+if (Test-Path $PayloadTracy) { Copy-Item $PayloadTracy $Payload }
 $FfxDlls | ForEach-Object { Copy-Item $_.FullName $Payload }
 Set-Content -Path (Join-Path $Payload "manifest.toml") -Value $ManifestText -Encoding ascii
 
