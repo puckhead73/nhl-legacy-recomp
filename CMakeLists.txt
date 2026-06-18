@@ -22,6 +22,11 @@ set(NHLLEGACY_SOURCES
     # kept in-tree for reference) — both override the same symbols, so only one may
     # be compiled into the target at a time.
     gpu/hooks/d3d9_resources.cpp
+    # Animation capture: hooks the DctAnimationAsset decode chain (sub_82CA9B20 ->
+    # sub_82CA9618 -> sub_82CA7BD0) to record decoded poses. Env-gated
+    # (NHL_ANIM_CAPTURE); pass-through when unset. Overrides distinct symbols from
+    # the D3D9 hooks above, so it composes with them. See docs cba-format.md §6.
+    gpu/hooks/anim_capture.cpp
     # High-cut engine (H-2): first plume-driven frame — an in-process plume D3D12
     # swapchain driven by the guest Present hook. Env-gated (NHL_HIGHCUT_PRESENT).
     gpu/hooks/plume_present.cpp

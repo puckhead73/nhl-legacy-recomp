@@ -12,6 +12,7 @@
 #include <span>
 #include <utility>
 
+#include <rex/filesystem.h>
 #include <rex/filesystem/file.h>
 #include <rex/logging.h>
 #include <rex/system/xtypes.h>
@@ -21,6 +22,7 @@
 #endif
 
 #include "injection_registry.h"
+#include "stick_caller_trace.h"
 
 namespace nhllegacy {
 
@@ -32,6 +34,13 @@ namespace {
 bool EndsWithCi(std::string_view s, std::string_view suffix) {
   if (s.size() < suffix.size()) return false;
   return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin(), [](char a, char b) {
+    return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+  });
+}
+
+bool StartsWithCi(std::string_view s, std::string_view prefix) {
+  if (s.size() < prefix.size()) return false;
+  return std::equal(prefix.begin(), prefix.end(), s.begin(), [](char a, char b) {
     return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
   });
 }
@@ -164,6 +173,31 @@ class LooseTreeEntry final : public fs::Entry {
         std::getenv("NHL_LOG_ASSET_OPENS") != nullptr;
     if (log_asset_opens) {
       REXLOG_INFO("[asset-open] {} ({} bytes)", path(), size_);
+    }
+    // NHL_TRACE_STICK_OPEN: when a create-player stick thumbnail is opened, walk
+    // the host call stack (== guest call chain in the recomp) and log RVAs so the
+    // recomp function that enumerates the stick picker can be symbolized offline.
+    // See src/stick_caller_trace.h and the editplayer-equipment-enumeration doc.
+    static const bool trace_stick_open =
+        std::getenv("NHL_TRACE_STICK_OPEN") != nullptr;
+    if (trace_stick_open && StartsWithCi(name_, "stick") &&
+        EndsWithCi(name_, ".big") && path().find("sticks") != std::string::npos) {
+      static const std::string trace_out =
+          (rex::filesystem::GetExecutableFolder() / "stick_caller_trace.txt").string();
+      nhllegacy::CaptureStickCaller(path().c_str(), trace_out.c_str());
+    }
+    // NHL_TRACE_TEXLIB_OPEN: capture the guest call chain when a player-stick
+    // RENDER texture (rendering\playerstick\texlib_<N>.rx2) is opened. The
+    // caller read the stick index out of the per-player equipment struct and
+    // formatted this path -> symbolizing the RVAs identifies the equipment-read
+    // function, the entry point for the 7->8-bit stick-field widening RE.
+    static const bool trace_texlib_open =
+        std::getenv("NHL_TRACE_TEXLIB_OPEN") != nullptr;
+    if (trace_texlib_open && StartsWithCi(name_, "texlib_") &&
+        path().find("playerstick") != std::string::npos) {
+      static const std::string trace_out =
+          (rex::filesystem::GetExecutableFolder() / "texlib_caller_trace.txt").string();
+      nhllegacy::CaptureStickCaller(path().c_str(), trace_out.c_str());
     }
     // TEMP diagnostic: log .db opens so we can see which databases the game
     // loads (and when) and confirm a grown DB is served. Remove after testing.
