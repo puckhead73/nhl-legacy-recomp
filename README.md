@@ -1,12 +1,11 @@
 # NHL Legacy Recomp
 
 A native **PC port of NHL Legacy** (Xbox 360), produced by static recompilation —
-the original game's code is translated into a native Windows executable rather than
+the original game's code is translated into a native Windows executable via RexGlue rather than
 emulated, so it runs as a real PC application with modern rendering on top.
 
 > ⚠️ **You must provide your own legally dumped copy of the game.** This project
-> ships **no game content** of any kind. It cannot be used without a copy of NHL
-> Legacy that you own and have dumped yourself. **Piracy is not condoned** — do not
+> ships **no game content** of any kind. **Piracy is not condoned** — do not
 > ask for, share, or use illegally obtained game files. This project is not
 > affiliated with or endorsed by EA or Microsoft.
 
