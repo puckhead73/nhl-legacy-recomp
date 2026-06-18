@@ -56,11 +56,17 @@ Canonical exe: `out\build\win-amd64-vk-ffx\nhllegacy.exe`. Run on the Vulkan pat
 
 - `_build_vk.bat` is now a **deprecation shim** that redirects to `_game_ffx_build.bat`.
 - Optimized/PGO release builds (`_build_vk_opt.bat`, `_build_vk_pgo.bat`, `_build_vk_pgogen.bat`)
-  now link the **FFX** SDK install. Their existing build dirs were configured against the old
-  non-FFX prefix — **delete `out/build/win-amd64-vk-{opt,pgo,pgogen}` before the next run** so they
-  reconfigure cleanly against `win-amd64-ffx`.
-- The stale non-FFX SDK install (`out/install/win-amd64`) and game dir (`out/build/win-amd64-vk`)
-  can be deleted once every instance is off them.
+  link the **FFX** SDK install (`E:/Tools/rexglue-sdk/src/out/install/win-amd64-ffx`).
+- **Consolidation complete (2026-06-17):** the stale non-FFX build dirs
+  (`out/build/win-amd64-vk{,-opt,-pgo,-pgogen}`) and the non-FFX SDK install
+  (`.../src/out/install/win-amd64`) have been deleted. The only Vulkan build dir is
+  `win-amd64-vk-ffx` and the only SDK install is `win-amd64-ffx`; everything links FFX.
+
+## Release
+
+Packaged by [release/package.ps1](../release/package.ps1) (`-Version X.Y.Z`): defaults to the
+prebuilt `win-amd64-vk-ffx` dir (auto `-SkipBuild`, since vk has no cmake preset). **v0.1.0** is
+tagged and pushed to `origin`. See the [release-pipeline memory] / `out/release/RELEASE-NOTES-*.md`.
 
 ## Active / open
 
