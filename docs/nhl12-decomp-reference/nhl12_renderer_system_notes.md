@@ -152,9 +152,16 @@ When this flag is active, `TextureCache::GetConfigDrawResolutionScale` returns 1
 `resolution_scale`, `draw_resolution_scale_x`, or `draw_resolution_scale_y` were supplied by config
 or command line.
 
-The app also explicitly sets:
+The app also explicitly sets the NHL12 renderer contract before backend setup:
 
 ```text
+nhl_force_stacked_texture3d=true
+nhl_force_native_draw_resolution=true
+nhl_fix_cube_reflection_fetches=true
+nhl_zero_cube_reflection_fetches=false
+nhl_rebase_mip_min_textures=true
+nhl_fix_base_only_packed_bc_textures=true
+nhl_preserve_equipment_mips_without_forced_aniso=true
 resolution_scale=1
 draw_resolution_scale_x=1
 draw_resolution_scale_y=1
@@ -162,7 +169,43 @@ draw_resolution_scaled_texture_offsets=false
 ```
 
 in `app/src/nhl12_app.h` before the GPU backend is created. This keeps 1080p, 1440p, and 4K launch
-options as presentation/window sizes rather than internal texture upscaling modes.
+options as presentation/window sizes rather than internal texture upscaling modes, preserves the
+known-good cubemap reflection path, and keeps the equipment material mip/sampler guards active even
+if RexGlue defaults change later.
+
+## NHL12 Cube Fetches With 2D Equipment Maps
+
+2026-06-15 normal-play logs showed that NHL12 can send glossy equipment/material data through a
+`tfetchCube` shader instruction while the fetch constant points at a regular 2D mipped material map.
+The clearest bad binding was:
+
+```text
+fetch=2 shader_dim=cube resource_dim=2DOrStacked null=true compatible=false
+fmt=k_DXT1 size=512x512x1 mip_min=0 mip_max=9 packed=true
+```
+
+On D3D12, a cube SRV is only valid for `DataDimension::kCube`, so that binding produced a sampled
+null descriptor. This matches the live symptoms: helmets may partly work through the real cubemap
+reflection path, while gloves, blocker/trapper surfaces, or goalie pads become green/black/purple or
+transparent when the equipment material map is sampled through the wrong descriptor shape.
+
+The DXBC translator now treats `nhl_fix_cube_reflection_fetches` as two cooperating NHL12 behaviors:
+
+- true cubemap resources still use the cube coordinate transform and cube SRV, preserving helmet
+  reflections and the prior Winter Classic cubemap fix;
+- non-cube resources bound to a cube fetch also get a 2D SRV fallback for the same fetch constant and
+  signedness;
+- the fallback uses cube SC/TC operands as face-local material UVs by converting the 1..2 range to
+  0..1 and forcing array layer 0.
+
+Do not remove this path when optimizing cubemap reflections. It is a title-specific bridge between
+NHL12's material shader pattern and D3D12's stricter SRV dimension compatibility.
+
+Crash status: enabling this fallback globally caused an access violation at first 3D scene load
+before the old equipment mismatch appeared in the log. The fallback is therefore gated by
+`nhl_cube_material_2d_fallback=false` by default. Leave `nhl_fix_cube_reflection_fetches=true`; that
+is the stable helmet/reflection path. Enable `nhl_cube_material_2d_fallback` only for controlled A/B
+logs until the first-scene crash is understood.
 
 ## NHL12 Equipment Color Composition
 
@@ -195,6 +238,189 @@ The asset layout matches this. `extracted/cache_hdd/rendering/goaliepad` contain
 So green/purple/black corruption on goalie pads or gloves is likely to involve a template/special
 map, swizzle/sign interpretation, alpha handling, or mip-window/addressing issue in the recolor
 material path. It should not be fixed by blanket DXT decompression or by disabling reflections.
+
+Latest equipment material map breakdown from user testing:
+
+```text
+colormap   -> logos and colors
+shine map  -> shadows and light reflection
+normal map -> wrinkles and shape
+```
+
+Jerseys and general equipment follow the same pattern conceptually, and these assets need their mip
+chains. Do not hardcode only the shorthand names, though. Some tools describe the colormap and
+normal-map families as DXT1/DXT5-like, while the embedded Xbox fetch constants in current extracted
+assets may identify them as `k_8_8_8_8`, `k_DXN`, or `k_DXT4_5`. The RX2 fetch constants are the
+renderer's source of truth. The offline verifier added on 2026-06-15 proves these real extracted
+goalie/glove equipment formats:
+
+```text
+*_dm.rx2 diffuse/base maps      -> k_DXT2_3, 512x512, base-only
+*_tm.rx2 template/color maps    -> k_DXT1,   512x512, base-only
+*_nm.rx2 normal maps            -> k_DXN,    512x512, 10 packed mips
+*_sm.rx2 shine/specular maps    -> k_DXT1,   128x128, 8 packed mips
+```
+
+The broader 2026-06-15 sweep over `goaliepad`, `glove`, `blocker`, and `trapper` found:
+
+```text
+2886 texture RX2 entries passed
+24 non-texture RX2 entries skipped
+0 failures
+0 D3D12 runtime-upload layout mismatches
+
+600  *_dm diffuse/base maps      -> k_DXT2_3, 1 mip, base-only
+1628 *_tm template/color maps    -> k_DXT1,   1 mip, base-only
+300  *_nm normal maps            -> k_DXN,    10 packed mips
+216  *_sm shine/specular maps    -> k_DXT1,   8 packed mips
+84   *_sm shine/specular maps    -> k_DXT1,   9 packed mips
+56   *_am alpha/aux maps         -> k_DXT1,   8 packed mips
+2    *_am alpha/aux maps         -> k_DXT1,   7 packed mips
+```
+
+Additional 2026-06-15 jersey/equipment sampling matches the user-level "normal map is DXT5"
+description for body materials, while also showing why filename-only assumptions are risky:
+
+```text
+300 jersey texlib/body samples passed:
+299 -> k_DXT4_5, 512x512, 10 packed mips
+1   -> k_DXT1,   1024x1024, 11 packed mips
+
+300 jersey nameplate *_cm samples passed:
+300 -> k_8_8_8_8, 256x256, 9 packed mips
+
+400 helmet/stick/general-equipment sample:
+275 textured entries passed, 125 non-texture containers skipped
+213 mipped k_DXT1 goaliehelmet/color equipment maps preserved
+49  base-only k_DXT2_3 helmet diffuse maps preserved
+12  base-only k_DXT1 template maps preserved
+1   tiny 4x4 k_DXT1 packed-base map preserved
+```
+
+So NHL12's renderer contract is not "all equipment color maps are DXT1" at the file level.
+The safer rule is: preserve real mip chains for all NHL12 material maps, including mipped DXT1
+shine/color maps, mipped DXN goalie normal maps, mipped DXT4/5 jersey/body normal-like maps, and
+mipped 8.8.8.8 nameplate/color-support maps.
+
+Default unattended renderer gate:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --nhl12-regression-suite --out build\nhl12_renderer_regression_suite_full
+```
+
+Latest full-suite result: PASS in about 5.5 minutes, 0 failed sections:
+
+```text
+source contract:              43 checks, 0 failures
+renderer-key self-test:        70 cases, 0 failures
+material contract:             3856 files, 0 failures, 0 warnings
+material stack previews:       40 DB-colored stacks, 40 passes, 30 exact DB color matches
+goalie equipment upload proof: 2910 files, 2886 texture passes, 24 non-texture skips, 0 failures
+jersey texlib upload sample:   300 files, 0 failures
+jersey colormap upload sample: 300 files, 0 failures
+```
+
+The source contract audits the NHL12 app defaults and RexGlue renderer defaults before any asset
+proof runs. It guards the ROV path, invalid-fetch tolerance, native 1x draw resolution, cube
+reflection preservation, real equipment mip preservation, 2D-only sampler guard, DXN BC5 view path,
+explicit-LOD mip rebase wiring, the base-only generated BC packed-state fix, and the protected
+material formats used by the colormap/logo, shine/reflection, and normal/shape maps. If this fails,
+treat it as a renderer regression even if the extracted texture bytes still decode cleanly.
+
+The material stack previews render simplified pad/glove/blocker/trapper composites at multiple LODs
+using decoded diffuse, template, normal, and shine layers. They are not a replacement for NHL12's
+full shader, but they catch offline neon-green, purple, and near-black layer-alignment artifacts.
+The artifact check accounts for DB colors, so saturated green only fails when it is not part of the
+selected equipment palette. Preview PNGs are written under
+`build\nhl12_renderer_regression_suite_full\material_stack_composites`.
+
+Fast iteration gate:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --nhl12-regression-suite --nhl12-regression-suite-fast --out build\nhl12_renderer_regression_suite_fast
+```
+
+Latest fast-suite result: PASS in about 2.0 minutes. It keeps the 43-check source contract, the
+70-case renderer-key self-test, the full 3856-file material contract scan, renders 8 representative
+material-stack previews, and samples the goalie-equipment byte-upload proof instead of running all
+2910 goalie equipment containers.
+
+The broad material-contract gate inside the suite is:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --scan-material-contract-dir goaliepad --scan-material-contract-dir glove --scan-material-contract-dir blocker --scan-material-contract-dir trapper --scan-material-contract-dir jersey --out build\texture_material_contract_equipment_jersey
+```
+
+Latest result: 3856 material-map files checked in about 32 seconds, 0 failures, 0 warnings:
+
+```text
+970  colormap/support maps -> k_8_8_8_8, real mips preserved
+300  normal maps           -> k_DXN,      real mips preserved
+300  shine maps            -> k_DXT1,     real mips preserved
+58   alpha/support maps     -> k_DXT1,     real mips preserved
+600  diffuse/recolor masks  -> k_DXT2_3,   base-only by design
+1628 template recolor masks -> k_DXT1,     base-only by design
+```
+
+This gate is a fast fetch/key/view/mip contract scan. Use the full regression suite when you need
+the contract scan plus byte-for-byte D3D12 upload equivalence coverage before launching the game.
+
+The verifier now also mirrors the NHL12 renderer-key normalization rules. The latest unattended
+synthetic edge-case gate was:
+
+```powershell
+python tools\nhl12_texture_proof.py --self-test-renderer-key --out build\texture_proof_equipment_renderer_key
+```
+
+It must pass the stale non-tiny base-only DXT case, the tiny packed-base DXT case, a mipped DXT1
+shine case, a mipped DXN normal case, a mipped DXT5 normal case, a mipped 8.8.8.8 support-map
+case, plus 64 historical normal-play generated texture fetches. The historical cases came from the
+old normal-play diagnostic where base-only BC runtime textures kept stale packed state. They cover
+2 `k_DXT1`, 5 `k_DXT2_3`, and 57 `k_DXT4_5` generated fetches from 32x32 through 2048x1024. The
+latest run passed all 70 cases. The latest unattended corpus gate was:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --glob "goaliepad\*.rx2" --glob "glove\*.rx2" --glob "blocker\*.rx2" --glob "trapper\*.rx2" --limit 5000 --out build\texture_proof_goalie_equipment_renderer_key --no-images
+```
+
+Result: 2910 RX2 containers scanned, 2886 textured entries passed, 24 non-texture containers
+skipped, 0 failures, 0 renderer-key failures, and 0 renderer-view failures. The renderer-key proof
+protected 658 real mipped equipment material maps: 300 `k_DXN` normal maps and 358 mipped `k_DXT1`
+shine/alpha maps.
+
+If pads, gloves, or jerseys show shifted green/purple/black blocks, treat it first as a mipped
+equipment material binding/sampler problem. Do not assume the RX2 bytes are corrupt without running
+the proof tool.
+
+The 2026-06-15 verifier also simulates RexGlue's D3D12 upload path: it builds the padded upload
+footprint for each stored level, slices packed tails with the same source-box math used by
+`D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl`, and byte-compares the result against the
+direct decoded mip. It now handles the packed-level-0 special case used by tiny textures, where the
+base and mip-tail loops both refer to logical level 0 but separate source ranges. The full
+goalie/glove corpus passed this runtime-upload comparison. That means the static extracted
+pad/glove bytes and normal D3D12 packed-tail copy math agree; remaining normal play corruption
+should be hunted in runtime-generated equipment maps, fetch binding state, sampler state, or shader
+material logic.
+
+The verifier also mirrors D3D12 renderer-view decisions: host resource format, UNORM/SNORM SRV
+formats, decompression path, host-format swizzle, final host swizzle, and post-swizzle signs. The
+latest goalie-equipment corpus passed with 0 renderer-view failures:
+
+```text
+1986 k_DXT1   -> BC1_UNORM resource/SRV, RGBA host swizzle
+600  k_DXT2_3 -> BC2_UNORM resource/SRV, RGBA host swizzle
+300  k_DXN    -> BC5_TYPELESS resource, BC5_UNORM + BC5_SNORM SRVs, RGGG host swizzle
+```
+
+DXN normal maps do not require a separate signed resource. They use UNORM/SNORM SRV views over one
+typeless BC5 resource. If live `[NHL-TEX]` diagnostics ever show a separate signed resource for
+these aligned DXN maps, that is a renderer divergence to investigate.
+
+Important NHL12-specific packed-state rule: do not strip `packed_mips` from a base-only BC fetch if
+level 0 itself is packed. Very small Xenos textures can store the base level in a packed tail, and
+NHL12's colorized equipment special maps are exactly the kind of data that may be small. The current
+`nhl_fix_base_only_packed_bc_textures` guard only ignores stale packed state for base-only BC maps
+whose level 0 is not packed.
 
 Skater helmets are also composed materials. User-provided DB research says the helmet shell is
 driven mostly by RGB values from the DB, while the logo is the changeable texture. The extracted data
@@ -365,11 +591,220 @@ tries to rebase the `TextureKey` so the requested first mip becomes logical mip 
 - cubemaps are excluded so the working helmet/reflection cubemap fix is not touched;
 - packed mip-tail cases that are not page-clean fail closed and keep the old generic path.
 
+2026-06-14 follow-up: the texture-cache rebase alone is not enough for shaders that use explicit
+LOD (`sample_l` / guest explicit mip fetches). Those shaders can still ask for guest LOD 1 even
+though the host resource has already made guest mip 1 become host mip 0. RexGlue now records the
+actual successful rebase offset per active fetch constant:
+
+```text
+TextureBinding::rebased_mip_min_level
+SystemConstants::texture_rebased_mip_min_levels[8]
+```
+
+The D3D12 command processor packs one byte per fetch constant into the system constants. The DXBC
+translator version is bumped to `0x20260620`, and the shader modification key includes
+`normalize_rebased_texture_lod` so cached shaders cannot be reused across this behavior change.
+
+For explicit LOD texture fetches only, the translator subtracts that recorded offset from the shader
+LOD and clamps the result to 0. It does this only when the texture cache says the rebase succeeded;
+failed packed/unaligned mip-tail cases carry offset 0 and therefore keep the generic path. Computed
+or implicit LOD fetches are left alone because their gradients already operate against the rebased
+host dimensions.
+
+Cubemaps are excluded twice:
+
+- `TextureCache::TryRebaseNHL12MipMinTextureKey` refuses cube textures.
+- `dxbc_translator_fetch.cpp` refuses to apply explicit LOD normalization to cube fetches.
+
+This is deliberate. Helmet/environment reflections are the cubemap path and must stay alive.
+
 This fix is intentionally title-specific. Do not replace the cubemap sanitizer with this, and do not
 disable cubemap reflections to hide equipment artifacts. These are separate bugs:
 
 - cubemap bug: saturated blue/green reflective contribution;
 - mip-window bug: shifted atlas/warped equipment texture patches.
+
+## Equipment Mip Proof And Sampler Guard
+
+Files:
+
+```text
+tools/nhl12_texture_proof.py
+RexGlue/include/rex/graphics/flags.h
+RexGlue/src/graphics/flags.cpp
+RexGlue/src/graphics/pipeline/texture/cache.cpp
+RexGlue/src/graphics/d3d12/texture_cache.cpp
+```
+
+NHL12 equipment should be understood as a multi-map material stack, not one diffuse texture:
+
+```text
+diffuse/base      -> embedded fetch format, often k_DXT2_3
+template/color    -> embedded fetch format, often k_DXT1
+shine/specular    -> embedded fetch format, often mipped k_DXT1
+normal            -> embedded fetch format, often mipped k_DXN
+```
+
+The important behavior is mip correctness. Real mipped equipment textures must keep their mip chains;
+otherwise close-up and replay material sampling can read the wrong logical level. The offline proof
+command for pads/gloves is:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --glob "goaliepad\*.rx2" --glob "glove\*.rx2" --limit 500 --out build\texture_proof_equipment --no-images
+```
+
+Full unattended renderer-key gate:
+
+```powershell
+python tools\nhl12_texture_proof.py --self-test-renderer-key --out build\texture_proof_goalie_equipment_renderer_key
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --glob "goaliepad\*.rx2" --glob "glove\*.rx2" --glob "blocker\*.rx2" --glob "trapper\*.rx2" --limit 5000 --out build\texture_proof_goalie_equipment_renderer_key --no-images
+```
+
+Focused all-mip preview command:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --glob "goaliepad\goaliepad_0_11_nm.rx2" --glob "goaliepad\goaliepad_0_11_sm.rx2" --out build\texture_proof_mips --all-mip-pngs
+```
+
+Current proof results:
+
+```text
+1346 texture RX2 entries passed
+12 non-texture RX2 entries skipped
+0 failures
+```
+
+Material-stack composite proof command:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --material-set goaliepad:0_11 --material-set glove:0_15 --out build\texture_material_artifact_metrics --material-size 512 --no-images
+```
+
+This writes:
+
+```text
+build\texture_material_artifact_metrics\material_goaliepad_0_11_lod0.png
+build\texture_material_artifact_metrics\material_goaliepad_0_11_lod1.png
+build\texture_material_artifact_metrics\material_goaliepad_0_11_lod2.png
+build\texture_material_artifact_metrics\material_goaliepad_0_11_lod9.png
+build\texture_material_artifact_metrics\material_glove_0_15_lod0.png
+build\texture_material_artifact_metrics\material_glove_0_15_lod1.png
+build\texture_material_artifact_metrics\material_glove_0_15_lod2.png
+build\texture_material_artifact_metrics\material_glove_0_15_lod9.png
+```
+
+Those composites are an offline alignment proof for the equipment material stack. They are not a
+replacement for NHL12's shader, but they prove that the extracted diffuse/template/normal/shine
+layers can be decoded, mipped, and sampled together coherently before opening the game.
+The proof also records artifact ratios for neon green, purple, transparency, and near-black coverage
+in `material_report.json`. The latest representative run passed both `goaliepad:0_11` and
+`glove:0_15` with `green=0.0000`, `purple=0.0000`, and `black=0.0000` across LOD 0, 1, 2, and the
+lowest mip. High transparency in these UV-sheet previews is expected and is reported as a note, not a
+failure.
+
+Full discovered material-stack gate:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --discover-material-dir goaliepad --discover-material-dir glove --out build\texture_material_discovery_full --material-size 64 --no-images
+```
+
+Latest result: 264 complete material stacks discovered, 164 in `goaliepad` and 100 in `glove`.
+All 264 passed, producing 1056 composite artifact metrics. Max neon-green ratio was 0, max purple
+ratio was 0, and max near-black ratio was 0.1963. Transparency reached 0.9897 in UV sheets and is
+expected to be high for cutout/material space.
+
+DB-colored material proof is also available. It reads `exhibitiongoalieequipment` from
+`extracted\cache_hdd\db\nhlng.db` using field layout from `nhlng-meta.xml` and records the bit order,
+equipment kind, equipment id, matched DB rows, and tint colors in the material report:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --material-set goaliepad:0_11 --material-set glove:0_15 --out build\texture_material_db_colors --material-size 256 --no-images --db-file extracted\cache_hdd\db\nhlng.db --db-meta extracted\cache_hdd\db\nhlng-meta.xml --db-bit-order msb
+```
+
+Latest representative result: `goaliepad:0_11` matched one DB `pads` row, `glove:0_15` matched
+three DB `trapper` rows, and both passed artifact metrics. A broader 40-stack discovered sample with
+DB colors also passed with 27 exact DB equipment-color matches and 13 DB global color fallbacks. See
+`docs\nhl12_equipment_db_color_notes.md`.
+
+The broader goalie-equipment DB sample now uses interleaved discovery across `goaliepad`, `glove`,
+`blocker`, and `trapper` so a limited sample cannot accidentally cover only the first directory:
+
+```powershell
+python tools\nhl12_texture_proof.py --root extracted\cache_hdd\rendering --discover-material-dir goaliepad --discover-material-dir glove --discover-material-dir blocker --discover-material-dir trapper --discover-material-limit 40 --out build\texture_material_goalie_equipment_db_sample --material-size 64 --no-images --db-file extracted\cache_hdd\db\nhlng.db --db-meta extracted\cache_hdd\db\nhlng-meta.xml --db-bit-order msb
+```
+
+Latest result: 40 material stacks passed with 0 failures. Exact DB color matches were found for 6
+pad stacks, 15 trapper/glove stacks, and 9 blocker stacks; the remaining 10 used DB global fallback
+colors. This reinforces that static RX2 data, packed-tail upload layout, and DB-colored material
+layer alignment are coherent offline for the currently corrupted goalie equipment families.
+
+The renderer has NHL-specific guards for this:
+
+```text
+nhl_rebase_mip_min_textures=true
+nhl_fix_base_only_packed_bc_textures=true
+nhl_preserve_equipment_mips_without_forced_aniso=true
+```
+
+`nhl_rebase_mip_min_textures` handles non-cubemap fetches that start at `mip_min_level > 0`.
+`nhl_fix_base_only_packed_bc_textures` handles base-only 2D BC equipment fetches such as DXT1,
+DXT2/3, and DXT4/5 when they carry a stale packed-mips bit. Those base-only maps should not be
+uploaded through packed-tail addressing.
+`nhl_preserve_equipment_mips_without_forced_aniso` keeps real mips enabled but prevents RexGlue's
+host-side anisotropic override from being forced onto mipped NHL12 material maps. This now covers
+the equipment/jersey stack the game actually uses: DXT1 color/shine maps, DXT4/5 and DXN normal
+maps, and the mipped 8.8.8.8 support/nameplate maps observed in jersey assets. Cubemaps are
+intentionally excluded so the working helmet/reflection path is not touched.
+
+The earlier signed DXN/DXT5A theory is a failed or unproven lead for the current pad/glove issue.
+Do not make it the primary explanation unless a future diagnostic log shows NHL12 binding signed
+normal/spec maps in the broken draw.
+
+Runtime proof path for normal gameplay:
+
+```powershell
+.\app\out\build\win-amd64-release\nhl12.exe --game_data_root extracted --log_file build\nhl12_normalplay_equipment_sampler.log --log_level info --mnk_mode=false --nhl_log_texture_bindings=true
+python tools\nhl12_texture_proof.py --analyze-log build\nhl12_normalplay_equipment_sampler.log --catalog-report build\texture_proof_goalie_equipment_renderer_key\report.json --out build\nhl12_normalplay_equipment_sampler_analysis
+```
+
+The first command writes `[NHL-TEX]` and `[NHL-SAMPLER]` lines while a human navigates to the
+broken normal-play equipment case. The analyzer looks for null texture descriptors, resource/shader
+dimension mismatches, mipped NHL12 material fetches that lost packed mip state, base-only BC fetches
+that kept stale packed state when level 0 is not packed, non-cube mip-window fetches that were not
+rebased, and mipped material samplers that still had RexGlue's forced anisotropic override. This is
+the preferred way to turn a live pad/glove screenshot into a renderer-side proof instead of another
+guess.
+
+When `--catalog-report` is supplied, the analyzer also compares runtime `[NHL-TEX]` bindings against
+the extracted RX2 proof catalog. A strict match means the runtime binding agrees with a known asset
+on format, dimensions, mip count, packed state, tiled state, and pitch. A loose match means the core
+format/size/mip identity agrees but one renderer-key detail differs and needs inspection. Runtime
+DB-generated or recolored textures can remain unmatched without automatically being corrupt.
+
+The analyzer also reports raw fetch-shape matches. These decode the logged `fetch_dw` constants as
+hex dwords and compare the non-address metadata that should survive runtime relocation: raw/base
+format, endianness, pitch, tiled/stacked state, dimensions, dimension type, packed-mips bit,
+fetch-level mip window, swizzle, and signs. A `strict+shape` match is the strongest unattended proof
+currently available that the live binding resembles an extracted equipment map before shader
+material constants are considered.
+
+2026-06-15 analyzer refinement: the translated shader declares unsigned and signed SRV slots, but
+samples only the slot required by runtime TextureSign values. The log analyzer now treats null
+unused signed/unsigned slots as notes instead of material failures, and it re-decodes `fetch_dw`
+values through the current NHL12 renderer-key rules. Old logs from before the packed-state fix now
+collapse to the real signal: base-only BC runtime bindings whose logged packed state differs from
+current normalization.
+
+Positive smoke for the catalog bridge:
+
+```powershell
+python tools\nhl12_texture_proof.py --analyze-log build\nhl12_catalog_smoke.log --catalog-report build\texture_proof_equipment_renderer_key\report.json --out build\texture_log_analysis_catalog_smoke
+```
+
+Latest result: a synthetic runtime binding for `goaliepad_0_11_sm.rx2` matched the extracted mipped
+`k_DXT1` shine map as `strict+shape`, preserved 8 mips, and reported no risky sampler state. The
+shape match fans out to many equivalent equipment assets because multiple pads/gloves/blockers can
+share identical fetch metadata; path identity still needs runtime addresses or asset-load logging.
 
 ## Shader Storage
 

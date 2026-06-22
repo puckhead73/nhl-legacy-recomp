@@ -1,0 +1,13 @@
+[package]
+name = "vp6conv"
+version = "0.1.0"
+edition = "2021"
+description = "Convert any video into an EA-container VP6 (.vp6) movie that NHL Legacy / EA Sports titles can play. Wraps ffmpeg (normalize) + NihAV (VP6 encode), and splices audio at the EA-container level."
+license = "MIT"
+
+[[bin]]
+name = "vp6conv"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2

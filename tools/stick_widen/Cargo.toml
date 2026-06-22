@@ -1,0 +1,20 @@
+# Standalone experiment tool: widen the bit-packed `stick` equipment index
+# (7 bits -> 8 bits) in nhlng.db so we can test whether the game engine reads
+# the field width generically from the TDB descriptor (value 200 survives) or
+# masks it to 7 bits (200 -> 72). See docs/stick-widen-experiment.md.
+#
+# Declares its own workspace so it does not get pulled into the recomp tree's
+# build; path-depends on the studio's tdb-core for correct TDB parsing/CRC.
+[package]
+name = "stick_widen"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tdb-core = { path = "../../../nhl-database-studio/crates/tdb-core" }
+
+[[bin]]
+name = "stick_widen"
+path = "src/main.rs"

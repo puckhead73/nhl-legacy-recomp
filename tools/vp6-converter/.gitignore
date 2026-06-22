@@ -1,0 +1,5 @@
+/target
+/bin/*.exe
+/vp6conv.exe
+*.vp6conv.y4m
+*.vp6conv.video.vp6
