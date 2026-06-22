@@ -1,24 +1,139 @@
-# rexglue Vulkan SDK patch for NHL Legacy
-#
-# Apply against a clean checkout of the rexglue SDK (E:\Tools\rexglue-sdk\src):
-#   git apply docs/rexglue-vulkan-nhl-legacy.patch
-#
-# Captures the Vulkan-fsi rendering source changes: spirv translator + texture
-# cache fixes (exp_adjust word3, readback=full, signed BC5) AND the in-game
-# color-grade post-process (command_processor.{cpp,h}: present_grade_* cvars +
-# the grade compute pipeline/dispatch after the swap gamma-apply).
-#
-# The grade compute shader is NOT in this diff (the SDK shaders dir is generated
-# and not reliably tracked). Copy the two canonical files from this repo into the
-# SDK tree before building:
-#   renderer/shaders/nhl_grade.comp   -> src/graphics/vulkan/shaders/src/nhl_grade.comp
-#   renderer/shaders/nhl_grade_cs.h   -> src/graphics/vulkan/shaders/nhl_grade_cs.h
-# (regenerate the header after editing the shader:
-#   glslangValidator -V --vn nhl_grade_cs nhl_grade.comp -o ../nhl_grade_cs.h)
-#
-# The FidelityFX cmake/build changes are documented separately in
-# docs/fidelityfx-enablement-notes.md.
-#
+diff --git a/cmake/rexglue_fidelityfx.cmake b/cmake/rexglue_fidelityfx.cmake
+index af35fa8..314c841 100644
+--- a/cmake/rexglue_fidelityfx.cmake
++++ b/cmake/rexglue_fidelityfx.cmake
+@@ -103,28 +103,50 @@ if(REXGLUE_USE_VULKAN AND REXGLUE_USE_D3D12)
+         "FidelityFX backend selected for this build: ${_rexglue_fidelityfx_backend}")
+ endif()
+ 
+-# ── Build FidelityFX ─────────────────────────────────────────────────────
+-set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
+-if(WIN32)
+-    set(FFX_API_AUTO_COMPILE_SHADERS ON CACHE BOOL "" FORCE)
++# ── Provide the FidelityFX libraries ─────────────────────────────────────
++# The upstream ffx-api/sdk CMake assumes MSVC + the Visual Studio generator
++# (toolchain.cmake force-sets CMAKE_GENERATOR_PLATFORM, calls vswhere, resolves
++# PIX by platform, uses MSVC-only flags). That is incompatible with this SDK's
++# clang + Ninja-Multi-Config toolchain. So when a prebuilt FidelityFX library
++# (built once with the VS generator) is supplied via REXGLUE_FIDELITYFX_PREBUILT_DIR,
++# import it instead of building it in-tree. The DLL is DELAYLOAD'd and talks a C
++# ABI, so a Release MSVC build links/loads fine into the clang SDK.
++set(REXGLUE_FIDELITYFX_PREBUILT_DIR "" CACHE PATH
++    "Directory containing a prebuilt amd_fidelityfx_<backend>.dll + .lib (skips the in-tree FidelityFX build)")
++
++if(REXGLUE_FIDELITYFX_PREBUILT_DIR AND
++   EXISTS "${REXGLUE_FIDELITYFX_PREBUILT_DIR}/amd_fidelityfx_${_rexglue_fidelityfx_backend}.dll")
++    set(_ffx_name "amd_fidelityfx_${_rexglue_fidelityfx_backend}")
++    add_library(${_ffx_name} SHARED IMPORTED GLOBAL)
++    set_target_properties(${_ffx_name} PROPERTIES
++        IMPORTED_LOCATION "${REXGLUE_FIDELITYFX_PREBUILT_DIR}/${_ffx_name}.dll"
++        IMPORTED_IMPLIB   "${REXGLUE_FIDELITYFX_PREBUILT_DIR}/${_ffx_name}.lib"
++        INTERFACE_INCLUDE_DIRECTORIES "")
++    message(STATUS "FidelityFX: using prebuilt ${_ffx_name} from ${REXGLUE_FIDELITYFX_PREBUILT_DIR}")
+ else()
+-    set(FFX_API_AUTO_COMPILE_SHADERS OFF CACHE BOOL "" FORCE)
+-endif()
+-add_subdirectory("${fidelityfx_SOURCE_DIR}/ffx-api" "${fidelityfx_BINARY_DIR}/ffx-api" EXCLUDE_FROM_ALL)
++    # ── Build FidelityFX in-tree (VS generator only) ─────────────────────
++    set(FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF CACHE BOOL "" FORCE)
++    if(WIN32)
++        set(FFX_API_AUTO_COMPILE_SHADERS ON CACHE BOOL "" FORCE)
++    else()
++        set(FFX_API_AUTO_COMPILE_SHADERS OFF CACHE BOOL "" FORCE)
++    endif()
++    add_subdirectory("${fidelityfx_SOURCE_DIR}/ffx-api" "${fidelityfx_BINARY_DIR}/ffx-api" EXCLUDE_FROM_ALL)
+ 
+-# The upstream FidelityFX targets expose source-tree include paths in
+-# INTERFACE_INCLUDE_DIRECTORIES, which breaks our install export checks.
+-# We only link against these targets internally, so no public includes are
+-# needed on the exported interface.
+-if(TARGET amd_fidelityfx_vk)
+-    set_target_properties(amd_fidelityfx_vk PROPERTIES
+-        INTERFACE_INCLUDE_DIRECTORIES ""
+-    )
+-endif()
+-if(TARGET amd_fidelityfx_dx12)
+-    set_target_properties(amd_fidelityfx_dx12 PROPERTIES
+-        INTERFACE_INCLUDE_DIRECTORIES ""
+-    )
++    # The upstream FidelityFX targets expose source-tree include paths in
++    # INTERFACE_INCLUDE_DIRECTORIES, which breaks our install export checks.
++    # We only link against these targets internally, so no public includes are
++    # needed on the exported interface.
++    if(TARGET amd_fidelityfx_vk)
++        set_target_properties(amd_fidelityfx_vk PROPERTIES
++            INTERFACE_INCLUDE_DIRECTORIES ""
++        )
++    endif()
++    if(TARGET amd_fidelityfx_dx12)
++        set_target_properties(amd_fidelityfx_dx12 PROPERTIES
++            INTERFACE_INCLUDE_DIRECTORIES ""
++        )
++    endif()
+ endif()
+ 
+ # FidelityFX's toolchain.cmake force-sets CMAKE_GENERATOR_PLATFORM (for VS generators).
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index e7d5135..49429df 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -33,14 +33,27 @@ if(REXGLUE_ENABLE_TRACY)
+     list(APPEND REXGLUE_INSTALL_TARGETS TracyClient)
+ endif()
+ 
++# Prebuilt (IMPORTED) FidelityFX libraries can't be install(TARGETS)/exported —
++# they're DELAYLOAD'd into the rexruntime shared lib, so only the DLL needs to
++# ship. Install those as files; build-in-tree targets go through install(TARGETS).
+ set(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
+-if(TARGET amd_fidelityfx_vk)
+-    list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS amd_fidelityfx_vk)
+-endif()
+-
+-if(TARGET amd_fidelityfx_dx12)
+-    list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS amd_fidelityfx_dx12)
+-endif()
++foreach(_ffx_tgt amd_fidelityfx_vk amd_fidelityfx_dx12)
++    if(TARGET ${_ffx_tgt})
++        get_target_property(_ffx_imported ${_ffx_tgt} IMPORTED)
++        if(_ffx_imported)
++            get_target_property(_ffx_dll ${_ffx_tgt} IMPORTED_LOCATION)
++            get_target_property(_ffx_lib ${_ffx_tgt} IMPORTED_IMPLIB)
++            if(_ffx_dll)
++                install(FILES "${_ffx_dll}" DESTINATION ${CMAKE_INSTALL_BINDIR})
++            endif()
++            if(_ffx_lib)
++                install(FILES "${_ffx_lib}" DESTINATION ${CMAKE_INSTALL_LIBDIR})
++            endif()
++        else()
++            list(APPEND REXGLUE_INSTALL_FIDELITYFX_TARGETS ${_ffx_tgt})
++        endif()
++    endif()
++endforeach()
+ 
+ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
+     EXPORT rexglueTargets
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index e0679b8..9b570e0 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -52,6 +52,17 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+ REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
+ REXCVAR_DECLARE(int32_t, anisotropic_override);
++// NHL: restore bilinear filtering on guest depth/shadow maps (k_24_8 /
++// k_24_8_FLOAT). The SDK forces NEAREST on these because the host R32_SFLOAT
++// decode is often not linear-filterable, which makes the game's shadow maps
++// look hard/"striped" up close. Enabling this softens shadow edges where the
++// host format supports linear filtering.
++REXCVAR_DECLARE(bool, shadow_filter_linear);
++// NHL: extra depth-domain blur on guest depth/shadow maps, applied once on upload
++// via a downsample/upsample blit. 0 = off (no blur), 1..4 = blur passes (wider,
++// softer penumbra). Goes beyond shadow_filter_linear's 2x2 bilinear; can mildly
++// halo at depth discontinuities, so it's a tunable slider.
++REXCVAR_DECLARE(int32_t, shadow_softness);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_soft);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_hard);
 diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
 index c51ea54..cc070dd 100644
 --- a/include/rex/graphics/pipeline/shader/spirv_translator.h
@@ -36,20 +151,151 @@ index c51ea54..cc070dd 100644
  
      enum class DepthStencilMode : uint32_t {
        kNoModifiers,
-diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 4b76791..5de3fbf 100644
---- a/include/rex/graphics/vulkan/command_processor.h
-+++ b/include/rex/graphics/vulkan/command_processor.h
-@@ -692,6 +692,9 @@ class VulkanCommandProcessor : public CommandProcessor {
-   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
-   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
-   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
-+  // NHL Legacy: in-place color-grade compute pass after the swap gamma-apply.
-+  VkPipelineLayout nhl_grade_pipeline_layout_ = VK_NULL_HANDLE;
-+  VkPipeline nhl_grade_pipeline_ = VK_NULL_HANDLE;
-   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
-   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
-   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..e8a121b 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -181,6 +181,30 @@ class DeferredCommandBuffer {
+                 sizeof(VkBufferCopy) * region_count);
+   }
+ 
++  // Returns a pointer to an uninitialized VkImageBlit[region_count] to fill in.
++  VkImageBlit* CmdBlitImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
++                                   VkImage dst_image, VkImageLayout dst_image_layout,
++                                   uint32_t region_count, VkFilter filter) {
++    const size_t header_size = rex::align(sizeof(ArgsVkBlitImage), alignof(VkImageBlit));
++    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
++        WriteCommand(Command::kVkBlitImage, header_size + sizeof(VkImageBlit) * region_count));
++    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(args_ptr);
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region_count = region_count;
++    args.filter = filter;
++    return reinterpret_cast<VkImageBlit*>(args_ptr + header_size);
++  }
++  void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                      VkImageLayout dst_image_layout, uint32_t region_count,
++                      const VkImageBlit* regions, VkFilter filter) {
++    std::memcpy(CmdBlitImageEmplace(src_image, src_image_layout, dst_image, dst_image_layout,
++                                    region_count, filter),
++                regions, sizeof(VkImageBlit) * region_count);
++  }
++
+   void CmdVkBeginQuery(VkQueryPool query_pool, uint32_t query, VkQueryControlFlags flags) {
+     auto& args = *reinterpret_cast<ArgsVkBeginQuery*>(
+         WriteCommand(Command::kVkBeginQuery, sizeof(ArgsVkBeginQuery)));
+@@ -359,6 +383,7 @@ class DeferredCommandBuffer {
+     kVkBindIndexBuffer,
+     kVkBindPipeline,
+     kVkBindVertexBuffers,
++    kVkBlitImage,
+     kVkClearAttachments,
+     kVkClearColorImage,
+     kVkCopyBuffer,
+@@ -475,6 +500,17 @@ class DeferredCommandBuffer {
+     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
+   };
+ 
++  struct ArgsVkBlitImage {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    uint32_t region_count;
++    VkFilter filter;
++    // Followed by aligned VkImageBlit[].
++    static_assert(alignof(VkImageBlit) <= alignof(uintmax_t));
++  };
++
+   struct ArgsVkCopyBufferToImage {
+     VkBuffer src_buffer;
+     VkImage dst_image;
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee..f59918d 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -327,6 +327,17 @@ class VulkanTextureCache final : public TextureCache {
+ 
+   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
+ 
++  // NHL shadow softening: blur level 0 of a just-loaded depth/shadow texture in
++  // place by ping-ponging through a half-resolution scratch image (downsample +
++  // upsample blit), `passes` times. Records into the deferred command buffer
++  // right after the texture's buffer->image copy; leaves the texture's level 0
++  // back in TRANSFER_DST_OPTIMAL so the cache's normal usage tracking is intact.
++  // No-op if the depth format can't be blit-filtered on this device.
++  void SoftenDepthShadowLevel0(VulkanTexture& texture, uint32_t level0_width,
++                               uint32_t level0_height, int passes);
++  // Lazily (re)allocate the blur scratch image to at least the given size.
++  bool EnsureShadowBlurScratch(uint32_t width, uint32_t height);
++
+   VulkanCommandProcessor& command_processor_;
+   VkPipelineStageFlags guest_shader_pipeline_stages_;
+ 
+@@ -362,6 +373,15 @@ class VulkanTextureCache final : public TextureCache {
+ 
+   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
+ 
++  // NHL shadow softening (shadow_softness cvar): half-res scratch image used to
++  // blur depth/shadow maps on upload. Grown on demand; destroyed in the dtor.
++  VkImage shadow_blur_scratch_image_ = VK_NULL_HANDLE;
++  VmaAllocation shadow_blur_scratch_allocation_ = VK_NULL_HANDLE;
++  uint32_t shadow_blur_scratch_width_ = 0;
++  uint32_t shadow_blur_scratch_height_ = 0;
++  // -1 = not yet probed; 0/1 = whether R32_SFLOAT supports linear blit filtering.
++  int shadow_blur_linear_filter_ = -1;
++
+   // Unsupported texture formats used during this frame (for research and
+   // testing).
+   enum : uint8_t {
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index aa55a4a..b3b5e13 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -11,6 +11,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdBindIndexBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdBindPipeline)
+ XE_UI_VULKAN_FUNCTION(vkCmdBindVertexBuffers)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
++XE_UI_VULKAN_FUNCTION(vkCmdBlitImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 60efcd3..049acda 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <string_view>
+ 
+@@ -245,6 +246,21 @@ void CommandProcessor::InvalidateGpuMemory() {}
+ 
+ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
+     bool legacy_readback_resolve_enabled) const {
++  // NHL debug knob: NHL_VK_READBACK_MODE={none,fast,some,full} overrides the
++  // configured resolve-readback mode at runtime so the per-resolve GPU sync stall
++  // (kFull) can be A/B'd against the delayed/double-buffered modes (kFast/kSome).
++  // Unset = no override. Cached on first read (single CP worker thread). See also
++  // the size-gated NHL_VK_READBACK_MAX_LEN in the Vulkan IssueCopy readback path,
++  // which is the shipping lever (keeps kFull correctness for composites, skips the
++  // per-resolve drain for large framebuffer resolves).
++  static int s_nhl_rb_override = -2;  // -2 unresolved, -1 no override, else mode
++  if (s_nhl_rb_override == -2) {
++    const char* e = std::getenv("NHL_VK_READBACK_MODE");
++    s_nhl_rb_override = e ? static_cast<int>(ParseReadbackResolveMode(e)) : -1;
++  }
++  if (s_nhl_rb_override != -1) {
++    return static_cast<ReadbackResolveMode>(s_nhl_rb_override);
++  }
+   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
+   bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
+                                       rex::cvar::HasNonDefaultValue("readback_resolve");
 diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 index 9ce3bb4..a3de031 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
@@ -87,213 +333,159 @@ index 9ce3bb4..a3de031 100644
          {
            uint32_t result_remaining_components = used_result_nonzero_components;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index a40436e..4075dfb 100644
+index 4075dfb..6bffa67 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
-@@ -11,6 +11,7 @@
- 
- #include <algorithm>
+@@ -13,12 +13,15 @@
  #include <array>
-+#include <cmath>
+ #include <cmath>
  #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
  #include <cstring>
  #include <iterator>
-@@ -69,6 +70,35 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
-                     "device (falls back to render passes otherwise)")
-     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ #include <mutex>
+ #include <string>
+ #include <string_view>
+ #include <tuple>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
  
-+// NHL Legacy color-grade post-process (runs in place on the guest-output image
-+// right after the swap gamma-apply). All defaults are identity, so the pass is a
-+// no-op until the in-game overlay moves a slider. Hot-reloadable so the overlay's
-+// edits take effect live.
-+REXCVAR_DEFINE_BOOL(present_grade_enable, false, "GPU/Vulkan",
-+                    "Enable the NHL Legacy color-grade post-process")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_exposure, 0.0, "GPU/Vulkan",
-+                      "Color-grade exposure in stops (EV); 0 = unchanged")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_contrast, 1.0, "GPU/Vulkan",
-+                      "Color-grade contrast around mid-gray; 1 = unchanged")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_saturation, 1.0, "GPU/Vulkan",
-+                      "Color-grade saturation; 1 = unchanged, 0 = grayscale")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_brightness, 0.0, "GPU/Vulkan",
-+                      "Color-grade additive brightness; 0 = unchanged")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_temperature, 0.0, "GPU/Vulkan",
-+                      "Color-grade white-balance temperature, -1 (cool) .. +1 (warm); 0 = neutral")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_tint, 0.0, "GPU/Vulkan",
-+                      "Color-grade white-balance tint, -1 (magenta) .. +1 (green); 0 = neutral")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+REXCVAR_DEFINE_DOUBLE(present_grade_tonemap, 0.0, "GPU/Vulkan",
-+                      "Color-grade ACES filmic tone-map blend, 0..1; 0 = off")
-+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
-+
- namespace rex::graphics::vulkan {
- 
- namespace {
-@@ -549,8 +579,24 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
- 
- }  // namespace
- 
-+// Push constants for the NHL Legacy color-grade compute pass; must match the
-+// layout in shaders/src/nhl_grade.comp.
-+struct NhlGradeConstants {
-+  uint32_t width;
-+  uint32_t height;
-+  float exposure;
-+  float contrast;
-+  float saturation;
-+  float brightness;
-+  float wb_r;
-+  float wb_g;
-+  float wb_b;
-+  float tonemap;
-+};
-+
- // Generated with `xb buildshaders`.
- namespace shaders {
-+#include "shaders/nhl_grade_cs.h"
- #include "../shaders/vulkan_spirv/apply_gamma_pwl_cs.h"
- #include "../shaders/vulkan_spirv/apply_gamma_pwl_fxaa_luma_ps.h"
- #include "../shaders/vulkan_spirv/apply_gamma_pwl_fxaa_luma_cs.h"
-@@ -1813,6 +1859,38 @@ bool VulkanCommandProcessor::SetupContext() {
-         "Failed to create the PWL gamma ramp application compute pipeline with "
-         "luma output");
+@@ -4578,6 +4581,66 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+     return true;
    }
+ 
++  // Size-gated readback (NHL). The per-resolve readback in kFull mode does a full
++  // GPU drain (AwaitAllQueueOperationsCompletion below) so the CPU memcpy reads
++  // current pixels — but that is only needed for the small runtime-COMPOSITED
++  // textures the guest CPU re-reads/tints (player/goalie equipment). The large
++  // framebuffer-class resolves (e.g. 1280x720x4) are consumed GPU-side for present
++  // and never CPU-read, yet kFull drains the GPU on every one — the dominant CP
++  // stall on this workload (~7 of ~14.5 readbacks/frame in dense gameplay). The
++  // GPU-side resolve (compute-copy into shared_memory + MarkRangeAsResolved) has
++  // already run in render_target_cache_->Resolve() above, so skipping the CPU
++  // readback here just leaves the resolve GPU-resident — correct for every GPU
++  // consumer; only a guest-CPU-composited texture would go stale. So skip the CPU
++  // readback (and its drain) above a byte threshold while keeping the FULL
++  // same-frame readback (zero staleness) for the smaller composite targets.
++  // NHL_VK_READBACK_MAX_LEN = max bytes still read back; 0/unset = no gating (every
++  // resolve reads back, == stock kFull). The game sets a default (~3 MB) that keeps
++  // every equipment composite and skips only the framebuffers. Cached; single CP
++  // worker thread, so a plain static is safe.
++  static int64_t s_rb_max_len = -1;
++  if (s_rb_max_len < 0) {
++    const char* e = std::getenv("NHL_VK_READBACK_MAX_LEN");
++    s_rb_max_len = (e && *e) ? std::strtoll(e, nullptr, 0) : 0;
++  }
++  const bool size_skip = (s_rb_max_len > 0 && written_length > uint32_t(s_rb_max_len));
 +
-+  // NHL Legacy color-grade compute pipeline. Reuses the single STORAGE_IMAGE
-+  // descriptor set layout (set 0 = the guest-output image, edited in place) and
-+  // adds a push-constant range for the grade knobs. Optional: if it fails to
-+  // create, the grade pass is simply skipped (the dispatch checks the handle).
-+  {
-+    VkDescriptorSetLayout grade_set_layout = swap_descriptor_set_layout_storage_image_;
-+    VkPushConstantRange grade_push_range;
-+    grade_push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-+    grade_push_range.offset = 0;
-+    grade_push_range.size = sizeof(NhlGradeConstants);
-+    VkPipelineLayoutCreateInfo grade_layout_info;
-+    grade_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-+    grade_layout_info.pNext = nullptr;
-+    grade_layout_info.flags = 0;
-+    grade_layout_info.setLayoutCount = 1;
-+    grade_layout_info.pSetLayouts = &grade_set_layout;
-+    grade_layout_info.pushConstantRangeCount = 1;
-+    grade_layout_info.pPushConstantRanges = &grade_push_range;
-+    if (dfn.vkCreatePipelineLayout(device, &grade_layout_info, nullptr,
-+                                   &nhl_grade_pipeline_layout_) == VK_SUCCESS) {
-+      nhl_grade_pipeline_ = ui::vulkan::util::CreateComputePipeline(
-+          vulkan_device, nhl_grade_pipeline_layout_, shaders::nhl_grade_cs,
-+          sizeof(shaders::nhl_grade_cs));
-+      if (nhl_grade_pipeline_ == VK_NULL_HANDLE) {
-+        REXGPU_WARN("Failed to create the NHL color-grade compute pipeline");
++  // Diagnostic (NHL_VK_RB_STATS): per-destination resolve sizes, so the size gate
++  // can be validated/tuned in any scene — "largest_kept" is the biggest dest the
++  // gate still reads back (must stay above every CPU-composited equipment target,
++  // below the framebuffers). Single CP worker thread, so plain statics are safe.
++  static int s_rb_stats = -1;
++  if (s_rb_stats < 0) s_rb_stats = std::getenv("NHL_VK_RB_STATS") ? 1 : 0;
++  if (s_rb_stats) {
++    static std::unordered_map<uint32_t, uint32_t> s_dest_max_len;  // dest addr -> max len
++    static uint64_t n = 0;
++    uint32_t& slot = s_dest_max_len[written_address];
++    slot = std::max(slot, written_length);
++    if ((++n % 4000) == 0) {
++      size_t kept = 0, skipped = 0;
++      uint32_t largest_kept = 0, smallest_skipped = UINT32_MAX;
++      for (const auto& kv : s_dest_max_len) {
++        if (s_rb_max_len > 0 && kv.second > uint32_t(s_rb_max_len)) {
++          ++skipped;
++          smallest_skipped = std::min(smallest_skipped, kv.second);
++        } else {
++          ++kept;
++          largest_kept = std::max(largest_kept, kv.second);
++        }
 +      }
-+    } else {
-+      REXGPU_WARN("Failed to create the NHL color-grade compute pipeline layout");
++      std::fprintf(stderr,
++                   "[nhl-rb] resolves=%llu dests=%zu kept=%zu skipped=%zu largest_kept=%.0fKB "
++                   "smallest_skipped=%.0fKB\n",
++                   (unsigned long long)n, s_dest_max_len.size(), kept, skipped,
++                   largest_kept / 1024.0,
++                   smallest_skipped == UINT32_MAX ? 0.0 : smallest_skipped / 1024.0);
 +    }
 +  }
 +
-   if (!vulkan_device->properties().imageViewFormatSwizzle) {
-     auto create_rb_swap_compute_pipeline = [&](const char* source, VkPipeline& pipeline_out,
-                                                const char* pipeline_name) {
-@@ -1968,6 +2046,9 @@ void VulkanCommandProcessor::ShutdownContext() {
++  if (size_skip) {
++    return true;  // GPU-side resolve already done; skip the CPU readback + drain
++  }
++
+   auto ensure_readback_slot = [&](ReadbackBuffer& readback, uint32_t index, uint32_t size) -> bool {
+     if (readback.buffers[index] != VK_NULL_HANDLE && size <= readback.sizes[index] &&
+         readback.mapped_data[index] != nullptr) {
+@@ -4628,6 +4691,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
  
-   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
-                                          swap_fxaa_extreme_pipeline_);
-+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, nhl_grade_pipeline_);
-+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
-+                                         nhl_grade_pipeline_layout_);
-   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, swap_fxaa_pipeline_);
-   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
-                                          swap_apply_gamma_compute_pwl_fxaa_luma_pipeline_);
-@@ -2765,6 +2846,66 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
-             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
-           }
+   bool is_scaled = texture_cache_->IsDrawResolutionScaled();
+   uint64_t resolve_key = MakeReadbackResolveKey(written_address, written_length);
++
+   ReadbackBuffer& readback = readback_buffers_[resolve_key];
+   readback.last_used_frame = frame_current_;
+   uint32_t write_index = readback.current_index;
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..1b76ae1 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -146,6 +146,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                                 rex::align(sizeof(ArgsVkCopyBuffer), alignof(VkBufferCopy))));
+       } break;
  
-+          // NHL Legacy: in-place color grade, right after gamma/FXAA. Reads the
-+          // present_grade_* cvars; skipped entirely when disabled or the pipeline
-+          // failed to create, so the swap path is unchanged by default. The
-+          // release barrier below already covers this dispatch's writes (it waits
-+          // on all prior COMPUTE SHADER_WRITEs to the same image).
-+          if (nhl_grade_pipeline_ != VK_NULL_HANDLE && REXCVAR_GET(present_grade_enable)) {
-+            // Make the gamma/FXAA writes visible to the grade's in-place read.
-+            PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
-+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-+                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-+                                   VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
-+            SubmitBarriers(true);
++      case Command::kVkBlitImage: {
++        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
++        dfn.vkCmdBlitImage(
++            command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++            args.dst_image_layout, args.region_count,
++            reinterpret_cast<const VkImageBlit*>(reinterpret_cast<const uint8_t*>(stream) +
++                                                 rex::align(sizeof(ArgsVkBlitImage),
++                                                            alignof(VkImageBlit))),
++            args.filter);
++      } break;
 +
-+            // Aim the storage descriptor at the guest-output image (the FXAA path
-+            // leaves it pointed at the FXAA source, so always rebind it here).
-+            VkDescriptorSet grade_descriptor =
-+                swap_descriptors_destination_storage_[swap_frame_index];
-+            VkDescriptorImageInfo grade_image_info;
-+            grade_image_info.sampler = VK_NULL_HANDLE;
-+            grade_image_info.imageView = vulkan_context.image_view();
-+            grade_image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-+            VkWriteDescriptorSet grade_write;
-+            grade_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-+            grade_write.pNext = nullptr;
-+            grade_write.dstSet = grade_descriptor;
-+            grade_write.dstBinding = 0;
-+            grade_write.dstArrayElement = 0;
-+            grade_write.descriptorCount = 1;
-+            grade_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-+            grade_write.pImageInfo = &grade_image_info;
-+            grade_write.pBufferInfo = nullptr;
-+            grade_write.pTexelBufferView = nullptr;
-+            dfn.vkUpdateDescriptorSets(device, 1, &grade_write, 0, nullptr);
-+
-+            deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
-+                                                             nhl_grade_pipeline_layout_, 0, 1,
-+                                                             &grade_descriptor, 0, nullptr);
-+
-+            NhlGradeConstants grade_constants;
-+            grade_constants.width = guest_output_width;
-+            grade_constants.height = guest_output_height;
-+            grade_constants.exposure = float(std::exp2(REXCVAR_GET(present_grade_exposure)));
-+            grade_constants.contrast = float(REXCVAR_GET(present_grade_contrast));
-+            grade_constants.saturation = float(REXCVAR_GET(present_grade_saturation));
-+            grade_constants.brightness = float(REXCVAR_GET(present_grade_brightness));
-+            // Map temperature/tint (-1..+1) to a simple per-channel white balance.
-+            float grade_temp = float(REXCVAR_GET(present_grade_temperature));
-+            float grade_tint = float(REXCVAR_GET(present_grade_tint));
-+            grade_constants.wb_r = 1.0f + 0.20f * grade_temp;
-+            grade_constants.wb_g = 1.0f + 0.20f * grade_tint;
-+            grade_constants.wb_b = 1.0f - 0.20f * grade_temp;
-+            grade_constants.tonemap = float(REXCVAR_GET(present_grade_tonemap));
-+            deferred_command_buffer_.CmdVkPushConstants(nhl_grade_pipeline_layout_,
-+                                                        VK_SHADER_STAGE_COMPUTE_BIT, 0,
-+                                                        sizeof(grade_constants), &grade_constants);
-+            BindExternalComputePipeline(nhl_grade_pipeline_);
-+            deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
-+          }
-+
-           // Insert the release barrier.
-           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
-                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+       case Command::kVkCopyBufferToImage: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
+         dfn.vkCmdCopyBufferToImage(
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index fc46bf8..c987776 100644
+index fc46bf8..b0066e4 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
-@@ -12,10 +12,13 @@
+@@ -12,8 +12,11 @@
  #include <algorithm>
  #include <array>
  #include <cstddef>
 +#include <cstdio>
++#include <cstdlib>
  #include <cstring>
  #include <utility>
 +#include <vector>
  
  #include <rex/assert.h>
-+#include <rex/system/kernel_state.h>  // [VP6-DUMP] guest memory access
  #include <rex/bit.h>
- #include <rex/logging.h>
- #include <rex/math.h>
-@@ -313,10 +316,16 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kBestHostFormats[64
+@@ -35,6 +38,19 @@
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+ 
++// NHL: see flags.h. Off by default so shadow sampling is byte-for-byte unchanged
++// unless the user opts in from the enhancements overlay.
++REXCVAR_DEFINE_BOOL(shadow_filter_linear, false, "GPU",
++                    "Restore bilinear filtering on guest depth/shadow maps to soften hard, "
++                    "pixelated shadow edges (no effect if the host depth format is not "
++                    "linear-filterable).");
++
++// NHL: see flags.h. 0 = off (default). Read live per texture upload.
++REXCVAR_DEFINE_INT32(shadow_softness, 0, "GPU",
++                     "Extra depth-domain blur passes applied to guest depth/shadow maps on "
++                     "upload (0 = off, 1..4 = progressively softer). Goes beyond bilinear.")
++    .range(0, 4);
++
+ namespace rex::graphics::vulkan {
+ 
+ // Generated with `xb buildshaders`.
+@@ -313,10 +329,16 @@ const VulkanTextureCache::HostFormatPair VulkanTextureCache::kBestHostFormats[64
      // k_16_16_MPEG_INTERLACED
      {{kLoadShaderIndexUnknown}, {kLoadShaderIndexUnknown}, xenos::XE_GPU_TEXTURE_SWIZZLE_RGGG},
      // k_DXN
@@ -313,65 +505,83 @@ index fc46bf8..c987776 100644
      // k_8_8_8_8_AS_16_16_16_16
      {{kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_UNORM},
       {kLoadShaderIndex32bpb, VK_FORMAT_R8G8B8A8_SNORM},
-@@ -1113,6 +1122,57 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
- std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(TextureKey key) {
-   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
-   const HostFormatPair& host_format = GetHostFormatPair(key);
-+  // [VP6-PROBE] Full per-texture descriptor for every >=320px texture created
-+  // (non-dedup, capped). The corrupt EA-logo video appears as a burst of
-+  // large textures; comparing them to the clean static splash reveals whether
-+  // the difference is format / tiling / endianness / pitch / scaled-resolve.
-+  {
-+    static int vp6_probe_count = 0;
-+    if (key.GetWidth() >= 320 && vp6_probe_count < 200) {
-+      ++vp6_probe_count;
-+      REXGPU_INFO(
-+          "[VP6-PROBE] #{} fmt {}(#{}) {}x{} pitch={} tiled={} endian={} sep={} "
-+          "scaled={} dim={} host_u={} host_s={}",
-+          vp6_probe_count, FormatInfo::Get(key.format)->name, uint32_t(key.format),
-+          key.GetWidth(), key.GetHeight(), uint32_t(key.pitch), uint32_t(key.tiled),
-+          uint32_t(key.endianness), uint32_t(key.signed_separate),
-+          uint32_t(key.scaled_resolve), uint32_t(key.dimension),
-+          uint32_t(host_format.format_unsigned.format),
-+          uint32_t(host_format.format_signed.format));
-+    }
+@@ -444,6 +466,13 @@ VulkanTextureCache::~VulkanTextureCache() {
+ 
+   ShutdownScaledResolveBuffer();
+ 
++  // NHL shadow softening scratch image.
++  if (shadow_blur_scratch_image_ != VK_NULL_HANDLE) {
++    vmaDestroyImage(vma_allocator_, shadow_blur_scratch_image_, shadow_blur_scratch_allocation_);
++    shadow_blur_scratch_image_ = VK_NULL_HANDLE;
++    shadow_blur_scratch_allocation_ = VK_NULL_HANDLE;
 +  }
-+  // [VP6-DUMP] One-shot raw dump of a luma and a chroma plane's GUEST bytes (as
-+  // the game hands them to the GPU). Clean => GPU/shader bug; garbage => CPU VP6
-+  // decoder bug. Reconstruct offline using the logged pitch/width/height.
-+  {
-+    static bool vp6_dumped_luma = false, vp6_dumped_chroma = false;
-+    if (key.format == xenos::TextureFormat::k_8 && !key.tiled &&
-+        key.dimension == xenos::DataDimension::k2DOrStacked) {
-+      bool luma = key.GetHeight() >= 700 && key.GetHeight() <= 740 && !vp6_dumped_luma;
-+      bool chroma = key.GetHeight() >= 280 && key.GetHeight() <= 380 && !vp6_dumped_chroma;
-+      if (luma || chroma) {
-+        uint32_t pitch_texels = uint32_t(key.pitch) << 5;
-+        uint32_t h = key.GetHeight();
-+        uint32_t addr = key.base_page << 12;
-+        const uint8_t* src =
-+            rex::system::kernel_state()->memory()->TranslatePhysical<const uint8_t*>(addr);
-+        if (src) {
-+          const char* path = luma ? "vp6_luma.raw" : "vp6_chroma.raw";
-+          if (FILE* fp = std::fopen(path, "wb")) {
-+            std::fwrite(src, 1, size_t(pitch_texels) * h, fp);
-+            std::fclose(fp);
-+          }
-+          REXGPU_INFO("[VP6-DUMP] {} {}x{} pitch={} addr=0x{:x}", path, key.GetWidth(),
-+                      h, pitch_texels, addr);
-+        }
-+        if (luma) {
-+          vp6_dumped_luma = true;
-+        } else {
-+          vp6_dumped_chroma = true;
-+        }
++
+   if (null_image_view_3d_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyImageView(device, null_image_view_3d_, nullptr);
+   }
+@@ -751,6 +780,32 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
+   }
+   parameters.aniso_filter = aniso_filter;
+ 
++  // NHL: optionally restore bilinear filtering on the guest's depth/shadow maps.
++  // The engine samples k_24_8 / k_24_8_FLOAT depth shadow maps that were linearly
++  // filterable on Xenos, but our host decode (R32_SFLOAT) is often flagged
++  // non-linear-filterable above, so the sampler was forced to NEAREST -> hard,
++  // "striped" shadow edges. When enabled and the host format actually supports
++  // linear filtering, force bilinear min/mag to soften them. Only touches depth
++  // formats, so colour textures are unaffected.
++  if (REXCVAR_GET(shadow_filter_linear) && !parameters.mag_linear) {
++    TextureKey depth_key;
++    uint8_t depth_swizzled_signs;
++    BindingInfoFromFetchConstant(fetch, depth_key, &depth_swizzled_signs);
++    if (depth_key.is_valid &&
++        (depth_key.format == xenos::TextureFormat::k_24_8 ||
++         depth_key.format == xenos::TextureFormat::k_24_8_FLOAT)) {
++      const HostFormatPair& depth_format_pair = GetHostFormatPair(depth_key);
++      bool depth_linear_filterable =
++          texture_util::IsAnySignSigned(depth_swizzled_signs)
++              ? depth_format_pair.format_signed.linear_filterable
++              : depth_format_pair.format_unsigned.linear_filterable;
++      if (depth_linear_filterable) {
++        parameters.mag_linear = 1;
++        parameters.min_linear = 1;
 +      }
 +    }
 +  }
-   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {
-     // Only the unsigned format may be available, if at all.
-     formats[0] = host_format.format_unsigned.format;
-@@ -1604,8 +1664,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
++
+   return parameters;
+ }
+ 
+@@ -1170,6 +1225,28 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
++  // NHL shadow softening: depth/shadow maps may be blurred on upload (shadow_softness),
++  // which blits FROM the texture's level 0 into a scratch image. Always allow it for
++  // depth formats so the softness slider works live (negligible cost, no extra memory).
++  if (key.format == xenos::TextureFormat::k_24_8 ||
++      key.format == xenos::TextureFormat::k_24_8_FLOAT) {
++    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
++    // Phase-0 shadow probe (NHL_VK_SHADOW_PROBE): log every depth (shadow-map
++    // candidate) texture created, so we can confirm the shadow maps flow through
++    // the resolve-to-texture path, how many there are, and their resolution.
++    // scaled_resolve=1 means it came from a scaled EDRAM resolve (a render-to-
++    // texture depth target -> a shadow map), which is Approach A's interception
++    // point. This is a diagnostic only; remove once the shadow-res path lands.
++    static const bool kShadowProbe = std::getenv("NHL_VK_SHADOW_PROBE") != nullptr;
++    if (kShadowProbe) {
++      REXGPU_INFO("[shadow-probe] depth tex create: host {}x{} guest {}x{} fmt={} "
++                  "scaled_resolve={} mips={} base=0x{:08X}",
++                  image_create_info.extent.width, image_create_info.extent.height,
++                  key.GetWidth(), key.GetHeight(), uint32_t(key.format),
++                  uint32_t(key.scaled_resolve), key.mip_max_level + 1,
++                  uint32_t(key.base_page) << 12);
++    }
++  }
+   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   image_create_info.queueFamilyIndexCount = 0;
+   image_create_info.pQueueFamilyIndices = nullptr;
+@@ -1604,8 +1681,45 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                            sizeof(load_constants.host_offset),
                                            &load_constants.host_offset);
        }
@@ -419,7 +629,161 @@ index fc46bf8..c987776 100644
        load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
        load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
      }
-@@ -2473,6 +2570,18 @@ bool VulkanTextureCache::Initialize() {
+@@ -1779,9 +1893,153 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
+   }
+ 
++  // NHL shadow softening: blur level 0 of depth/shadow maps in place after the
++  // upload copy, when shadow_softness > 0. Only base level is loaded for these
++  // (no guest mips), so blurring level 0 is sufficient. Records blits into the
++  // same deferred command buffer, after the copy above.
++  if (load_base && (texture_key.format == xenos::TextureFormat::k_24_8 ||
++                    texture_key.format == xenos::TextureFormat::k_24_8_FLOAT)) {
++    int softness_passes = REXCVAR_GET(shadow_softness);
++    if (softness_passes > 0) {
++      SoftenDepthShadowLevel0(vulkan_texture,
++                              std::max(width * texture_resolution_scale_x, UINT32_C(1)),
++                              std::max(height * texture_resolution_scale_y, UINT32_C(1)),
++                              softness_passes);
++    }
++  }
++
++  return true;
++}
++
++bool VulkanTextureCache::EnsureShadowBlurScratch(uint32_t width, uint32_t height) {
++  width = std::max(width, UINT32_C(1));
++  height = std::max(height, UINT32_C(1));
++  if (shadow_blur_scratch_image_ != VK_NULL_HANDLE && shadow_blur_scratch_width_ >= width &&
++      shadow_blur_scratch_height_ >= height) {
++    return true;
++  }
++  // Grow to cover the largest shadow seen so far (avoids thrashing across sizes).
++  uint32_t new_width = std::max(width, shadow_blur_scratch_width_);
++  uint32_t new_height = std::max(height, shadow_blur_scratch_height_);
++  if (shadow_blur_scratch_image_ != VK_NULL_HANDLE) {
++    vmaDestroyImage(vma_allocator_, shadow_blur_scratch_image_, shadow_blur_scratch_allocation_);
++    shadow_blur_scratch_image_ = VK_NULL_HANDLE;
++    shadow_blur_scratch_allocation_ = VK_NULL_HANDLE;
++  }
++  VkImageCreateInfo image_create_info = {};
++  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_create_info.imageType = VK_IMAGE_TYPE_2D;
++  image_create_info.format = VK_FORMAT_R32_SFLOAT;  // Host decode of k_24_8(_FLOAT).
++  image_create_info.extent.width = new_width;
++  image_create_info.extent.height = new_height;
++  image_create_info.extent.depth = 1;
++  image_create_info.mipLevels = 1;
++  image_create_info.arrayLayers = 1;
++  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  VmaAllocationCreateInfo allocation_create_info = {};
++  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
++  if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info,
++                     &shadow_blur_scratch_image_, &shadow_blur_scratch_allocation_,
++                     nullptr) != VK_SUCCESS) {
++    shadow_blur_scratch_image_ = VK_NULL_HANDLE;
++    shadow_blur_scratch_allocation_ = VK_NULL_HANDLE;
++    return false;
++  }
++  shadow_blur_scratch_width_ = new_width;
++  shadow_blur_scratch_height_ = new_height;
+   return true;
+ }
+ 
++void VulkanTextureCache::SoftenDepthShadowLevel0(VulkanTexture& texture, uint32_t level0_width,
++                                                 uint32_t level0_height, int passes) {
++  if (passes <= 0 || level0_width < 2 || level0_height < 2) {
++    return;
++  }
++  // Probe once whether R32_SFLOAT can be blit-filtered linearly on this device.
++  if (shadow_blur_linear_filter_ < 0) {
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    const ui::vulkan::VulkanInstance::Functions& ifn =
++        vulkan_device->vulkan_instance()->functions();
++    VkFormatProperties format_properties;
++    ifn.vkGetPhysicalDeviceFormatProperties(vulkan_device->physical_device(),
++                                             VK_FORMAT_R32_SFLOAT, &format_properties);
++    const VkFormatFeatureFlags features = format_properties.optimalTilingFeatures;
++    // Blit both ways is required; linear filtering is preferred but optional.
++    if (!(features & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ||
++        !(features & VK_FORMAT_FEATURE_BLIT_DST_BIT)) {
++      shadow_blur_linear_filter_ = -2;  // Blit unsupported -> feature disabled.
++      REXGPU_WARN("Shadow softening disabled: R32_SFLOAT is not blittable on this device");
++    } else {
++      shadow_blur_linear_filter_ =
++          (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? 1 : 0;
++    }
++  }
++  if (shadow_blur_linear_filter_ == -2) {
++    return;
++  }
++  const uint32_t half_width = std::max(level0_width >> 1, UINT32_C(1));
++  const uint32_t half_height = std::max(level0_height >> 1, UINT32_C(1));
++  if (!EnsureShadowBlurScratch(half_width, half_height)) {
++    return;
++  }
++  const VkFilter filter =
++      shadow_blur_linear_filter_ == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++  const VkImage shadow_image = texture.image();
++  const VkImageSubresourceRange level0_range =
++      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
++  const VkImageSubresourceRange scratch_range =
++      ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++
++  VkImageBlit down_blit = {};
++  down_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  down_blit.srcOffsets[1] = {int32_t(level0_width), int32_t(level0_height), 1};
++  down_blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  down_blit.dstOffsets[1] = {int32_t(half_width), int32_t(half_height), 1};
++  VkImageBlit up_blit = {};
++  up_blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  up_blit.srcOffsets[1] = {int32_t(half_width), int32_t(half_height), 1};
++  up_blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++  up_blit.dstOffsets[1] = {int32_t(level0_width), int32_t(level0_height), 1};
++
++  // The texture's level 0 arrives (and must leave) in TRANSFER_DST_OPTIMAL, which
++  // matches the cache's tracked kTransferDestination usage. Each pass does a
++  // downsample (level0 -> half-res scratch) then an upsample (scratch -> level0).
++  for (int pass = 0; pass < passes; ++pass) {
++    // level0 -> TRANSFER_SRC (read), scratch -> TRANSFER_DST (write, discard old).
++    command_processor_.PushImageMemoryBarrier(
++        shadow_image, level0_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    command_processor_.PushImageMemoryBarrier(
++        shadow_blur_scratch_image_, scratch_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++    command_buffer.CmdVkBlitImage(shadow_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
++                                  shadow_blur_scratch_image_,
++                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &down_blit, filter);
++
++    // scratch -> TRANSFER_SRC (read), level0 -> TRANSFER_DST (write).
++    command_processor_.PushImageMemoryBarrier(
++        shadow_blur_scratch_image_, scratch_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    command_processor_.PushImageMemoryBarrier(
++        shadow_image, level0_range, VK_PIPELINE_STAGE_TRANSFER_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++    command_buffer.CmdVkBlitImage(shadow_blur_scratch_image_,
++                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shadow_image,
++                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up_blit, filter);
++  }
++}
++
+ void VulkanTextureCache::UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {
+   uint32_t bindings_remaining = fetch_constant_mask;
+   uint32_t binding_index;
+@@ -2473,6 +2731,18 @@ bool VulkanTextureCache::Initialize() {
      host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
      host_format_dxn.format_unsigned.block_compressed = false;
    }
@@ -438,7 +802,7 @@ index fc46bf8..c987776 100644
    HostFormatPair& host_format_dxt5a = host_formats_[uint32_t(xenos::TextureFormat::k_DXT5A)];
    assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
    ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
-@@ -2484,7 +2593,10 @@ bool VulkanTextureCache::Initialize() {
+@@ -2484,7 +2754,10 @@ bool VulkanTextureCache::Initialize() {
    }
    // Keep signed format support aligned with D3D12 for texture formats where
    // D3D12 doesn't expose signed sampling paths.
@@ -450,7 +814,7 @@ index fc46bf8..c987776 100644
        xenos::TextureFormat::k_1_5_5_5,
        xenos::TextureFormat::k_5_6_5,
        xenos::TextureFormat::k_6_5_5,
-@@ -2495,7 +2607,6 @@ bool VulkanTextureCache::Initialize() {
+@@ -2495,7 +2768,6 @@ bool VulkanTextureCache::Initialize() {
        xenos::TextureFormat::k_DXT1,
        xenos::TextureFormat::k_DXT2_3,
        xenos::TextureFormat::k_DXT4_5,
@@ -458,3 +822,75 @@ index fc46bf8..c987776 100644
        xenos::TextureFormat::k_DXT5A,
        xenos::TextureFormat::k_CTX1,
        xenos::TextureFormat::k_DXT1_AS_16_16_16_16,
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 3cb2df6..eeafcef 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -99,3 +99,12 @@ if(REXGLUE_USE_VULKAN)
+     )
+     target_compile_definitions(rexruntime PUBLIC REX_HAS_VULKAN=1)
+ endif()
++
++# When FidelityFX is enabled it must be PUBLIC: presenter.h changes the layout of
++# Presenter/GuestOutputPaintConfig under REX_HAS_FIDELITYFX_SDK, so every consumer
++# of rex::runtime (the game) must compile with the same define as the SDK binary,
++# or the class layouts disagree (ABI mismatch). It also drives the host overlay's
++# FSR/CAS controls. Mirrors rexui's condition (source dir + headers present).
++if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
++    target_compile_definitions(rexruntime PUBLIC REX_HAS_FIDELITYFX_SDK=1)
++endif()
+diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
+index 9eeb902..f5343f3 100644
+--- a/src/ui/vulkan/vulkan_provider.cpp
++++ b/src/ui/vulkan/vulkan_provider.cpp
+@@ -88,9 +88,7 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+     bool prefer_fragment_stores = REXCVAR_GET(vulkan_prefer_fragment_stores_and_atomics);
+     bool prefer_vertex_stores = REXCVAR_GET(vulkan_prefer_vertex_pipeline_stores_and_atomics);
+     bool prefer_fill_mode_non_solid = REXCVAR_GET(vulkan_prefer_fill_mode_non_solid);
+-    if (with_gpu_emulation && physical_devices.size() > 1 &&
+-        (prefer_geometry_shader || prefer_fragment_stores || prefer_vertex_stores ||
+-         prefer_fill_mode_non_solid)) {
++    if (with_gpu_emulation && physical_devices.size() > 1) {
+       struct PhysicalDeviceScore {
+         VkPhysicalDevice physical_device;
+         uint32_t score;
+@@ -100,7 +98,27 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+       for (const VkPhysicalDevice physical_device : physical_devices) {
+         VkPhysicalDeviceFeatures supported_features = {};
+         ifn.vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
++        VkPhysicalDeviceProperties device_properties = {};
++        ifn.vkGetPhysicalDeviceProperties(physical_device, &device_properties);
+         uint32_t score = 0;
++        // Prefer a discrete GPU over integrated/virtual/CPU. This dominates the
++        // feature bonuses below, so a usable dGPU always wins over an iGPU when
++        // both are present (common on hybrid-graphics laptops, where the iGPU
++        // frequently enumerates first and would otherwise be chosen). The
++        // 'vulkan_device' cvar still overrides this entirely.
++        switch (device_properties.deviceType) {
++          case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
++            score += 1000;
++            break;
++          case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
++            score += 100;
++            break;
++          case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
++            score += 10;
++            break;
++          default:  // CPU / other: lowest priority.
++            break;
++        }
+         if (prefer_geometry_shader && supported_features.geometryShader) {
+           ++score;
+         }
+diff --git a/thirdparty/libmspack b/thirdparty/libmspack
+--- a/thirdparty/libmspack
++++ b/thirdparty/libmspack
+@@ -1 +1 @@
+-Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837
++Subproject commit 305907723a4e7ab2018e58040059ffb5e77db837-dirty
+diff --git a/thirdparty/o1heap b/thirdparty/o1heap
+--- a/thirdparty/o1heap
++++ b/thirdparty/o1heap
+@@ -1 +1 @@
+-Subproject commit 388a73fd9007300e5130c5fe352d9ce3288b6dde
++Subproject commit 388a73fd9007300e5130c5fe352d9ce3288b6dde-dirty

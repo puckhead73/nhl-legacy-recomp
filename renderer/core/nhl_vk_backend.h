@@ -102,6 +102,19 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   uint64_t frames_total_ = 0;
   std::chrono::steady_clock::time_point window_start_{};
   bool started_ = false;
+
+  // F9 hotkey streaming capture (NHL_HOTKEY_CAPTURE=1): press F9 in-scene to
+  // start, F9 again to stop -> gpu_trace/scene_NN/<title>_stream.xtr. Mirrors the
+  // D3D12 beta path's PollHotkeyCapture so a representative *gameplay* PM4 stream
+  // can be captured on the shipping Vulkan-fsi backend (the only path that runs
+  // gameplay) and replayed deterministically via NHL_REPLAY_XTR/NHL_REPLAY_BENCH.
+  // The .xtr is backend-agnostic (guest PM4), so it replays on any backend.
+  void PollHotkeyCapture();
+  bool hotkey_checked_ = false;   // env resolved once
+  bool hotkey_enabled_ = false;   // NHL_HOTKEY_CAPTURE set
+  bool hotkey_prev_down_ = false;  // F9 edge detect
+  bool hotkey_capturing_ = false;  // a stream is currently open
+  uint32_t hotkey_capture_index_ = 0;  // scene_NN counter (skips existing dirs)
 };
 
 class NhlVkGraphicsSystem : public rex::graphics::vulkan::VulkanGraphicsSystem {

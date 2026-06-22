@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rex/ui/imgui_dialog.h>
@@ -45,6 +46,33 @@ struct PadState {
   uint16_t buttons = 0;
   float lx = 0.0f;  // left stick X, normalized -1..1 (+ = right)
   float ly = 0.0f;  // left stick Y, normalized -1..1 (+ = up)
+};
+
+// One node of the Advanced tunable browser's category tree. Built from each
+// entry's '/'-separated group path (e.g. "AI/Injuries/Fighting"); `leaves` holds
+// the entry indices whose category terminates exactly at this node.
+struct TunTreeNode {
+  std::string seg;                    // this segment's display label
+  std::vector<int> leaves;            // entry indices at this exact path
+  std::vector<TunTreeNode> children;  // sub-categories (sorted by seg)
+};
+
+// Display metadata for one tunable, loaded from tunables_schema.tsv (the refined
+// schema). Drives the friendly schema panels; bound to the live store by name.
+struct SchemaEntry {
+  std::string name, label, section, unit, help;
+  char type = 'f';     // 'f' float | 'i' int | 'b' bool
+  char widget = 't';   // 'c' checkbox | 's' slider | 't' stepper
+  float vmin = 0.0f, vmax = 0.0f, vstep = 0.0f;
+  bool has_min = false, has_max = false, has_step = false;
+  int store_idx = -1;  // resolved live-store index (or -1 if not present)
+};
+
+// A friendly panel (e.g. "Goalie", "Injuries") = the schema entries grouped by
+// their top-level panel name.
+struct SchemaPanel {
+  std::string name;
+  std::vector<int> entries;  // indices into schema_
 };
 
 class NhlEnhancementsDialog : public rex::ui::ImGuiDialog {
@@ -84,6 +112,23 @@ class NhlEnhancementsDialog : public rex::ui::ImGuiDialog {
   // Recompute filtered_ from the current search text + group selection.
   void RefreshTunableFilter();
 
+  // Schema-driven friendly panels: load tunables_schema.tsv (refined label / type
+  // / widget / range / unit / help per gXxx) and auto-render every panel, each
+  // control bound to the live store by name.
+  void EnsureSchemaLoaded();
+  void DrawSchemaPanels();
+  void DrawSchemaRow(const SchemaEntry& e);
+
+  // Advanced raw browser: name filter + nested category tree over all tunables.
+  void DrawTunableAdvanced();
+  void RebuildTunableTree();          // rebuild tun_tree_root_ from tun_filtered_
+  void RenderTunableTreeNode(const TunTreeNode& node);
+  void RenderTunableRow(int idx);     // one value-editor row for entry `idx`
+
+  // Lazily build the name -> entry-index map once the store is kReady.
+  void EnsureTunableIndex();
+  int FindTunable(const char* name) const;  // -1 if absent
+
   std::function<PadState()> poll_pad_;
   std::function<PerfSnapshot()> perf_;
   std::function<void()> on_exit_;
@@ -101,13 +146,23 @@ class NhlEnhancementsDialog : public rex::ui::ImGuiDialog {
   bool dev_stick_scan_fired_ = false;  // latches the one-shot scan trigger
 
   // Tunable browser state.
-  char tun_filter_[96] = {0};   // case-insensitive name substring
-  int tun_group_ = 0;           // 0 = All, else group index + 1
+  char tun_filter_[96] = {0};   // case-insensitive name/label substring
   bool tun_hex_ = false;        // edit every row as raw hex
   bool tun_only_overridden_ = false;
-  bool tun_dirty_filter_ = true;        // filtered_ needs a rebuild
+  bool tun_dirty_filter_ = true;        // filtered_ + tree need a rebuild
   std::string tun_last_filter_;         // detects filter-text changes
   std::vector<int> tun_filtered_;       // entry indices passing the filter
+  TunTreeNode tun_tree_root_;           // nested category tree over tun_filtered_
+
+  // Curated-panel support: name -> entry index, built once at kReady.
+  std::unordered_map<std::string, int> tun_by_name_;
+  bool tun_index_built_ = false;
+
+  // Schema-driven view (loaded from tunables_schema.tsv next to the exe).
+  std::vector<SchemaEntry> schema_;
+  std::vector<SchemaPanel> panels_;
+  int schema_state_ = 0;        // 0 = unloaded, 1 = loaded, 2 = file missing
+  char schema_filter_[96] = {0};
 };
 
 }  // namespace nhl::ui

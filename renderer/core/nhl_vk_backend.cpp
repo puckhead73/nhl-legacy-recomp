@@ -1,13 +1,20 @@
 #include "renderer/core/nhl_vk_backend.h"
 
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <utility>
 
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
+
+// Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
+// <windows.h> out of this TU, mirroring the D3D12 path).
+extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
 
 namespace nhl::graphics {
 
@@ -165,12 +172,70 @@ bool NhlVkCommandProcessor::IssueDraw(
       primitive_type, index_count, index_buffer_info, major_mode_explicit);
 }
 
+void NhlVkCommandProcessor::PollHotkeyCapture() {
+  if (!hotkey_checked_) {
+    hotkey_checked_ = true;
+    hotkey_enabled_ = std::getenv("NHL_HOTKEY_CAPTURE") != nullptr;
+    if (hotkey_enabled_) {
+      // Continue numbering after any existing gpu_trace/scene_NN so we never
+      // overwrite the canonical captures (scene_00..scene_03).
+      std::error_code ec;
+      const std::filesystem::path root = "gpu_trace";
+      if (std::filesystem::exists(root, ec)) {
+        for (const auto& e : std::filesystem::directory_iterator(root, ec)) {
+          if (!e.is_directory()) continue;
+          const std::string n = e.path().filename().string();
+          if (n.rfind("scene_", 0) != 0) continue;
+          char* end = nullptr;
+          const unsigned long idx = std::strtoul(n.c_str() + 6, &end, 10);
+          if (end && *end == '\0' && idx + 1 > hotkey_capture_index_) {
+            hotkey_capture_index_ = uint32_t(idx + 1);
+          }
+        }
+      }
+      REXLOG_INFO(
+          "[nhl-cap] F9 hotkey streaming capture enabled (press F9 in a GAMEPLAY "
+          "scene to start, F9 again to stop -> gpu_trace/scene_{:02}/); replay with "
+          "NHL_REPLAY_XTR / NHL_REPLAY_BENCH.",
+          hotkey_capture_index_);
+    }
+  }
+  if (!hotkey_enabled_) return;
+
+  constexpr int kVkF9 = 0x78;
+  const bool down = (GetAsyncKeyState(kVkF9) & 0x8000) != 0;
+  const bool rising = down && !hotkey_prev_down_;
+  hotkey_prev_down_ = down;
+  if (!rising) return;
+
+  if (!hotkey_capturing_) {
+    char dir[32];
+    std::snprintf(dir, sizeof(dir), "scene_%02u", hotkey_capture_index_);
+    const std::filesystem::path path = std::filesystem::path("gpu_trace") / dir;
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    BeginTracing(path);  // streaming starts on the next primary-buffer execute
+    hotkey_capturing_ = true;
+    REXLOG_INFO("[nhl-cap] F9 capture BEGIN -> {}/ (frame {})", path.string(),
+                frames_total_);
+  } else {
+    EndTracing();
+    hotkey_capturing_ = false;
+    REXLOG_INFO("[nhl-cap] F9 capture END (frame {}) -> gpu_trace/scene_{:02}/",
+                frames_total_, hotkey_capture_index_);
+    ++hotkey_capture_index_;
+  }
+}
+
 void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   // Present the frame via the SDK's own Vulkan presenter, then sample timing.
   rex::graphics::vulkan::VulkanCommandProcessor::IssueSwap(
       frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+
+  // F9 streaming capture toggle (gameplay-trace benchmark source).
+  PollHotkeyCapture();
 
   const auto now = std::chrono::steady_clock::now();
   last_frame_draws_ = draws_this_frame_;

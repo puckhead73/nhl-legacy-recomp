@@ -53,6 +53,7 @@
 #include "tunable_registry_dump.h"
 #include "tunable_runtime.h"
 #include "union_device.h"
+#include "anim_decode.h"
 
 // Runtime cvar (defined in rexruntime): when true, guest page 0 is
 // no-access. NHL Legacy's file-registration code (sub_82705510) walks an
@@ -111,6 +112,11 @@ REXCVAR_DECLARE(double, present_grade_brightness);
 REXCVAR_DECLARE(double, present_grade_temperature);
 REXCVAR_DECLARE(double, present_grade_tint);
 REXCVAR_DECLARE(double, present_grade_tonemap);
+
+// NHL: bilinear filtering for guest depth/shadow maps (SDK texture cache).
+REXCVAR_DECLARE(bool, shadow_filter_linear);
+// NHL: extra depth-domain blur passes for guest depth/shadow maps (0..4).
+REXCVAR_DECLARE(int32_t, shadow_softness);
 
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
@@ -190,7 +196,22 @@ class NhllegacyApp : public rex::ReXApp {
       if (!std::getenv("NHL_VK_NO_READBACK")) {
         REXCVAR_SET(readback_resolve, std::string("full"));
         REXCVAR_SET(vulkan_readback_resolve, true);
-        REXLOG_INFO("[nhl-vk-spike] resolve readback enabled (readback_resolve=full)");
+        // Size-gated readback (the SDK honors NHL_VK_READBACK_MAX_LEN in the Vulkan
+        // resolve path): kFull does a full GPU drain per resolve so the CPU memcpy
+        // reads current pixels, but that drain is only NEEDED for the small
+        // runtime-composited equipment textures the guest CPU re-reads (helmet ~960
+        // KB, goalie ~2.3 MB resolves). The large framebuffer resolves (1280x720x4
+        // = ~3.6 MB, ~7/frame) are GPU-consumed for present and never CPU-read, yet
+        // were draining the GPU every frame — the dominant CP-thread stall (~1.33x
+        // bench, validated live: helmets+goalies correct at 3 MB; both regress below
+        // ~1 MB). Default the threshold to 3 MB (keeps every composite, skips only
+        // the framebuffers). Override via the env (set to 0 to disable the gate).
+        if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
+          _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
+        }
+        REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
+                    "size gate {} B)",
+                    std::getenv("NHL_VK_READBACK_MAX_LEN"));
       }
       // Enable Guide/PS button pass-through so the host can read it
       // (XInputGetStateEx ordinal 100 / SDL mapping) to toggle the enhancements
@@ -313,6 +334,34 @@ class NhllegacyApp : public rex::ReXApp {
         REXCVAR_SET(present_grade_tint, nhl::LoadGradeTint(0.0));
         REXCVAR_SET(present_grade_tonemap, nhl::LoadGradeTonemap(0.0));
         REXLOG_INFO("[nhl-vk-grade] color grade enabled from persisted settings");
+      }
+
+      // Soften shadows: restore bilinear filtering on the guest's depth/shadow
+      // maps to reduce the hard, pixelated "striped" look up close. Hot-reloadable
+      // (read per-draw in the texture cache), so applying the persisted choice here
+      // just makes it live from the first frame. NHL_VK_SHADOW_FILTER env overrides.
+      {
+        bool soften = nhl::LoadShadowFilterLinear(REXCVAR_GET(shadow_filter_linear));
+        if (const char* sf = std::getenv("NHL_VK_SHADOW_FILTER"); sf && *sf) {
+          soften = (sf[0] == '1' || sf[0] == 't' || sf[0] == 'T');
+        }
+        REXCVAR_SET(shadow_filter_linear, soften);
+        if (soften) {
+          REXLOG_INFO("[nhl-vk-shadow] bilinear shadow filtering enabled");
+        }
+
+        // Extra depth-domain blur passes (0 = off). Hot-reloadable; NHL_VK_SHADOW_BLUR
+        // env overrides the persisted choice.
+        int softness = nhl::LoadShadowSoftness(REXCVAR_GET(shadow_softness));
+        if (const char* sb = std::getenv("NHL_VK_SHADOW_BLUR"); sb && *sb) {
+          softness = int(std::strtol(sb, nullptr, 10));
+        }
+        if (softness < 0) softness = 0;
+        if (softness > 4) softness = 4;
+        REXCVAR_SET(shadow_softness, softness);
+        if (softness > 0) {
+          REXLOG_INFO("[nhl-vk-shadow] shadow softness blur passes = {}", softness);
+        }
       }
     }
 #endif
@@ -629,6 +678,55 @@ class NhllegacyApp : public rex::ReXApp {
       }
       rex::ReXApp::LaunchModule();
       return;
+    }
+
+    // NHL_ANIM_DECODE: headless animation-decode harness (docs cba-format.md §6).
+    // Milestone 0 validates the host->guest call mechanism by invoking the LEAF
+    // decode fns (sub_82CE3750 / sub_82CA7330) on a synthetic asset and asserting
+    // their outputs — no allocator, no booted guest needed — then fast-exits.
+    // Value "1" = log-only; any other value = report-file path. Later milestones
+    // (prime/seek/sub_82CA7BD0) will switch to the boot-then-decode pattern below.
+    if (const char* ad = std::getenv("NHL_ANIM_DECODE"); ad && *ad) {
+      // Milestone 1 recon: NHL_ANIM_DECODE=scan boots the guest, waits for it to
+      // load anim.cba, then scans committed guest memory for resident GD records
+      // and writes anim_scan_report.txt. Unlike milestone 0 (fast-exit), this must
+      // let the guest run — same boot-then-scan pattern as NHL_DUMP_*_RUNTIME.
+      if (std::strncmp(ad, "scan", 4) == 0) {
+        const uint8_t* vbase =
+            runtime()->memory() ? runtime()->memory()->virtual_membase() : nullptr;
+        // anim.cba loads on-ice, not at the menu — so auto-fire the scan when the
+        // bundle becomes resident (clip-name string appears in heap) rather than
+        // racing a fixed delay against the user navigating into a game. Cap the
+        // wait (default 5 min; NHL_DUMP_DELAY_MS overrides) and scan anyway on
+        // timeout so a report always lands. Get into an on-ice game while it waits.
+        unsigned timeout_ms = 300000;
+        if (const char* d = std::getenv("NHL_DUMP_DELAY_MS"); d && *d) {
+          timeout_ms = static_cast<unsigned>(strtoul(d, nullptr, 0));
+        }
+        const std::string out =
+            (rex::filesystem::GetExecutableFolder() / "anim_scan_report.txt").string();
+        if (vbase) {
+          std::thread([vbase, out, timeout_ms]() {
+            std::fprintf(stderr,
+                         "[anim-scan] waiting up to %u ms for anim.cba to load "
+                         "(get into an on-ice game)...\n",
+                         timeout_ms);
+            const bool loaded = nhllegacy::WaitForAnimData(vbase, timeout_ms);
+            std::fprintf(stderr, "[anim-scan] %s — scanning now\n",
+                         loaded ? "anim data detected" : "TIMEOUT (scanning anyway)");
+            nhllegacy::RunAnimScan(vbase, out.c_str());
+            rex::ShutdownLogging();
+            ::TerminateProcess(::GetCurrentProcess(), 0u);
+          }).detach();
+        } else {
+          std::fprintf(stderr, "[anim-scan] no membase; cannot scan\n");
+        }
+        rex::ReXApp::LaunchModule();  // boot the guest so anim.cba loads
+        return;
+      }
+      const bool ok = nhllegacy::RunAnimDecode(runtime()->memory(), ad);
+      rex::ShutdownLogging();
+      ::TerminateProcess(::GetCurrentProcess(), ok ? 0u : 1u);
     }
 
     // NHL_DUMP_IMAGE: write the decompressed guest image (.rodata/.data/.text,

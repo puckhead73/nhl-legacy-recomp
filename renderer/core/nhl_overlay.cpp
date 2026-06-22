@@ -2,10 +2,17 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 
@@ -19,6 +26,13 @@
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_x);
 REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, vsync);
+
+// Bilinear filtering for guest depth/shadow maps (SDK texture cache). Read
+// per-draw, so toggling it takes effect immediately — no restart.
+REXCVAR_DECLARE(bool, shadow_filter_linear);
+// Extra depth-domain blur passes on depth/shadow maps (0..4). Read per texture
+// upload, so it takes effect within a frame or two — no restart.
+REXCVAR_DECLARE(int32_t, shadow_softness);
 
 // NHL Legacy color-grade post-process cvars (defined in the SDK Vulkan command
 // processor; applied in place on the guest-output image right after the swap
@@ -231,6 +245,29 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
       }
       ImGui::SameLine();
       ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "[restart]");
+
+      // Soften shadows: restore bilinear filtering on the guest's depth/shadow
+      // maps. Read per-draw in the texture cache, so this is live (no restart).
+      bool soften_shadows = REXCVAR_GET(shadow_filter_linear);
+      if (ImGui::Checkbox("Soften shadows (bilinear)", &soften_shadows)) {
+        REXCVAR_SET(shadow_filter_linear, soften_shadows);
+        nhl::SaveShadowFilterLinear(soften_shadows);
+      }
+      ImGui::TextDisabled("smooths hard, pixelated shadow edges (no effect if the "
+                          "GPU can't linear-filter depth)");
+
+      // Extra depth-domain blur on shadow maps, beyond bilinear. Applied on upload,
+      // so it takes effect within a frame or two. 0 = off.
+      int softness = REXCVAR_GET(shadow_softness);
+      if (softness < 0) softness = 0;
+      if (softness > 4) softness = 4;
+      if (ImGui::SliderInt("Shadow softness", &softness, 0, 4,
+                           softness == 0 ? "off" : "%d")) {
+        REXCVAR_SET(shadow_softness, softness);
+        nhl::SaveShadowSoftness(softness);
+      }
+      ImGui::TextDisabled("extra blur passes for a softer penumbra; higher can mildly "
+                          "halo at contact points");
     }
 
     // --- Upscaling & Sharpening (AMD FidelityFX) ---
@@ -384,6 +421,21 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
 }
 
 namespace {
+// A dimmed "(?)" that shows `text` on hover. Used by the curated panels.
+void HelpMarker(const char* text) {
+  ImGui::SameLine();
+  ImGui::TextDisabled("(?)");
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text);
+}
+
+// Sort a tunable-tree node's children by segment (and recurse) so the browser
+// renders categories alphabetically.
+void SortTunNode(TunTreeNode& n) {
+  std::sort(n.children.begin(), n.children.end(),
+            [](const TunTreeNode& a, const TunTreeNode& b) { return a.seg < b.seg; });
+  for (TunTreeNode& c : n.children) SortTunNode(c);
+}
+
 // Case-insensitive substring test (needle assumed already lowercased).
 bool ContainsCi(const char* hay, const char* needle_lower) {
   if (!needle_lower[0]) return true;
@@ -407,16 +459,31 @@ void NhlEnhancementsDialog::RefreshTunableFilter() {
   char needle[sizeof(tun_filter_)];
   for (size_t i = 0; i < sizeof(needle); ++i)
     needle[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(tun_filter_[i])));
-  const char* group_sel =
-      tun_group_ > 0 ? tunables_->Group(static_cast<size_t>(tun_group_ - 1)) : nullptr;
   const size_t count = tunables_->Count();
   for (size_t i = 0; i < count; ++i) {
     const TunableEntry e = tunables_->Info(i);
-    if (group_sel && std::strcmp(e.group, group_sel) != 0) continue;
     if (tun_only_overridden_ && !tunables_->IsOverridden(i)) continue;
-    if (!ContainsCi(e.name, needle)) continue;
+    // Match the gXxx name OR the human label (so a search for "injury" finds
+    // both gInjury* and "Injury Occurrence Level").
+    if (!ContainsCi(e.name, needle) && !(e.label[0] && ContainsCi(e.label, needle)))
+      continue;
     tun_filtered_.push_back(static_cast<int>(i));
   }
+  RebuildTunableTree();
+}
+
+void NhlEnhancementsDialog::EnsureTunableIndex() {
+  if (tun_index_built_ || !tunables_) return;
+  const size_t count = tunables_->Count();
+  tun_by_name_.reserve(count * 2);
+  for (size_t i = 0; i < count; ++i)
+    tun_by_name_.emplace(tunables_->Info(i).name, static_cast<int>(i));
+  tun_index_built_ = true;
+}
+
+int NhlEnhancementsDialog::FindTunable(const char* name) const {
+  auto it = tun_by_name_.find(name);
+  return it == tun_by_name_.end() ? -1 : it->second;
 }
 
 void NhlEnhancementsDialog::DrawTunables() {
@@ -431,10 +498,9 @@ void NhlEnhancementsDialog::DrawTunables() {
   }
   if (st == State::kIdle) {
     ImGui::TextWrapped(
-        "Experimental live editor for the engine's %s gXxx constants (physics, "
-        "AI, animation, rules) \xE2\x80\x94 not guaranteed to work, and some "
-        "changes may need a restart. Building the index scans guest memory once.",
-        "12,000+");
+        "Live editor for the engine's 12,000+ gXxx constants (physics, AI, "
+        "animation, rules). Friendly panels below; full list under Advanced. "
+        "Building the index scans guest memory once.");
     if (ImGui::Button("Build tunable index")) tunables_->RequestBuild();
     return;
   }
@@ -443,133 +509,338 @@ void NhlEnhancementsDialog::DrawTunables() {
     return;
   }
 
-  // Ready. Warn about the experimental nature + live-write caveats.
-  ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f),
-                     "\xE2\x9A\xA0 EXPERIMENTAL \xE2\x80\x94 not guaranteed to "
-                     "work.");
-  ImGui::TextWrapped(
-      "Some gXxx are runtime state the engine overwrites each frame, so an edit "
-      "may not stick; others are only read at load, so a change may require a "
-      "restart to take effect. Saved values re-apply on next launch.");
+  // Ready.
+  EnsureTunableIndex();
+  EnsureSchemaLoaded();
   ImGui::TextDisabled("%zu tunables, %zu overridden", tunables_->Count(),
                       tunables_->OverrideCount());
-
-  // Filters. Any change marks the filtered list dirty.
-  if (ImGui::InputTextWithHint("##tun_filter", "filter by name (gXxx)",
-                               tun_filter_, sizeof(tun_filter_)))
-    tun_dirty_filter_ = true;
-
-  // Group combo: "All" + every group.
-  const char* group_preview =
-      tun_group_ > 0 ? tunables_->Group(static_cast<size_t>(tun_group_ - 1)) : "All groups";
-  if (ImGui::BeginCombo("Group", group_preview)) {
-    if (ImGui::Selectable("All groups", tun_group_ == 0)) {
-      tun_group_ = 0;
-      tun_dirty_filter_ = true;
-    }
-    const size_t groups = tunables_->GroupCount();
-    for (size_t g = 0; g < groups; ++g) {
-      const bool sel = tun_group_ == static_cast<int>(g + 1);
-      if (ImGui::Selectable(tunables_->Group(g), sel)) {
-        tun_group_ = static_cast<int>(g + 1);
-        tun_dirty_filter_ = true;
-      }
-    }
-    ImGui::EndCombo();
-  }
-
-  ImGui::Checkbox("Raw hex", &tun_hex_);
-  ImGui::SameLine();
-  if (ImGui::Checkbox("Only overridden", &tun_only_overridden_))
-    tun_dirty_filter_ = true;
-  ImGui::SameLine();
   if (ImGui::Button("Save")) tunables_->Save();
   ImGui::SameLine();
   if (ImGui::Button("Revert all")) {
     tunables_->ClearAll();
     tun_dirty_filter_ = true;
   }
+  ImGui::SameLine();
+  ImGui::TextDisabled("(saved values re-apply on next launch)");
 
-  // Rebuild the filtered index when text/group/flags change.
+  // Schema-driven friendly panels (primary view).
+  if (schema_state_ == 1) {
+    DrawSchemaPanels();
+  } else {
+    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+                       "tunables_schema.tsv not found next to the exe \xE2\x80\x94 "
+                       "raw list only.");
+  }
+
+  // The full raw browser (every gXxx by category) stays as a fallback.
+  if (ImGui::CollapsingHeader("Advanced \xE2\x80\x94 raw list")) {
+    DrawTunableAdvanced();
+  }
+}
+
+// --- Schema-driven panels -------------------------------------------------
+
+void NhlEnhancementsDialog::EnsureSchemaLoaded() {
+  if (schema_state_ != 0) return;
+  const std::filesystem::path path =
+      rex::filesystem::GetExecutableFolder() / "tunables_schema.tsv";
+  std::ifstream f(path);
+  if (!f) {
+    schema_state_ = 2;  // missing
+    return;
+  }
+  auto to_f = [](const std::string& s, bool& has) -> float {
+    if (s.empty()) { has = false; return 0.0f; }
+    has = true;
+    return std::strtof(s.c_str(), nullptr);
+  };
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    // Split into 11 tab-separated fields.
+    std::string col[11];
+    size_t start = 0;
+    int n = 0;
+    for (; n < 11; ++n) {
+      const size_t tab = line.find('\t', start);
+      if (tab == std::string::npos || n == 10) {
+        col[n] = line.substr(start);
+        ++n;
+        break;
+      }
+      col[n] = line.substr(start, tab - start);
+      start = tab + 1;
+    }
+    if (n < 6 || col[0].empty()) continue;  // need at least name..widget
+    SchemaEntry e;
+    e.name = col[0];
+    // col[1] = panel, col[2] = section
+    e.section = col[2];
+    e.label = col[3].empty() ? col[0] : col[3];
+    e.type = col[4].empty() ? 'f' : col[4][0];
+    e.widget = col[5].empty() ? 't' : col[5][0];
+    e.vmin = to_f(col[6], e.has_min);
+    e.vmax = to_f(col[7], e.has_max);
+    e.vstep = to_f(col[8], e.has_step);
+    e.unit = col[9];
+    e.help = col[10];
+    e.store_idx = FindTunable(e.name.c_str());
+
+    const int sidx = static_cast<int>(schema_.size());
+    schema_.push_back(std::move(e));
+    // Group into panels (first-seen order).
+    const std::string& panel = col[1].empty() ? std::string("Misc") : col[1];
+    SchemaPanel* p = nullptr;
+    for (SchemaPanel& cand : panels_)
+      if (cand.name == panel) { p = &cand; break; }
+    if (!p) {
+      panels_.push_back(SchemaPanel{panel, {}});
+      p = &panels_.back();
+    }
+    p->entries.push_back(sidx);
+  }
+  // Sort panels alphabetically, "Misc" last; entries within a panel by section.
+  std::sort(panels_.begin(), panels_.end(),
+            [](const SchemaPanel& a, const SchemaPanel& b) {
+              if ((a.name == "Misc") != (b.name == "Misc"))
+                return b.name == "Misc";
+              return a.name < b.name;
+            });
+  for (SchemaPanel& p : panels_)
+    std::sort(p.entries.begin(), p.entries.end(), [this](int a, int b) {
+      if (schema_[a].section != schema_[b].section)
+        return schema_[a].section < schema_[b].section;
+      return schema_[a].label < schema_[b].label;
+    });
+  schema_state_ = 1;
+}
+
+void NhlEnhancementsDialog::DrawSchemaRow(const SchemaEntry& e) {
+  if (e.store_idx < 0) {
+    ImGui::TextDisabled("%s \xE2\x80\x94 (n/a)", e.label.c_str());
+    return;
+  }
+  const size_t idx = static_cast<size_t>(e.store_idx);
+  const uint32_t bits = tunables_->Get(idx);
+  const bool over = tunables_->IsOverridden(idx);
+
+  ImGui::PushID(e.name.c_str());
+  ImGui::SetNextItemWidth(180.0f);
+  bool changed = false;
+  uint32_t new_bits = bits;
+  if (e.widget == 'c' || e.type == 'b') {
+    bool b = bits != 0;
+    if (ImGui::Checkbox("##v", &b)) { new_bits = b ? 1u : 0u; changed = true; }
+  } else if (e.type == 'i') {
+    int v = static_cast<int>(bits);
+    const bool sl = e.widget == 's' && e.has_min && e.has_max;
+    if (sl ? ImGui::SliderInt("##v", &v, static_cast<int>(e.vmin),
+                              static_cast<int>(e.vmax))
+           : ImGui::InputInt("##v", &v, 1, 10)) {
+      if (sl) v = v < e.vmin ? static_cast<int>(e.vmin)
+                             : (v > e.vmax ? static_cast<int>(e.vmax) : v);
+      new_bits = static_cast<uint32_t>(v);
+      changed = true;
+    }
+  } else {  // float
+    float v;
+    std::memcpy(&v, &bits, 4);
+    const bool sl = e.widget == 's' && e.has_min && e.has_max;
+    if (sl ? ImGui::SliderFloat("##v", &v, e.vmin, e.vmax, "%.3f")
+           : ImGui::InputFloat("##v", &v, 0.0f, 0.0f, "%.4f",
+                               ImGuiInputTextFlags_EnterReturnsTrue)) {
+      std::memcpy(&new_bits, &v, 4);
+      changed = true;
+    }
+  }
+  if (changed) tunables_->Set(idx, new_bits);
+
+  ImGui::SameLine();
+  if (over) {
+    if (ImGui::SmallButton("\xE2\x86\xBA")) tunables_->Reset(idx);
+    ImGui::SameLine();
+  }
+  // Label (+ unit), orange when overridden.
+  const char* lbl = e.label.c_str();
+  if (over)
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.25f, 1.0f), "%s", lbl);
+  else
+    ImGui::TextUnformatted(lbl);
+  if (!e.unit.empty()) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", e.unit.c_str());
+  }
+  if (!e.help.empty()) HelpMarker(e.help.c_str());
+  ImGui::PopID();
+}
+
+void NhlEnhancementsDialog::DrawSchemaPanels() {
+  ImGui::SetNextItemWidth(-1.0f);
+  ImGui::InputTextWithHint("##schema_filter", "search all settings (name or label)",
+                           schema_filter_, sizeof(schema_filter_));
+  char needle[sizeof(schema_filter_)];
+  for (size_t i = 0; i < sizeof(needle); ++i)
+    needle[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(schema_filter_[i])));
+  const bool filtering = needle[0] != '\0';
+
+  for (const SchemaPanel& p : panels_) {
+    // Gather entries that pass the filter.
+    int matches = 0;
+    for (int si : p.entries) {
+      const SchemaEntry& e = schema_[si];
+      if (!filtering || ContainsCi(e.label.c_str(), needle) ||
+          ContainsCi(e.name.c_str(), needle))
+        ++matches;
+    }
+    if (matches == 0) continue;
+
+    if (filtering) ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+    char header[128];
+    std::snprintf(header, sizeof(header), "%s (%d)##panel_%s", p.name.c_str(),
+                  matches, p.name.c_str());
+    if (!ImGui::CollapsingHeader(header)) continue;
+
+    ImGui::Indent();
+    std::string cur_section = "\x01";  // sentinel so the first section emits
+    for (int si : p.entries) {
+      const SchemaEntry& e = schema_[si];
+      if (filtering && !ContainsCi(e.label.c_str(), needle) &&
+          !ContainsCi(e.name.c_str(), needle))
+        continue;
+      if (e.section != cur_section) {
+        cur_section = e.section;
+        if (!cur_section.empty()) ImGui::SeparatorText(cur_section.c_str());
+      }
+      DrawSchemaRow(e);
+    }
+    ImGui::Unindent();
+  }
+}
+
+// --- Advanced raw browser (nested category tree) --------------------------
+
+void NhlEnhancementsDialog::RebuildTunableTree() {
+  tun_tree_root_ = TunTreeNode{};
+  if (!tunables_) return;
+  for (int idx : tun_filtered_) {
+    const TunableEntry e = tunables_->Info(static_cast<size_t>(idx));
+    TunTreeNode* node = &tun_tree_root_;
+    const char* s = e.group;
+    while (*s) {
+      const char* slash = std::strchr(s, '/');
+      const std::string seg = slash ? std::string(s, slash - s) : std::string(s);
+      TunTreeNode* child = nullptr;
+      for (TunTreeNode& c : node->children)
+        if (c.seg == seg) { child = &c; break; }
+      if (!child) {
+        node->children.push_back(TunTreeNode{seg, {}, {}});
+        child = &node->children.back();
+      }
+      node = child;
+      if (!slash) break;
+      s = slash + 1;
+    }
+    node->leaves.push_back(idx);
+  }
+  SortTunNode(tun_tree_root_);
+}
+
+void NhlEnhancementsDialog::RenderTunableTreeNode(const TunTreeNode& node) {
+  for (const TunTreeNode& c : node.children) {
+    if (ImGui::TreeNode(c.seg.c_str())) {
+      RenderTunableTreeNode(c);
+      ImGui::TreePop();
+    }
+  }
+  for (int idx : node.leaves) RenderTunableRow(idx);
+}
+
+void NhlEnhancementsDialog::RenderTunableRow(int idx) {
+  const TunableEntry e = tunables_->Info(static_cast<size_t>(idx));
+  const uint32_t bits = tunables_->Get(static_cast<size_t>(idx));
+  const bool over = tunables_->IsOverridden(static_cast<size_t>(idx));
+
+  ImGui::PushID(idx);
+  ImGui::SetNextItemWidth(150.0f);
+  bool changed = false;
+  uint32_t new_bits = bits;
+  if (tun_hex_) {
+    int hv = static_cast<int>(bits);
+    if (ImGui::InputInt("##v", &hv, 0, 0,
+                        ImGuiInputTextFlags_CharsHexadecimal |
+                            ImGuiInputTextFlags_EnterReturnsTrue)) {
+      new_bits = static_cast<uint32_t>(hv);
+      changed = true;
+    }
+  } else if (e.type == TunableType::kBool) {
+    bool b = bits != 0;
+    if (ImGui::Checkbox("##v", &b)) {
+      new_bits = b ? 1u : 0u;
+      changed = true;
+    }
+  } else if (e.type == TunableType::kInt) {
+    int iv = static_cast<int>(bits);
+    if (ImGui::InputInt("##v", &iv, 1, 10,
+                        ImGuiInputTextFlags_EnterReturnsTrue)) {
+      new_bits = static_cast<uint32_t>(iv);
+      changed = true;
+    }
+  } else {  // float (and unknown — edited as float)
+    float fv;
+    std::memcpy(&fv, &bits, 4);
+    if (ImGui::InputFloat("##v", &fv, 0.0f, 0.0f, "%.4f",
+                          ImGuiInputTextFlags_EnterReturnsTrue)) {
+      std::memcpy(&new_bits, &fv, 4);
+      changed = true;
+    }
+  }
+  if (changed) tunables_->Set(static_cast<size_t>(idx), new_bits);
+
+  ImGui::SameLine();
+  if (over) {
+    if (ImGui::SmallButton("\xE2\x86\xBA")) tunables_->Reset(static_cast<size_t>(idx));
+    ImGui::SameLine();
+  }
+  // Prefer the human label as the row text; fall back to the gXxx name.
+  const char* shown = e.label[0] ? e.label : e.name;
+  if (over)
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.25f, 1.0f), "%s", shown);
+  else
+    ImGui::TextUnformatted(shown);
+  if (ImGui::IsItemHovered()) {
+    const char* tn = e.type == TunableType::kBool   ? "bool"
+                     : e.type == TunableType::kInt   ? "int"
+                     : e.type == TunableType::kFloat ? "float"
+                                                     : "unknown";
+    float cf;
+    std::memcpy(&cf, &e.captured_bits, 4);
+    ImGui::SetTooltip("%s\ngroup: %s\ntype: %s%s\nstock: %.4f (0x%08X)", e.name,
+                      e.group, tn, e.scalar ? "" : " (non-scalar)", cf,
+                      e.captured_bits);
+  }
+  ImGui::PopID();
+}
+
+void NhlEnhancementsDialog::DrawTunableAdvanced() {
+  // Filters. Any change marks the filtered list + tree dirty.
+  if (ImGui::InputTextWithHint("##tun_filter", "filter by name or label",
+                               tun_filter_, sizeof(tun_filter_)))
+    tun_dirty_filter_ = true;
+  ImGui::Checkbox("Raw hex", &tun_hex_);
+  ImGui::SameLine();
+  if (ImGui::Checkbox("Only overridden", &tun_only_overridden_))
+    tun_dirty_filter_ = true;
+
+  // Rebuild the filtered index + tree when text/flags change.
   if (tun_dirty_filter_ || tun_last_filter_ != tun_filter_) {
-    RefreshTunableFilter();
+    RefreshTunableFilter();  // also rebuilds the tree
     tun_last_filter_ = tun_filter_;
     tun_dirty_filter_ = false;
   }
 
-  ImGui::Separator();
-  // Clipped flat list — only visible rows are drawn (12k entries otherwise stall).
-  if (ImGui::BeginChild("##tun_list", ImVec2(0, 320), true)) {
-    ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(tun_filtered_.size()));
-    while (clipper.Step()) {
-      for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-        const size_t idx = static_cast<size_t>(tun_filtered_[row]);
-        const TunableEntry e = tunables_->Info(idx);
-        const uint32_t bits = tunables_->Get(idx);
-        const bool over = tunables_->IsOverridden(idx);
-
-        ImGui::PushID(row);
-        ImGui::SetNextItemWidth(150.0f);
-        bool changed = false;
-        uint32_t new_bits = bits;
-        if (tun_hex_) {
-          int hv = static_cast<int>(bits);
-          if (ImGui::InputInt("##v", &hv, 0, 0,
-                              ImGuiInputTextFlags_CharsHexadecimal |
-                                  ImGuiInputTextFlags_EnterReturnsTrue)) {
-            new_bits = static_cast<uint32_t>(hv);
-            changed = true;
-          }
-        } else if (e.type == TunableType::kBool) {
-          bool b = bits != 0;
-          if (ImGui::Checkbox("##v", &b)) {
-            new_bits = b ? 1u : 0u;
-            changed = true;
-          }
-        } else if (e.type == TunableType::kInt) {
-          int iv = static_cast<int>(bits);
-          if (ImGui::InputInt("##v", &iv, 1, 10,
-                              ImGuiInputTextFlags_EnterReturnsTrue)) {
-            new_bits = static_cast<uint32_t>(iv);
-            changed = true;
-          }
-        } else {  // float (and unknown — edited as float)
-          float fv;
-          std::memcpy(&fv, &bits, 4);
-          if (ImGui::InputFloat("##v", &fv, 0.0f, 0.0f, "%.4f",
-                                ImGuiInputTextFlags_EnterReturnsTrue)) {
-            std::memcpy(&new_bits, &fv, 4);
-            changed = true;
-          }
-        }
-        if (changed) tunables_->Set(idx, new_bits);
-
-        ImGui::SameLine();
-        if (over) {
-          if (ImGui::SmallButton("\xE2\x86\xBA")) tunables_->Reset(idx);  // ↺
-          ImGui::SameLine();
-        }
-        // Name (orange when overridden), tooltip carries group/label/type.
-        if (over)
-          ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.25f, 1.0f), "%s", e.name);
-        else
-          ImGui::TextUnformatted(e.name);
-        if (ImGui::IsItemHovered()) {
-          const char* tn = e.type == TunableType::kBool   ? "bool"
-                           : e.type == TunableType::kInt   ? "int"
-                           : e.type == TunableType::kFloat ? "float"
-                                                           : "unknown";
-          float cf;
-          std::memcpy(&cf, &e.captured_bits, 4);
-          ImGui::SetTooltip("%s\ngroup: %s\ntype: %s%s\nstock: %.4f (0x%08X)",
-                            e.label[0] ? e.label : e.name, e.group, tn,
-                            e.scalar ? "" : " (non-scalar)", cf, e.captured_bits);
-        }
-        ImGui::PopID();
-      }
-    }
-    clipper.End();
+  ImGui::TextDisabled("%zu shown", tun_filtered_.size());
+  if (ImGui::BeginChild("##tun_tree", ImVec2(0, 360), true)) {
+    RenderTunableTreeNode(tun_tree_root_);
   }
   ImGui::EndChild();
 }

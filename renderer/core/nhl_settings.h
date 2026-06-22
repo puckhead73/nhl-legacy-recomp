@@ -94,6 +94,28 @@ inline void SaveSupersampling(int v) {
   SaveSetting("supersampling", std::to_string(v));
 }
 
+// Soften shadows: restore bilinear filtering on the guest's depth/shadow maps
+// (SDK `shadow_filter_linear` cvar). Hot-reloadable (read per-draw in the texture
+// cache), but persisted so the overlay choice survives a relaunch and is applied
+// at launch in OnPreSetup. Default off => shadow sampling unchanged.
+inline bool LoadShadowFilterLinear(bool fallback) {
+  return LoadBool("shadow_filter_linear", fallback);
+}
+inline void SaveShadowFilterLinear(bool v) {
+  SaveSetting("shadow_filter_linear", v ? "1" : "0");
+}
+
+// Shadow softness: extra depth-domain blur passes on guest depth/shadow maps
+// (SDK `shadow_softness` cvar), 0..4. 0 = off. Hot-reloadable; persisted.
+inline int LoadShadowSoftness(int fallback) {
+  return LoadInt("shadow_softness", fallback, 0, 4);
+}
+inline void SaveShadowSoftness(int v) {
+  if (v < 0) v = 0;
+  if (v > 4) v = 4;
+  SaveSetting("shadow_softness", std::to_string(v));
+}
+
 // Borderless-fullscreen vs windowed (the SDK's "fullscreen" cvar is borderless).
 inline bool LoadFullscreen(bool fallback) { return LoadBool("fullscreen", fallback); }
 inline void SaveFullscreen(bool v) { SaveSetting("fullscreen", v ? "1" : "0"); }

@@ -32,6 +32,11 @@ set(NHLLEGACY_SOURCES
     # (NHL_ANIM_CAPTURE); pass-through when unset. Overrides distinct symbols from
     # the D3D9 hooks above, so it composes with them. See docs cba-format.md §6.
     gpu/hooks/anim_capture.cpp
+    # Headless animation-decode harness: invokes the real recompiled DctAnimationAsset
+    # decoder offline (the runtime-hook above is dead — never fires). Env-gated
+    # (NHL_ANIM_DECODE); Milestone 0 validates the host->guest call mechanism on the
+    # leaf decode fns. See docs cba-format.md §6.
+    src/anim_decode.cpp
     # High-cut engine (H-2): first plume-driven frame — an in-process plume D3D12
     # swapchain driven by the guest Present hook. Env-gated (NHL_HIGHCUT_PRESENT).
     gpu/hooks/plume_present.cpp

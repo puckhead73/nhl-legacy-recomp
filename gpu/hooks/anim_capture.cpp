@@ -67,6 +67,16 @@ std::FILE* CaptureFile() {
     return g_file;
 }
 
+// One-time banner so a run definitively shows whether the chain is hooked and
+// whether the capture env was seen — independent of g_enabled.
+void AnnounceOnce(const char* who) {
+    static std::once_flag once;
+    std::call_once(once, [who] {
+        REXLOG_INFO("[anim] HOOK ACTIVE (first hit: {}); NHL_ANIM_CAPTURE={}",
+                    who, g_capPath ? g_capPath : "<unset>");
+    });
+}
+
 inline bool PlausibleGuestPtr(uint32_t a) {
     return a >= 0x10000u && a < 0xFFFF0000u;
 }
@@ -117,16 +127,13 @@ void DumpRaw(uint8_t* base, uint32_t tag, uint32_t addr, uint32_t len) {
 // Clip-sample entry: time -> key. Capture the controller and a window around it
 // (to later resolve the clip name/guid), plus the float time arg in fr1.
 REX_HOOK_RAW(sub_82CA9B20) {
-    if (g_enabled) {
-        const uint32_t self = ctx.r3.u32;
-        if (PlausibleGuestPtr(self)) {
-            DumpRaw(base, /*tag=*/0x53504C43u /*'CLPS'*/, self, 128);
-            if (g_entryLogs.fetch_add(1) < kLogCap) {
-                REXLOG_INFO("[anim] sample(sub_82CA9B20) self={:08X} r4={:08X} "
-                            "t={:.4f} ctrl[+0..32]={}",
-                            self, ctx.r4.u32, ctx.f1.f64, HexWindow(base, self, 32));
-            }
-        }
+    AnnounceOnce("sub_82CA9B20");
+    const uint32_t self = ctx.r3.u32;
+    if (PlausibleGuestPtr(self) && g_entryLogs.fetch_add(1) < kLogCap) {
+        if (g_enabled) DumpRaw(base, /*tag=*/0x53504C43u /*'CLPS'*/, self, 128);
+        REXLOG_INFO("[anim] sample(sub_82CA9B20) self={:08X} r4={:08X} "
+                    "t={:.4f} ctrl[+0..32]={}",
+                    self, ctx.r4.u32, ctx.f1.f64, HexWindow(base, self, 32));
     }
     __imp__sub_82CA9B20(ctx, base);
 }
@@ -134,41 +141,106 @@ REX_HOOK_RAW(sub_82CA9B20) {
 // Core decompressor: capture asset + NumKeys + the decoded output buffer. We dump
 // the output AFTER the real function runs (so the buffer holds decoded poses).
 REX_HOOK_RAW(sub_82CA7BD0) {
+    AnnounceOnce("sub_82CA7BD0");
     uint32_t self = ctx.r3.u32;
     uint32_t outA = ctx.r4.u32;
     uint32_t outB = ctx.r5.u32;
     uint32_t asset = 0, numKeys = 0;
-    if (g_enabled && PlausibleGuestPtr(self)) {
+    if (PlausibleGuestPtr(self)) {
         asset = G32(base, self + 0);
         if (PlausibleGuestPtr(asset)) {
             numKeys = G32(base, asset + 12);  // header NumKeys (validate live)
-            DumpRaw(base, /*tag=*/0x54455341u /*'ASET'*/, asset, 96);
+            if (g_enabled) DumpRaw(base, /*tag=*/0x54455341u /*'ASET'*/, asset, 96);
         }
     }
 
     __imp__sub_82CA7BD0(ctx, base);
 
-    if (g_enabled && PlausibleGuestPtr(self)) {
+    if (PlausibleGuestPtr(self) && g_coreLogs.fetch_add(1) < kLogCap) {
         // Output pose buffer(s): dump a window after decode for offline decode.
-        if (PlausibleGuestPtr(outA)) DumpRaw(base, 0x30544F50u /*'POT0'*/, outA, 128);
-        if (PlausibleGuestPtr(outB)) DumpRaw(base, 0x31544F50u /*'POT1'*/, outB, 128);
-        if (g_coreLogs.fetch_add(1) < kLogCap) {
-            REXLOG_INFO("[anim] core(sub_82CA7BD0) self={:08X} asset={:08X} "
-                        "numKeys={} outA={:08X} outB={:08X} out[+0..32]={}",
-                        self, asset, numKeys, outA, outB,
-                        PlausibleGuestPtr(outA) ? HexWindow(base, outA, 32) : "");
+        if (g_enabled) {
+            if (PlausibleGuestPtr(outA)) DumpRaw(base, 0x30544F50u /*'POT0'*/, outA, 128);
+            if (PlausibleGuestPtr(outB)) DumpRaw(base, 0x31544F50u /*'POT1'*/, outB, 128);
         }
+        REXLOG_INFO("[anim] core(sub_82CA7BD0) self={:08X} asset={:08X} "
+                    "numKeys={} outA={:08X} outB={:08X} out[+0..32]={}",
+                    self, asset, numKeys, outA, outB,
+                    PlausibleGuestPtr(outA) ? HexWindow(base, outA, 32) : "");
     }
 }
 
 // Per-track orchestrator: light touch — count invocations to confirm the chain.
 REX_HOOK_RAW(sub_82CA9618) {
-    if (g_enabled) {
-        static std::atomic<uint32_t> n{0};
-        if (n.fetch_add(1) < 8) {
-            REXLOG_INFO("[anim] track(sub_82CA9618) self={:08X} r4={:08X} r5={:08X}",
-                        ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
-        }
+    AnnounceOnce("sub_82CA9618");
+    static std::atomic<uint32_t> n{0};
+    if (n.fetch_add(1) < 8) {
+        REXLOG_INFO("[anim] track(sub_82CA9618) self={:08X} r4={:08X} r5={:08X}",
+                    ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
     }
     __imp__sub_82CA9618(ctx, base);
+}
+
+// ---------------------------------------------------------------------------
+// Mid/leaf helper hooks. The top chain (9B20/9618/7BD0) is proven dead in the
+// live path, but these lower helpers may still be hit — especially the ONE-TIME
+// prime (sub_82CA8C60) done when a clip is first used at load. Whichever fires
+// hands us a valid RUNTIME DctAnimationAsset pointer + its exact field layout
+// (the thing memory archaeology couldn't pin down). asset = r4 for the
+// (controller, asset) helpers; r3 for the size-calc leaf.
+// ---------------------------------------------------------------------------
+
+// Dump a captured asset's layout: the count/pointer fields the decode fns read
+// (+4/+16/+24/+28/+44 counts, +76 ptr, +88) plus a 128-byte window.
+void DumpAssetLayout(const char* who, uint8_t* base, uint32_t asset) {
+    if (!PlausibleGuestPtr(asset)) {
+        REXLOG_INFO("[anim] {} asset={:08X} (implausible)", who, asset);
+        return;
+    }
+    REXLOG_INFO("[anim] {} asset={:08X}  +4={} +16={} +24={:08X} +28={} +44={} "
+                "+76={:08X} +88={}",
+                who, asset, G32(base, asset + 4), G32(base, asset + 16),
+                G32(base, asset + 24), G32(base, asset + 28), G32(base, asset + 44),
+                G32(base, asset + 76), G32(base, asset + 88));
+    REXLOG_INFO("[anim]   asset[+0..128]={}", HexWindow(base, asset, 128));
+    if (g_enabled) DumpRaw(base, /*tag=*/0x54455341u /*'ASET'*/, asset, 256);
+}
+
+// Prime/unpack — likely the one-time per-clip setup. asset = r4.
+REX_HOOK_RAW(sub_82CA8C60) {
+    AnnounceOnce("sub_82CA8C60");
+    static std::atomic<uint32_t> n{0};
+    const uint32_t k = n.fetch_add(1);
+    if (k < 6) DumpAssetLayout("prime(sub_82CA8C60)", base, ctx.r4.u32);
+    else if (k == 6) REXLOG_INFO("[anim] sub_82CA8C60 firing >6x (live path uses it)");
+    __imp__sub_82CA8C60(ctx, base);
+}
+
+// Sibling prime. asset = r4.
+REX_HOOK_RAW(sub_82CA8B88) {
+    AnnounceOnce("sub_82CA8B88");
+    static std::atomic<uint32_t> n{0};
+    const uint32_t k = n.fetch_add(1);
+    if (k < 6) DumpAssetLayout("prime2(sub_82CA8B88)", base, ctx.r4.u32);
+    else if (k == 6) REXLOG_INFO("[anim] sub_82CA8B88 firing >6x");
+    __imp__sub_82CA8B88(ctx, base);
+}
+
+// Descriptor-D builder (pure). asset = r4.
+REX_HOOK_RAW(sub_82CE3750) {
+    AnnounceOnce("sub_82CE3750");
+    static std::atomic<uint32_t> n{0};
+    const uint32_t k = n.fetch_add(1);
+    if (k < 6) DumpAssetLayout("descD(sub_82CE3750)", base, ctx.r4.u32);
+    else if (k == 6) REXLOG_INFO("[anim] sub_82CE3750 firing >6x");
+    __imp__sub_82CE3750(ctx, base);
+}
+
+// Size-calc leaf (may be high-frequency if the live path uses it). asset = r3.
+REX_HOOK_RAW(sub_82CA7330) {
+    AnnounceOnce("sub_82CA7330");
+    static std::atomic<uint32_t> n{0};
+    const uint32_t k = n.fetch_add(1);
+    if (k < 6) DumpAssetLayout("sizecalc(sub_82CA7330)", base, ctx.r3.u32);
+    else if (k == 6) REXLOG_INFO("[anim] sub_82CA7330 firing >6x");
+    __imp__sub_82CA7330(ctx, base);
 }
