@@ -176,6 +176,10 @@ Copy-Item (Join-Path $PSScriptRoot "THIRD-PARTY-NOTICES.txt") $Stage
 # payload/: the prebuilt port + its runtime DLLs (incl. FFX) + manifest.
 Copy-Item $PortExe $Payload
 Copy-Item (Join-Path $BuildDir $RuntimeDll) $Payload
+# Engine tunables editor schema - the overlay panel reads tunables_schema.tsv from
+# next to the exe; ship it beside nhllegacy.exe so the editor works post-install.
+$TunablesSchema = Join-Path $RepoRoot "docs\tunables_schema.tsv"
+if (Test-Path $TunablesSchema) { Copy-Item $TunablesSchema $Payload }
 $PayloadTracy = Join-Path $BuildDir $TracyDll
 if (Test-Path $PayloadTracy) { Copy-Item $PayloadTracy $Payload }
 $FfxDlls | ForEach-Object { Copy-Item $_.FullName $Payload }
