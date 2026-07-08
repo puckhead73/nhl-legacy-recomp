@@ -71,3 +71,5 @@ nhllegacy_manifest.codegen.toml
 # build. (The hand-written RE markdown notes alongside it stay visible.)
 /docs/nhl12-decomp-reference/gpu/
 /docs/nhl12-decomp-reference/gpu.7z
+out/web/
+web/patches_wasm_applied
