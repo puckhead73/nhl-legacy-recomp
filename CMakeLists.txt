@@ -79,6 +79,28 @@ set(NHLLEGACY_SOURCES
     tools/replay/src/image_dump.cpp
 )
 
+# Linux / non-Windows: the D3D12 renderer subclass and the reference-only
+# "high-cut" plume/D3D12 + SPIR-V translator experiment are Windows-only (they
+# are only reachable from the D3D12 command processor). Drop them and use the
+# SDK's Vulkan backend, which is the only renderer there. linux_stubs.cpp
+# provides no-op stand-ins for the few hooks the kept code calls into.
+if(NOT WIN32)
+    list(REMOVE_ITEM NHLLEGACY_SOURCES
+        gpu/hooks/plume_present.cpp
+        gpu/hooks/highcut_spirv_probe.cpp
+        gpu/spirv/spirv_builder.cc
+        gpu/spirv/spirv_shader_translator.cc
+        gpu/spirv/spirv_shader_translator_alu.cc
+        gpu/spirv/spirv_shader_translator_fetch.cc
+        gpu/spirv/spirv_shader_translator_memexport.cc
+        gpu/spirv/spirv_shader_translator_rb.cc
+        gpu/spirv/spirv_shader.cc
+        gpu/spirv/spirv_translator_tables.cc
+        renderer/core/nhl_graphics_system.cpp
+        renderer/core/nhl_command_processor.cpp)
+    list(APPEND NHLLEGACY_SOURCES src/linux_stubs.cpp)
+endif()
+
 if(WIN32)
     add_executable(nhllegacy WIN32 ${NHLLEGACY_SOURCES})
 else()
@@ -91,7 +113,15 @@ rexglue_setup_target(nhllegacy)
 # a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips). When
 # CMAKE_PREFIX_PATH points at an SDK built with it ON, enable this to compile the
 # NHL_VK_BACKEND env gate (src/nhllegacy_app.h) and link the Vulkan graphics system.
-option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" OFF)
+if(WIN32)
+    set(_nhl_vk_default OFF)
+else()
+    set(_nhl_vk_default ON)  # Vulkan is the only renderer off Windows
+endif()
+option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" ${_nhl_vk_default})
+if(NOT WIN32 AND NOT NHLLEGACY_VULKAN_BACKEND)
+    message(FATAL_ERROR "Non-Windows builds need NHLLEGACY_VULKAN_BACKEND=ON (no D3D12 renderer)")
+endif()
 if(NHLLEGACY_VULKAN_BACKEND)
     target_compile_definitions(nhllegacy PRIVATE NHL_HAVE_VULKAN_BACKEND=1)
     # Compiled ONLY in the Vulkan build dir — links the SDK's Vulkan backend symbols
@@ -113,6 +143,9 @@ endif()
 # nhllegacy so gpu/hooks/plume_present.cpp can drive an in-process plume swapchain
 # from the intercepted guest Present. Same add_subdirectory pattern proven by the
 # standalone gpu/smoke build.
+# Everything from here through the glslang block is the Windows-only high-cut
+# experiment (see the NOT WIN32 source filter above).
+if(WIN32)
 add_subdirectory(third_party/plume ${CMAKE_BINARY_DIR}/plume_build)
 target_link_libraries(nhllegacy PRIVATE plume d3d12 dxgi dxguid)
 
@@ -178,17 +211,39 @@ endif()
 # root to the include path makes the SDK's `#include <SPIRV/SpvBuilder.h>` resolve.
 target_link_libraries(nhllegacy PRIVATE SPIRV)
 target_include_directories(nhllegacy PRIVATE "${glslang_SOURCE_DIR}")
+else()
+# The SDK's Vulkan backend headers (rex/graphics/pipeline/shader/spirv_builder.h)
+# include <SPIRV/SpvBuilder.h>, but the installed SDK doesn't ship glslang's
+# headers. On Windows the FetchContent glslang above provides them; elsewhere
+# use the SDK source tree's own glslang so the headers match what it was built
+# with. (Header-only use - the SDK links glslang itself.)
+set(REXGLUE_SDK_SRC "$ENV{REXGLUE_SDK_SRC}" CACHE PATH "ReXGlue SDK source tree (for glslang headers)")
+if(NOT EXISTS "${REXGLUE_SDK_SRC}/thirdparty/glslang/SPIRV/SpvBuilder.h")
+    message(FATAL_ERROR "Set REXGLUE_SDK_SRC to the rexglue-sdk source tree "
+                        "(needs thirdparty/glslang for the SPIR-V builder headers)")
+endif()
+target_include_directories(nhllegacy PRIVATE "${REXGLUE_SDK_SRC}/thirdparty/glslang")
+endif()  # WIN32 high-cut experiment
 
 # snappy (for .xtr trace decompression in the in-host replay mode). Statically
 # linked into rexruntime.dll but not re-exported, so link it directly; lib name
 # is config-specific. SDK lib dir derived from the package config location.
 get_filename_component(_rexsdk_lib "${rexglue_DIR}/../.." ABSOLUTE)
-target_link_libraries(nhllegacy PRIVATE
-    $<$<CONFIG:Debug>:${_rexsdk_lib}/snappyd.lib>
-    $<$<CONFIG:RelWithDebInfo>:${_rexsdk_lib}/snappyrd.lib>
-    $<$<CONFIG:Release>:${_rexsdk_lib}/snappy.lib>
-    $<$<CONFIG:MinSizeRel>:${_rexsdk_lib}/snappy.lib>
-)
+if(WIN32)
+    target_link_libraries(nhllegacy PRIVATE
+        $<$<CONFIG:Debug>:${_rexsdk_lib}/snappyd.lib>
+        $<$<CONFIG:RelWithDebInfo>:${_rexsdk_lib}/snappyrd.lib>
+        $<$<CONFIG:Release>:${_rexsdk_lib}/snappy.lib>
+        $<$<CONFIG:MinSizeRel>:${_rexsdk_lib}/snappy.lib>
+    )
+else()
+    target_link_libraries(nhllegacy PRIVATE
+        $<$<CONFIG:Debug>:${_rexsdk_lib}/libsnappyd.a>
+        $<$<CONFIG:RelWithDebInfo>:${_rexsdk_lib}/libsnappyrd.a>
+        $<$<CONFIG:Release>:${_rexsdk_lib}/libsnappy.a>
+        $<$<CONFIG:MinSizeRel>:${_rexsdk_lib}/libsnappy.a>
+    )
+endif()
 
 # rex/ui/renderdoc_api.h does `#include <renderdoc_app.h>`, which lives in the
 # SDK's include/renderdoc subdir (not on the default -isystem include path). Add

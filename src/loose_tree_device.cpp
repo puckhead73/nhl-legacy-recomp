@@ -9,7 +9,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>
+#include "platform_compat.h"
 
 #include <algorithm>
 #include <cctype>

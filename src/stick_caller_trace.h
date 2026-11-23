@@ -25,7 +25,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
-#include <windows.h>
+#include "platform_compat.h"
 #endif
 
 namespace nhllegacy {
@@ -61,6 +61,9 @@ inline void CaptureStickCaller(const char* stick_name, const char* out_path) {
   if (f != stderr) std::fclose(f);
 }
 
+#else
+// Stack-walk caller trace is Windows-only (RtlCaptureStackBackTrace); no-op here.
+inline void CaptureStickCaller(const char*, const char*) {}
 #endif  // _WIN32
 
 }  // namespace nhllegacy

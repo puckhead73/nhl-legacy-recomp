@@ -30,7 +30,11 @@
 #include <rex/ui/flags.h>
 #include <rex/ui/presenter.h>
 
+// The D3D12 graphics-system subclass is Windows-only (Linux builds the SDK's
+// Vulkan backend alone - see NHL_HAVE_VULKAN_BACKEND below).
+#if defined(_WIN32)
 #include "renderer/core/nhl_graphics_system.h"
+#endif
 // SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend
 // is a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips).
 // The header always installs; the implementation only links against an SDK built
@@ -83,7 +87,10 @@ REXCVAR_DECLARE(std::string, readback_resolve);
 // D3D12 render-target path: "rtv" (fast host path) vs "rov" (rasterizer-
 // ordered-views, accurate per-sample EDRAM — handles the in-game scene's
 // predicated tiling/overlapping resolves the rtv path renders black).
+// Defined by the SDK's D3D12 backend, which only exists on Windows.
+#if defined(_WIN32)
 REXCVAR_DECLARE(std::string, render_target_path_d3d12);
+#endif
 // TEMP black-screen diagnosis: dump the guest PM4 command stream so we can
 // count draw packets (DRAW_INDX / DRAW_INDX_2) vs swap-only frames.
 REXCVAR_DECLARE(bool, trace_gpu_stream);
@@ -130,8 +137,14 @@ REXCVAR_DECLARE(int32_t, shadow_softness);
 
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
+// Elsewhere platform_compat.h provides POSIX equivalents (TerminateProcess on
+// the current process == _exit) plus Sleep/_putenv_s.
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
 extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, unsigned int code);
+#else
+#include "platform_compat.h"
+#endif
 
 #ifdef NHL_PGO_INSTRUMENT
 // PGO instrumentation profile writer (compiler-rt profile runtime, auto-linked by
@@ -277,9 +290,16 @@ class NhllegacyApp : public rex::ReXApp {
       REXCVAR_SET(guide_button, true);
       REXLOG_INFO("[nhl-vk-spike] Vulkan backend selected (render_target_path_vulkan={})",
                   vk_rt ? vk_rt : "fsi");
-    } else
+    }
+#if defined(_WIN32)
+    else
 #endif
+#endif
+#if defined(_WIN32)
+    // D3D12 fallback (NHL_VK_BACKEND_OFF). Linux has no D3D12; there the Vulkan
+    // backend above is the only renderer.
     config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
+#endif
     REXCVAR_SET(protect_zero, false);  // see comment at REXCVAR_DECLARE above
     // NHL Legacy reads heap fields it never wrote (sub_82705510 record walk);
     // it relies on allocations being zero-filled like Xenia/Windows provide.
@@ -296,7 +316,9 @@ class NhllegacyApp : public rex::ReXApp {
     // green flash/overlay artifacts come from skipped fetches.
     REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
     // Accurate EDRAM path (in-game scene renders black under the rtv path).
+#if defined(_WIN32)
     REXCVAR_SET(render_target_path_d3d12, std::string("rov"));
+#endif
     // Black-screen diagnosis: flip to true to dump the guest PM4 stream to
     // gpu_trace/<title>_stream.xtr (~5MB / 25s boot). Parse with
     // tools/parse_gpu_trace.py / trace_resolve_analysis.py. Xenia accepts the
@@ -431,10 +453,12 @@ class NhllegacyApp : public rex::ReXApp {
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
     // provider creates the device. Used to get the exact device-removal reason
     // while debugging the beta owned-draw path.
+#if defined(_WIN32)
     if (std::getenv("NHL_BETA_D3D12_DEBUG")) {
       REXCVAR_SET(d3d12_debug, true);
       REXLOG_INFO("[nhl-beta] D3D12 debug layer enabled via NHL_BETA_D3D12_DEBUG");
     }
+#endif
     // Opt-in verbose SDK logging (NHL_LOG_LEVEL=debug|trace): surfaces the texture
     // cache's per-texture create/load actions (TextureKey::LogAction) for diagnosing
     // textures that bind but sample zero.
@@ -453,6 +477,8 @@ class NhllegacyApp : public rex::ReXApp {
     // assumes — SetGraphicsRootDescriptorTable(5) then faults the draw. Bindful
     // makes the base CP, our PipelineCache, and our hand-written binding code
     // agree. Gated on beta so default gameplay keeps the faster bindless path.
+    // (D3D12-only, so Windows-only.)
+#if defined(_WIN32)
     if (const char* be = std::getenv("NHL_BACKEND"); be && std::strcmp(be, "beta") == 0) {
       REXCVAR_SET(d3d12_bindless, false);
       REXLOG_INFO("[nhl-beta] forcing bindful descriptor path (d3d12_bindless=false) for beta");
@@ -476,6 +502,7 @@ class NhllegacyApp : public rex::ReXApp {
         REXLOG_INFO("[nhl-beta] d3d12_tiled_shared_memory = false (full buffer)");
       }
     }
+#endif
   }
 
   // End-user installs assembled by tools/packager ship game data in a
