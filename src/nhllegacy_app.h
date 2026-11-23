@@ -263,9 +263,23 @@ class NhllegacyApp : public rex::ReXApp {
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
           _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
+#if !defined(_WIN32)
+        // Linux default: delayed ("fast") readback instead of a full GPU drain
+        // per resolve. The SDK honors NHL_VK_READBACK_MODE (read once at the
+        // first resolve). On a Steam Deck the per-resolve drains left CPU and
+        // GPU waiting on each other (GPU ~62% busy at half clock): fast took
+        // matches from ~21 to ~28 fps with equipment composites still correct
+        // (they land one frame later). Windows keeps "full" (validated there).
+        // Set NHL_VK_READBACK_MODE=full to restore the old behavior.
+        if (!std::getenv("NHL_VK_READBACK_MODE")) {
+          _putenv_s("NHL_VK_READBACK_MODE", "fast");
+        }
+#endif
         REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
-                    "size gate {} B)",
-                    std::getenv("NHL_VK_READBACK_MAX_LEN"));
+                    "size gate {} B, mode override {})",
+                    std::getenv("NHL_VK_READBACK_MAX_LEN"),
+                    std::getenv("NHL_VK_READBACK_MODE") ? std::getenv("NHL_VK_READBACK_MODE")
+                                                        : "none");
       }
       // Deepen the audio queue on the Vulkan/SSAA path: at >=2x the CP thread
       // stalls on resolution-scaled swap/fence work and starves the guest audio

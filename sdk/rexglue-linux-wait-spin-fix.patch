@@ -1,0 +1,32 @@
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 09b0cd99..b7197799 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -360,9 +360,13 @@ class PosixConditionBase {
+       if (timeout == std::chrono::milliseconds::max()) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+       } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
++        // Keep full clock precision: truncating the remaining time to whole
++        // milliseconds turned every sub-millisecond remainder into
++        // sleep_for(0), so each timed multi-wait busy-spun until its deadline
++        // (e.g. the audio worker's WaitAny burned ~80% of a core).
++        auto remaining = end_time - now;
++        std::this_thread::sleep_for(
++            std::min<std::chrono::steady_clock::duration>(remaining, std::chrono::milliseconds(1)));
+       }
+     }
+   }
+@@ -998,7 +1002,9 @@ std::chrono::milliseconds ComputeAlertableWaitTimeout(
+   if (deadline == std::chrono::steady_clock::time_point::max()) {
+     return kAlertablePollSlice;
+   }
+-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
++  // Round UP: truncating a sub-millisecond remainder to 0 made the inner wait
++  // return immediately, so the alertable loop spun until the deadline.
++  auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+       deadline - std::chrono::steady_clock::now());
+   if (remaining <= std::chrono::milliseconds::zero()) {
+     return std::chrono::milliseconds::zero();

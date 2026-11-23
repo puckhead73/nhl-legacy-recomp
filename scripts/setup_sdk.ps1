@@ -43,7 +43,10 @@ if ($LASTEXITCODE -ne 0) { throw "git submodule update failed" }
 #    - upstream codegen cherry-picks that postdate the pin (e.g. the conditional
 #      bcctr tail-recovery fix, upstream 10cf1ad - a conditional bnectr/beqctr
 #      used to end the block and silently drop the rest of the function)
-$patches = @($patch, (Join-Path $repo "sdk\rexglue-codegen-bcctr-tail-fix.patch"))
+#    - the POSIX wait spin fix (Linux-only code; harmless on Windows, applied so
+#      both checkouts stay identical)
+$patches = @($patch, (Join-Path $repo "sdk\rexglue-codegen-bcctr-tail-fix.patch"),
+             (Join-Path $repo "sdk\rexglue-linux-wait-spin-fix.patch"))
 foreach ($p in $patches) {
     $pname = Split-Path -Leaf $p
     git -C $SdkDir apply --check $p 2>$null

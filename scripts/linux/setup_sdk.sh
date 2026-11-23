@@ -16,6 +16,8 @@ pin=bd9b51918faa71f962fa38af6d5f744af9aba2ce
 patches=(
   "$repo/sdk/rexglue-vulkan-nhl-legacy-bd9b519.patch"
   "$repo/sdk/rexglue-codegen-bcctr-tail-fix.patch"
+  # POSIX timed multi-waits busy-spun (ms truncation -> sleep_for(0)).
+  "$repo/sdk/rexglue-linux-wait-spin-fix.patch"
 )
 
 if [ ! -d "$sdk/.git" ]; then
