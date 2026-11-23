@@ -103,6 +103,11 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   std::chrono::steady_clock::time_point window_start_{};
   bool started_ = false;
 
+  // Present frame cap (NHL_FPS_CAP, see IssueSwap). Deadline of the next
+  // allowed present; default-constructed = not started.
+  void ThrottlePresent();
+  std::chrono::steady_clock::time_point present_deadline_{};
+
   // F9 hotkey streaming capture (NHL_HOTKEY_CAPTURE=1): press F9 in-scene to
   // start, F9 again to stop -> gpu_trace/scene_NN/<title>_stream.xtr. Mirrors the
   // D3D12 beta path's PollHotkeyCapture so a representative *gameplay* PM4 stream

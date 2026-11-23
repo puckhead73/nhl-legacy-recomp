@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <mutex>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include <rex/graphics/registers.h>
@@ -232,10 +233,47 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   }
 }
 
+// Present frame cap. On Windows the guest's presents pace themselves (60 fps in
+// menus, 30 in matches). On Linux the same build presents uncapped in menus
+// (~200+ fps, measured on a Steam Deck) - game *timing* stays correct (movies
+// play at their encoded rate), the extra frames just burn CPU/GPU power. Holding
+// the CP thread here backpressures the guest render thread to the cap without
+// touching simulation time. NHL_FPS_CAP=<fps> overrides (0 = off). Default 60
+// off Windows; off on Windows, where it never triggers and the coarse system
+// timer could only add jitter.
+void NhlVkCommandProcessor::ThrottlePresent() {
+  static const double cap = [] {
+    if (const char* e = std::getenv("NHL_FPS_CAP"); e && *e) {
+      const double v = std::strtod(e, nullptr);
+      return v > 0.0 ? v : 0.0;
+    }
+#if defined(_WIN32)
+    return 0.0;
+#else
+    return 60.0;
+#endif
+  }();
+  if (cap <= 0.0) return;
+  using clock = std::chrono::steady_clock;
+  const auto interval =
+      std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / cap));
+  const auto now = clock::now();
+  if (present_deadline_ == clock::time_point{} || now - present_deadline_ > interval) {
+    // First frame, or we fell more than a frame behind (slow scene): resync
+    // instead of bursting to catch up.
+    present_deadline_ = now + interval;
+    return;
+  }
+  if (present_deadline_ > now) std::this_thread::sleep_until(present_deadline_);
+  present_deadline_ += interval;
+}
+
 void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
-  // Present the frame via the SDK's own Vulkan presenter, then sample timing.
+  // Pace presents to the cap, then present the frame via the SDK's own Vulkan
+  // presenter and sample timing.
+  ThrottlePresent();
   rex::graphics::vulkan::VulkanCommandProcessor::IssueSwap(
       frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
