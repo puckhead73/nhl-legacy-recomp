@@ -26,6 +26,13 @@ if (-not (Test-Path (Join-Path $SdkDir ".git"))) {
     if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
 }
 Write-Host "[sdk] pinning $Pin"
+# The pin is not reachable from upstream's default branch any more, so a plain
+# clone does not contain it - fetch the commit explicitly if it is missing.
+git -C $SdkDir cat-file -e "$Pin^{commit}" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    git -C $SdkDir fetch origin $Pin
+    if ($LASTEXITCODE -ne 0) { throw "git fetch $Pin failed" }
+}
 git -C $SdkDir checkout $Pin
 if ($LASTEXITCODE -ne 0) { throw "git checkout $Pin failed" }
 git -C $SdkDir submodule update --init --recursive

@@ -37,6 +37,16 @@ if not defined VCVARS64 (
     if not defined VCVARS64 if exist "C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS64=C:\Program Files\Microsoft Visual Studio\2022\%%e\VC\Auxiliary\Build\vcvars64.bat"
   )
 )
+REM Fall back to VS 2026 (v18) when no 2022 install is present.
+if not defined VCVARS64 (
+  for %%e in (BuildTools Community Professional Enterprise) do (
+    if not defined VCVARS64 if exist "C:\Program Files\Microsoft Visual Studio\18\%%e\VC\Auxiliary\Build\vcvars64.bat" (
+      set "VCVARS64=C:\Program Files\Microsoft Visual Studio\18\%%e\VC\Auxiliary\Build\vcvars64.bat"
+      if not defined FFX_VS_GENERATOR set "FFX_VS_GENERATOR=Visual Studio 18 2026"
+    )
+  )
+)
+if not defined FFX_VS_GENERATOR set "FFX_VS_GENERATOR=Visual Studio 17 2022"
 if not defined VCVARS64 (
   echo [env] ERROR: Visual Studio 2022 vcvars64.bat not found ^(install VS2022 Build Tools with the C++ workload, or set VCVARS64^)
   exit /b 1

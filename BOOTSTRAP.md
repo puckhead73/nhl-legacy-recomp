@@ -63,6 +63,18 @@ set NHL_VK_BACKEND=1
 out\build\win-amd64-vk-ffx\nhllegacy.exe --game_data_root "<your install>\game"
 ```
 
+**Movies show green blocks?** The VP6 host-decode bridge needs `ffmpeg.exe`
+(on PATH or beside the exe; `release\fetch_ffmpeg.ps1` fetches one) and the
+movies as loose files under `<game>\_compiled\`. A raw disc extract (e.g. via
+extract-xiso) only has the `.big` archives, and the builder's QuickBMS unpacker
+comes from a private repo, so pull just the movies out with:
+
+```bat
+python tools\extract_big_movies.py "<game>" "<game>\_compiled"
+```
+
+(Add `--dry-run` to list them first: 54 `.vp6`/`.sub` files, ~700 MB.)
+
 For an optimized (shipping-grade, non-PGO) build: `scripts\_build_vk_opt.bat
 configure` then `scripts\_build_vk_opt.bat`. PGO flow: `_build_vk_pgogen.bat` →
 play a session → `llvm-profdata merge -output=pgo\nhllegacy.profdata *.profraw` →
