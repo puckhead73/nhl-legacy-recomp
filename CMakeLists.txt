@@ -26,6 +26,9 @@ set(NHLLEGACY_SOURCES
     # Env-gated (NHL_PIN_PCORES, default ON); no-op on AMD / non-hybrid CPUs. Called
     # from NhllegacyApp::OnPreSetup before any threads spin up.
     src/cpu_affinity.cpp
+    # D3D GPU-wait loop backoff (sub_827E2BC8): yield/sleep instead of a flat-out
+    # spin. Default on off Windows; NHL_GPU_WAIT_SLEEP_US tunes / disables it.
+    src/gpu_wait_backoff.cpp
     # High-cut engine (H-1): D3D9 logical resource graph — pass-through hooks that
     # build the EDRAM-free RT/texture/resolve graph. Env-gated (NHL_HIGHCUT); no
     # behavior change. Supersedes the M1 correlation tap (gpu/hooks/d3d9_tap.cpp,
