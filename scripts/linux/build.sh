@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Native Linux build of the NHL Legacy port (SDK + game) - optimized, Vulkan.
 #
-# Usage: scripts/linux/build.sh [sdk|game|stage|all]   (default: all)
+# Usage: scripts/linux/build.sh [sdk|game|stage|all|pgo-gen|pgo-merge|pgo]
 #   sdk   - configure + build + install the ReXGlue SDK (Release, Vulkan, no FFX)
 #   game  - configure + build nhllegacy against that SDK
 #   stage - assemble a runnable dir: nhllegacy + librexruntime.so ($ORIGIN rpath)
+#   PGO (profile-guided optimization, 3 stages):
+#     pgo-gen            - instrumented build -> out/stage/linux-amd64-pgogen
+#                          (play a session with NHL_PGO_DUMP_AFTER=<s>; it writes
+#                          LLVM_PROFILE_FILE, e.g. nhl-%p.profraw, and exits)
+#     pgo-merge <raw...> - merge .profraw -> pgo/nhllegacy-linux.profdata
+#     pgo                - optimized build using it -> out/stage/linux-amd64-pgo
 #
 # Run from the repo root on a Linux filesystem (WSL: ~/..., not /mnt/c - see
 # scripts/linux/sync_from_windows.sh). Needs scripts/linux/install_build_deps.sh
@@ -65,42 +71,87 @@ build_sdk() {
   cmake --install "$sdk_build"
 }
 
+# Game build flavors (same SDK for all):
+#   opt     - -O3 + ThinLTO (default)
+#   pgogen  - PGO stage 1: instrumented, NO LTO (as scripts/_build_vk_pgogen.bat:
+#             LTO only slows the profiling build). Defines NHL_PGO_INSTRUMENT so
+#             the app flushes the profile on its hard-exit paths and honors
+#             NHL_PGO_DUMP_AFTER=<seconds>.
+#   pgo     - PGO stage 3: -O3 + ThinLTO + -fprofile-use=$profdata.
+profdata=${PROFDATA:-$repo/pgo/nhllegacy-linux.profdata}
+flavor_flags() {
+  case "$1" in
+    opt)
+      g_dir=$repo/out/build/linux-amd64-opt
+      g_base="$base"; g_c="$opt"; g_cxx="$opt"
+      g_link="-flto=thin -fuse-ld=lld -Wl,--thinlto-jobs=$jobs" ;;
+    pgogen)
+      g_dir=$repo/out/build/linux-amd64-pgogen
+      g_base="-march=x86-64-v3"
+      g_c="$opt -fprofile-generate"; g_cxx="$opt -fprofile-generate -DNHL_PGO_INSTRUMENT"
+      g_link="-fprofile-generate -fuse-ld=lld" ;;
+    pgo)
+      [ -f "$profdata" ] || { echo "missing $profdata (run: $0 pgo-merge <profraw...>)" >&2; exit 1; }
+      g_dir=$repo/out/build/linux-amd64-pgo
+      local use="-fprofile-use=$profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+      g_base="$base"; g_c="$opt $use"; g_cxx="$opt $use"
+      g_link="-flto=thin -fuse-ld=lld -Wl,--thinlto-jobs=$jobs" ;;
+  esac
+}
+
 build_game() {
+  local flavor=${1:-opt}
+  flavor_flags "$flavor"
   [ -f "$repo/generated/rexglue.cmake" ] || {
     echo "generated/ is missing - sync it from the Windows checkout (codegen output)" >&2
     exit 1
   }
-  echo "== game: configure ($game_build)"
-  cmake -S "$repo" -B "$game_build" -G Ninja \
+  echo "== game ($flavor): configure ($g_dir)"
+  cmake -S "$repo" -B "$g_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-    "-DCMAKE_C_FLAGS=$base" "-DCMAKE_CXX_FLAGS=$base" \
-    "-DCMAKE_C_FLAGS_RELEASE=$opt" "-DCMAKE_CXX_FLAGS_RELEASE=$opt" \
-    "-DCMAKE_EXE_LINKER_FLAGS=-flto=thin -fuse-ld=lld -Wl,--thinlto-jobs=$jobs" \
+    "-DCMAKE_C_FLAGS=$g_base" "-DCMAKE_CXX_FLAGS=$g_base" \
+    "-DCMAKE_C_FLAGS_RELEASE=$g_c" "-DCMAKE_CXX_FLAGS_RELEASE=$g_cxx" \
+    "-DCMAKE_EXE_LINKER_FLAGS=$g_link" \
     "-DCMAKE_PREFIX_PATH=$sdk_install" \
     "-DREXGLUE_SDK_SRC=$sdk" \
     "-DCMAKE_BUILD_RPATH=\$ORIGIN" \
     -DNHLLEGACY_VULKAN_BACKEND=ON \
     -DNHLLEGACY_BUILD_PACKAGER=OFF -DNHLLEGACY_BUILD_TRACE_TOOLS=OFF
-  echo "== game: build"
-  cmake --build "$game_build" --target nhllegacy --parallel "$jobs"
+  echo "== game ($flavor): build"
+  cmake --build "$g_dir" --target nhllegacy --parallel "$jobs"
 }
 
 stage_out() {
-  echo "== stage -> $stage"
-  rm -rf "$stage"
-  mkdir -p "$stage"
-  cp "$game_build/nhllegacy" "$stage/"
-  cp -P "$sdk_install"/lib/librexruntime.so* "$stage/"
+  local flavor=${1:-opt}
+  flavor_flags "$flavor"
+  local out=$stage
+  [ "$flavor" = opt ] || out=$stage-$flavor
+  echo "== stage ($flavor) -> $out"
+  rm -rf "$out"
+  mkdir -p "$out"
+  cp "$g_dir/nhllegacy" "$out/"
+  cp -P "$sdk_install"/lib/librexruntime.so* "$out/"
   # Make sure the binary finds the runtime beside itself.
-  readelf -d "$stage/nhllegacy" | grep -E 'RUNPATH|RPATH' || true
-  ls -la "$stage"
+  readelf -d "$out/nhllegacy" | grep -E 'RUNPATH|RPATH' || true
+  ls -la "$out"
+}
+
+# PGO stage 2: merge the .profraw files the instrumented build wrote.
+pgo_merge() {
+  [ $# -gt 0 ] || { echo "usage: $0 pgo-merge <file.profraw>..." >&2; exit 2; }
+  mkdir -p "$(dirname "$profdata")"
+  llvm-profdata-20 merge -output="$profdata" "$@"
+  llvm-profdata-20 show "$profdata" | head -5
 }
 
 case "$what" in
   sdk) build_sdk ;;
-  game) build_game ;;
-  stage) stage_out ;;
-  all) build_sdk; build_game; stage_out ;;
-  *) echo "usage: $0 [sdk|game|stage|all]" >&2; exit 2 ;;
+  game) build_game opt ;;
+  stage) stage_out opt ;;
+  all) build_sdk; build_game opt; stage_out opt ;;
+  pgo-gen) build_game pgogen; stage_out pgogen ;;
+  pgo-merge) shift; pgo_merge "$@" ;;
+  pgo) build_game pgo; stage_out pgo ;;
+  *) echo "usage: $0 [sdk|game|stage|all|pgo-gen|pgo-merge <profraw...>|pgo]" >&2; exit 2 ;;
 esac
