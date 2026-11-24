@@ -25,6 +25,8 @@
 #include <rex/filesystem/file.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/texture/util.h>  // GetTiledOffset2D (replay dumps)
+#include <rex/memory.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/ui/flags.h>
@@ -235,6 +237,16 @@ class NhllegacyApp : public rex::ReXApp {
             "[nhl-vk] host render targets: execute_unclipped_draw_vs_on_cpu=1, "
             "occlusion_query_enable=0");
       }
+#if !defined(_WIN32)
+      // The same intermittent match-load hang later hit fsi on the Deck as well
+      // (rarer); fake occlusion results then held across repeated loads on both
+      // paths, so they are the Linux default. NHL_REAL_OCCLUSION_QUERIES=1 opts
+      // back into host queries. Windows keeps them (no hang seen there).
+      if (!std::getenv("NHL_REAL_OCCLUSION_QUERIES")) {
+        REXCVAR_SET(occlusion_query_enable, false);
+        REXLOG_INFO("[nhl-vk] occlusion_query_enable=0 (fake sample counts; Linux default)");
+      }
+#endif
       // Perf measurement wants the present rate uncapped: vsync is forced on below
       // (console-pacing experiment) and would peg fps at the refresh rate, hiding
       // both headroom and dense-scene drops. NHL_VK_NO_VSYNC=1 frees it.
@@ -1031,6 +1043,14 @@ class NhllegacyApp : public rex::ReXApp {
         xtr_path, stats.draw_packets, stats.primary_packets, stats.memory_ranges, stats.frames,
         stats.skipped_wait_reg_mem, stats.skipped_empty_leaves);
 
+    // NHL_REPLAY_DUMP=<hexaddr>:<w>:<h>[,...] - after the replay, untile a 32bpp
+    // resolve destination from guest memory and write replay_dump_<addr>.png, to
+    // see which stage of a render->resolve->composite chain loses content. For
+    // host-RT runs set NHL_VK_READBACK_MAX_LEN=0 so large resolves are read back.
+    if (const char* d = std::getenv("NHL_REPLAY_DUMP"); d && *d) {
+      DumpGuestTextures(*gs, d);
+    }
+
     auto* presenter = gs->presenter();
     if (!presenter) {
       REXLOG_ERROR("[nhl-replay] no presenter to capture from");
@@ -1061,6 +1081,39 @@ class NhllegacyApp : public rex::ReXApp {
     }
     REXLOG_ERROR("[nhl-replay] failed to write {}", out);
     return false;
+  }
+
+  void DumpGuestTextures(rex::graphics::GraphicsSystem& gs, const std::string& spec) {
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) end = spec.size();
+      const std::string item = spec.substr(pos, end - pos);
+      pos = end + 1;
+      uint32_t addr = 0, w = 0, h = 0;
+      if (std::sscanf(item.c_str(), "%x:%u:%u", &addr, &w, &h) != 3 || !w || !h) continue;
+      const uint8_t* src = gs.memory()->TranslatePhysical<const uint8_t*>(addr & 0x1FFFFFFFu);
+      if (!src) continue;
+      const uint32_t pitch = (w + 31u) & ~31u;  // tiled pitch in texels
+      std::vector<uint8_t> rgba(size_t(w) * h * 4);
+      uint64_t sum = 0;
+      for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+          const int32_t off = rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(x), int32_t(y), pitch, 2);
+          const uint8_t* p = src + off;  // k_8_8_8_8, 8-in-32 swapped
+          uint8_t* o = rgba.data() + (size_t(y) * w + x) * 4;
+          o[0] = p[3]; o[1] = p[2]; o[2] = p[1]; o[3] = 255;
+          sum += o[0] + o[1] + o[2];
+        }
+      }
+      char name[64];
+      std::snprintf(name, sizeof(name), "replay_dump_%08X.png", addr);
+      const std::string out = (rex::filesystem::GetExecutableFolder() / name).string();
+      nhl::replay::WritePng(out, w, h, rgba.data());
+      REXLOG_INFO("[nhl-replay] dump {:08X} {}x{} mean={:.1f} -> {}", addr, w, h,
+                  double(sum) / (3.0 * w * h), out);
+    }
   }
 
   std::thread replay_thread_;
