@@ -13,6 +13,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <vector>
@@ -64,6 +65,10 @@ REXCVAR_DECLARE(bool, protect_zero);
 REXCVAR_DECLARE(bool, scribble_heap);
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+// Host-RT (fbo) fixes, see OnPreSetup: real EDRAM extent for clip-disabled
+// 8192x8192-scissor draws, and fake occlusion results.
+REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
+REXCVAR_DECLARE(bool, occlusion_query_enable);
 // Audio queue depth (frames buffered before the SDL device callback underruns to
 // silence — the audible pop). Default 8 (~43 ms) is thin when the CP thread stalls
 // on resolution-scaled swap work at high SSAA and starves audio servicing; a deeper
@@ -181,11 +186,42 @@ class NhllegacyApp : public rex::ReXApp {
       // Vulkan backend otherwise, so rendering matches the stock path.
       config.graphics = std::make_unique<nhl::graphics::NhlVkGraphicsSystem>();
       // NOTE: the Vulkan backend only honors "fsi" (Path::kPixelShaderInterlock —
-      // the real per-tile EDRAM path the in-game 3D scene needs). ANY other value
-      // (incl. "rov") falls through to kHostRenderTargets (== D3D12 "rtv"), which
-      // renders the in-game scene black/missing. So default to fsi, not rov.
+      // the real per-tile EDRAM path). ANY other value (incl. "rov", "fbo") falls
+      // through to kHostRenderTargets (== D3D12 "rtv"). fsi stays the default;
+      // host RTs (NHL_VK_RT_PATH=fbo) are opt-in and need the two settings below.
       const char* vk_rt = std::getenv("NHL_VK_RT_PATH");
       REXCVAR_SET(render_target_path_vulkan, std::string(vk_rt ? vk_rt : "fsi"));
+      // Host-RT black in-game scene - ROOT CAUSE: the game renders the 1280x720
+      // 2xMSAA scene in two 640-wide halves (window offset -640) and, between
+      // each half's draws and its color resolve, clears depth/stencil with an
+      // EDRAM depth-only (mode 5) quad drawn through a 4xMSAA pitch-320 alias,
+      // with clipping disabled and the D3D9 8192x8192 scissor. With no viewport
+      // to bound it, the host-RT cache's draw-extent estimate is the full
+      // scissor, clamped to the whole EDRAM; EDRAM addressing wraps, so the
+      // clear's depth RT (base 736) took ownership of ALL 2048 tiles - including
+      // the scene's color at tiles 0-720 - and the resolve then dumped the
+      // clear's RT: black (only the depth-test-off HUD survived; title-dialog
+      // text lost most glyphs the same way). Running the vertex shader on the
+      // CPU for exactly these unclipped 8192 draws (SDK cvar, off by default)
+      // gives the real extent; an F9 match trace replayed through both paths
+      // then matches fsi (scene mean 75.3 vs 75.4). fsi tracks EDRAM per pixel
+      // and never needed it.
+      //
+      // Host occlusion queries off too: with host RTs, match loads hung
+      // intermittently on a Steam Deck (a game thread polling in a sleep loop,
+      // GPU idle); with queries off (fixed fake sample count, like the base CP)
+      // the repeated loads tested then did not hang. Host-RT queries count only
+      // samples passing the hardware depth test and can read 0, while under fsi
+      // (depth tested in the shader) they never do - a loader retrying until
+      // "visible" can then spin forever. A rarer load stall has since been seen
+      // with queries off too, so treat this as a mitigation, not a full cure.
+      if (vk_rt && std::string_view(vk_rt) != "fsi") {
+        REXCVAR_SET(execute_unclipped_draw_vs_on_cpu, true);
+        REXCVAR_SET(occlusion_query_enable, false);
+        REXLOG_INFO(
+            "[nhl-vk] host render targets: execute_unclipped_draw_vs_on_cpu=1, "
+            "occlusion_query_enable=0");
+      }
       // Perf measurement wants the present rate uncapped: vsync is forced on below
       // (console-pacing experiment) and would peg fps at the refresh rate, hiding
       // both headroom and dense-scene drops. NHL_VK_NO_VSYNC=1 frees it.
