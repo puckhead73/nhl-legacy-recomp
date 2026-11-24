@@ -1,6 +1,8 @@
 #include "renderer/core/nhl_vk_backend.h"
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -62,6 +64,8 @@ bool NhlVkCommandProcessor::IssueDraw(
     return rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
         primitive_type, index_count, index_buffer_info, major_mode_explicit);
   }
+  if (rtlog_ < 0) rtlog_ = std::getenv("NHL_VK_RTLOG") ? 1 : 0;
+  if (rtlog_) RtLogDraw();
   // Resolve experiment env once.
   if (!exp_resolved_) {
     exp_skip_dxt3_ = std::getenv("NHL_VK_SKIP_DXT3") != nullptr;
@@ -173,6 +177,39 @@ bool NhlVkCommandProcessor::IssueDraw(
     (*register_file_)[color_idx] = saved_color;
     return rv;
   }
+  // Experiment (NHL_VK_EXP_ZALWAYS=1): depth-tested draws pass the depth test
+  // unconditionally (ZFUNC=ALWAYS, writes kept) - tells "depth buffer content
+  // rejects everything" apart from other host-RT draw losses.
+  // Experiment (NHL_VK_EXP_SKIP_MSAA4=1): drop draws into 4x-MSAA surfaces (the
+  // game's EDRAM clear trick at pitch 320), to test whether host-RT ownership
+  // transfers between the 4x/320 and 2x/640 layouts lose the scene.
+  // Value = bit mask of which 4x draws to drop: 1 = color(+depth) writes
+  // (mode 4, cmask!=0), 2 = depth-only (mode 5), 4 = no-write (cmask==0, no z).
+  static const uint32_t exp_skip_msaa4 = [] {
+    const char* e = std::getenv("NHL_VK_EXP_SKIP_MSAA4");
+    return (e && *e) ? uint32_t(std::strtoul(e, nullptr, 0)) : 0u;
+  }();
+  if (exp_skip_msaa4 && (((*register_file_)[0x2000] >> 16) & 3u) == 2u) {
+    const uint32_t mode = (*register_file_)[0x2208] & 7u;
+    const uint32_t cmask = (*register_file_)[0x2104] & 0xFFFFu;
+    const bool z_on = ((*register_file_)[0x2200] & 0x7u) != 0;
+    uint32_t kind;
+    if (mode == 5) kind = 2;
+    else if (cmask == 0 && !z_on) kind = 4;
+    else kind = 1;
+    if (exp_skip_msaa4 & kind) return true;
+  }
+  static const bool exp_zalways = std::getenv("NHL_VK_EXP_ZALWAYS") != nullptr;
+  if (exp_zalways) {
+    constexpr uint32_t kZCtl = 0x2200;
+    uint32_t& z = (*register_file_)[kZCtl];
+    const uint32_t saved = z;
+    if (z & 0x2u) z = (z & ~(7u << 4)) | (7u << 4);
+    const bool rv = rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
+        primitive_type, index_count, index_buffer_info, major_mode_explicit);
+    z = saved;
+    return rv;
+  }
   // Forward unchanged — rendering is identical to the stock Vulkan backend.
   return rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
       primitive_type, index_count, index_buffer_info, major_mode_explicit);
@@ -233,6 +270,138 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   }
 }
 
+// --- Render-target / resolve inventory (NHL_VK_RTLOG=1) ---------------------
+// Raw Xenos register dwords (see register_table.inc) so the log is easy to
+// decode against Xenia/SDK docs.
+namespace {
+constexpr uint32_t kRbSurfaceInfo = 0x2000, kRbColorInfo = 0x2001, kRbDepthInfo = 0x2002,
+                   kRbColor1Info = 0x2003, kWindowOffset = 0x2080, kWindowScissorBr = 0x2082,
+                   kRbColorMask = 0x2104, kVportXScale = 0x210F, kVportYScale = 0x2111,
+                   kRbDepthControl = 0x2200, kRbModeControl = 0x2208, kVizQuery = 0x2293,
+                   kCopyControl = 0x2318, kCopyDestBase = 0x2319, kCopyDestPitch = 0x231A,
+                   kCopyDestInfo = 0x231B;
+}  // namespace
+
+void NhlVkCommandProcessor::RtLogDraw() {
+  const auto& rf = *register_file_;
+  RtDrawKey k{rf[kRbSurfaceInfo], rf[kRbColorInfo],   rf[kRbColor1Info], rf[kRbDepthInfo],
+              rf[kRbModeControl], rf[kRbDepthControl], rf[kRbColorMask], rf[kWindowOffset]};
+  RtDrawStat* s = nullptr;
+  for (auto& e : rt_draws_) {
+    if (e.key == k) { s = &e; break; }
+  }
+  if (!s) {
+    if (rt_draws_.size() >= 256) return;
+    rt_draws_.push_back(RtDrawStat{k});
+    s = &rt_draws_.back();
+  }
+  ++s->draws;
+  const uint32_t idx = uint32_t(s - rt_draws_.data());
+  if (!rt_seq_.empty() && rt_seq_.back().first == idx) {
+    ++rt_seq_.back().second;
+  } else if (rt_seq_.size() < 512) {
+    rt_seq_.emplace_back(idx, 1u);
+  }
+  if (rf[kVizQuery] & 1u) ++s->viz_query_draws;
+  s->vp_w = std::max(s->vp_w, 2.0f * std::abs(std::bit_cast<float>(rf[kVportXScale])));
+  s->vp_h = std::max(s->vp_h, 2.0f * std::abs(std::bit_cast<float>(rf[kVportYScale])));
+  s->scissor_br = rf[kWindowScissorBr];
+}
+
+bool NhlVkCommandProcessor::IssueCopy() {
+  if (rtlog_ > 0 && register_file_) {
+    const auto& rf = *register_file_;
+    RtCopyStat c{rf[kRbSurfaceInfo], rf[kRbColorInfo],  rf[kRbDepthInfo],
+                 rf[kCopyControl],   rf[kCopyDestBase], rf[kCopyDestPitch],
+                 rf[kCopyDestInfo],  rf[kWindowScissorBr], rf[kWindowOffset]};
+    bool found = false;
+    uint32_t cidx = 0;
+    for (auto& e : rt_copies_) {
+      if (e.surface_info == c.surface_info && e.color_info == c.color_info &&
+          e.depth_info == c.depth_info && e.copy_control == c.copy_control &&
+          e.dest_base == c.dest_base && e.dest_pitch == c.dest_pitch &&
+          e.dest_info == c.dest_info && e.scissor_br == c.scissor_br) {
+        ++e.count;
+        found = true;
+        break;
+      }
+      ++cidx;
+    }
+    if (!found && rt_copies_.size() < 256) {
+      c.count = 1;
+      rt_copies_.push_back(c);
+    }
+    if (rt_seq_.size() < 512) rt_seq_.emplace_back(0x8000u | cidx, 1u);
+  }
+  // Experiment (NHL_VK_EXP_COPY_SAMPLE=<0..6>): force RB_COPY_CONTROL's
+  // copy_sample_select for color resolves, restoring it afterwards - separates
+  // "MSAA draws never landed" from "multi-sample resolve loses them".
+  static const int exp_sample = [] {
+    const char* e = std::getenv("NHL_VK_EXP_COPY_SAMPLE");
+    return (e && *e) ? int(std::strtol(e, nullptr, 10)) : -1;
+  }();
+  if (exp_sample >= 0 && register_file_) {
+    uint32_t& cc = (*register_file_)[kCopyControl];
+    const uint32_t saved = cc;
+    if ((cc & 7u) != 4u) {  // color source only (4 = depth)
+      cc = (cc & ~(7u << 4)) | (uint32_t(exp_sample & 7) << 4);
+    }
+    const bool r = rex::graphics::vulkan::VulkanCommandProcessor::IssueCopy();
+    cc = saved;
+    return r;
+  }
+  return rex::graphics::vulkan::VulkanCommandProcessor::IssueCopy();
+}
+
+// Decode helpers per Xenos: SURFACE_INFO pitch[13:0] msaa[17:16];
+// COLOR_INFO base[11:0] (EDRAM tiles) format[19:16]; DEPTH_INFO base[11:0]
+// format[16]; COPY_CONTROL src[2:0] sample[6:4] cmd[21:20].
+void NhlVkCommandProcessor::RtLogDump() {
+  if (rt_draws_.empty() && rt_copies_.empty()) return;
+  REXLOG_INFO("[nhl-rt] ---- frame {}: {} rt configs, {} resolve kinds ----", frames_total_,
+              rt_draws_.size(), rt_copies_.size());
+  uint32_t di = 0;
+  for (const auto& e : rt_draws_) {
+    const auto& k = e.key;
+    REXLOG_INFO(
+        "[nhl-rt] D{:<2} x{:<5} pitch={:<4} msaa={} c0base={:<4} c0fmt={:<2} c1={:08X} "
+        "dbase={:<4} dfmt={} mode={} zctl={:08X} cmask={:04X} woff={:08X} vp={:.0f}x{:.0f} "
+        "sc_br={:08X} viz={}",
+        di++, e.draws, k.surface_info & 0x3FFFu, (k.surface_info >> 16) & 3u,
+        k.color_info & 0xFFFu, (k.color_info >> 16) & 0xFu, k.color1_info,
+        k.depth_info & 0xFFFu, (k.depth_info >> 16) & 1u, k.modecontrol & 7u, k.depthcontrol,
+        k.colormask & 0xFFFFu, k.window_offset, e.vp_w, e.vp_h, e.scissor_br,
+        e.viz_query_draws);
+  }
+  uint32_t ci = 0;
+  for (const auto& c : rt_copies_) {
+    REXLOG_INFO(
+        "[nhl-rt] C{:<2} x{:<3} pitch={:<4} msaa={} c0base={:<4} c0fmt={:<2} dbase={:<4} "
+        "src={} sample={} cmd={} clr={}{} dest=0x{:08X} dpitch={}x{} dinfo={:08X} "
+        "sc_br={:08X} woff={:08X}",
+        ci++, c.count, c.surface_info & 0x3FFFu, (c.surface_info >> 16) & 3u, c.color_info & 0xFFFu,
+        (c.color_info >> 16) & 0xFu, c.depth_info & 0xFFFu, c.copy_control & 7u,
+        (c.copy_control >> 4) & 7u, (c.copy_control >> 20) & 3u, (c.copy_control >> 8) & 1u,
+        (c.copy_control >> 9) & 1u, c.dest_base, c.dest_pitch & 0x3FFFu,
+        (c.dest_pitch >> 16) & 0x3FFFu, c.dest_info, c.scissor_br, c.window_offset);
+  }
+  // In-order sequence, "D<draw config #>x<run>" / "C<copy #>", indices as listed above.
+  std::string seq;
+  for (const auto& [id, run] : rt_seq_) {
+    char buf[24];
+    if (id & 0x8000u) {
+      std::snprintf(buf, sizeof(buf), "C%u ", id & 0x7FFFu);
+    } else {
+      std::snprintf(buf, sizeof(buf), "D%ux%u ", id, run);
+    }
+    seq += buf;
+  }
+  REXLOG_INFO("[nhl-rt] seq: {}", seq);
+  rt_draws_.clear();
+  rt_copies_.clear();
+  rt_seq_.clear();
+}
+
 // Present frame cap. On Windows the guest's presents pace themselves (60 fps in
 // menus, 30 in matches). On Linux the same build presents uncapped in menus
 // (~200+ fps, measured on a Steam Deck) - game *timing* stays correct (movies
@@ -279,6 +448,7 @@ void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   // F9 streaming capture toggle (gameplay-trace benchmark source).
   PollHotkeyCapture();
+  if (rtlog_ > 0) RtLogDump();
 
   const auto now = std::chrono::steady_clock::now();
   last_frame_draws_ = draws_this_frame_;
