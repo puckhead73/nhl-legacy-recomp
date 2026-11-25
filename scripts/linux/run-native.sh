@@ -10,4 +10,11 @@ if [ -z "$XAUTHORITY" ]; then
   export XAUTHORITY
 fi
 export NHL_VK_BACKEND=1
+# Fastest measured configuration on a Steam Deck: host render targets +
+# single-pass scene. Set either variable yourself to override.
+export NHL_VK_RT_PATH="${NHL_VK_RT_PATH:-fbo}"
+export NHL_SINGLE_PASS="${NHL_SINGLE_PASS:-1}"
+# Under Steam, use Steam Input's virtual gamepad instead of opening the Deck's
+# controller hardware directly (the two fight over it and input drops out).
+if [ -n "$SteamEnv" ]; then export SDL_JOYSTICK_HIDAPI_STEAMDECK="${SDL_JOYSTICK_HIDAPI_STEAMDECK:-0}"; fi
 exec ./nhllegacy "$@"

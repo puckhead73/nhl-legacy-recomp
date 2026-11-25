@@ -1,0 +1,17 @@
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index fce701ee..1b579ce1 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -377,6 +377,12 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+     shm_unlink(full_path.c_str());
+     return kFileMappingHandleInvalid;
+   }
++  // Drop the name right away: the descriptor keeps the object alive for as
++  // long as it is open or mapped, and nothing reopens it by name. Leaving the
++  // unlink to CloseFileMappingHandle leaked the whole guest memory image
++  // (several GB of tmpfs, i.e. RAM) every time the process was killed or
++  // crashed, until /dev/shm filled up and later launches died with SIGBUS.
++  shm_unlink(full_path.c_str());
+   return static_cast<FileMappingHandle>(ret);
+ #endif
+ }

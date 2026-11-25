@@ -19,6 +19,11 @@ patches=(
   # POSIX timed multi-waits busy-spun (ms truncation -> sleep_for(0)).
   "$repo/sdk/rexglue-linux-wait-spin-fix.patch"
   "$repo/sdk/rexglue-silent-audio-fallback.patch"
+  "$repo/sdk/rexglue-xma-kick-wait-fix.patch"
+  "$repo/sdk/rexglue-linux-shm-leak-fix.patch"
+  "$repo/sdk/rexglue-renderdoc-attach-check.patch"
+  "$repo/sdk/rexglue-linux-fault-recheck-fix.patch"
+  "$repo/sdk/rexglue-sdl-guide-mapping-fix.patch"
 )
 
 if [ ! -d "$sdk/.git" ]; then

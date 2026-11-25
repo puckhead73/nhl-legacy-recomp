@@ -149,6 +149,9 @@ void NhlEnhancementsDialog::OnDraw(ImGuiIO& io) {
     const bool guide = (pad.buttons & kPadGuide) != 0;
     if (guide && !prev_guide_) {
       visible_ = !visible_;
+      // Logged because an open overlay blocks the game's controller input:
+      // an unexpected toggle otherwise looks like the pad dying mid-game.
+      REXLOG_INFO("[nhl-overlay] Guide pressed - overlay {}", visible_ ? "opened" : "closed");
       if (!visible_) {
         confirm_exit_ = false;  // reset the exit confirm when closing
       }
