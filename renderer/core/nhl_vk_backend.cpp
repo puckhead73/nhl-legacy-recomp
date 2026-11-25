@@ -11,6 +11,7 @@
 #include <thread>
 #include <utility>
 
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -53,7 +54,90 @@ NhlVkGraphicsSystem::CreateCommandProcessor() {
   return std::make_unique<NhlVkCommandProcessor>(this, kernel_state());
 }
 
+// Single-pass scene rendering (NHL_SINGLE_PASS=1).
+//
+// A 1280x720 2xMSAA color+depth surface doesn't fit the 360's 10 MB EDRAM, so
+// the game renders the in-game scene TWICE, as two 640-wide halves: pass A
+// (window offset 0) and pass B (window offset -640) submit the exact same
+// draws - same shaders, textures, vertex buffers and constants (verified per
+// draw on a match trace: 284/284 and 948/948 identical) - each followed by a
+// depth + color resolve into the left / right half of the same 1280x720
+// textures. That doubles the scene's CPU (command processor) and GPU cost.
+//
+// A host GPU has no such limit, but the emulated EDRAM does, so the full-width
+// surface only fits WITHOUT MSAA: color at tile 0 and depth at tile 720, pitch
+// 1280, 1x - the same layout the game's own composite pass uses. So:
+//   - pass A draws: surface -> pitch 1280 / 1x / depth base 720, scissor 1280;
+//   - the game's 4x-aliased clears of the half surface (pitch 320, 4x, depth
+//     base 736, unclipped) -> pitch 640 / 4x / depth base 720 with a 640x360
+//     scissor (= 1280x720 samples: exactly the new color and depth extents);
+//   - pass A's resolves: same surface override, 1x sample, scissor 1280 so one
+//     resolve fills the whole destination;
+//   - pass B draws and resolves: skipped.
+// Cost: the scene loses its 2x (vertical) MSAA; use supersampling instead.
 bool NhlVkCommandProcessor::IssueDraw(
+    rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
+    rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
+    bool major_mode_explicit) {
+  static const bool single_pass = [] {
+    const char* e = std::getenv("NHL_SINGLE_PASS");
+    return e && *e && *e != '0';
+  }();
+  if (!single_pass || !register_file_) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  constexpr uint32_t kSurfaceInfo = 0x2000, kDepthInfo = 0x2002, kWindowOffset = 0x2080,
+                     kScissorBr = 0x2082, kModeControl = 0x2208, kCopyCtl = 0x2318,
+                     kCopyDestBaseReg = 0x2319;
+  auto& rf = *register_file_;
+  const uint32_t si = rf[kSurfaceInfo], di = rf[kDepthInfo];
+  const uint32_t pitch = si & 0x3FFFu, msaa = (si >> 16) & 3u, dbase = di & 0xFFFu;
+  const bool scene = pitch == 640 && msaa == 1 && dbase == 736;
+  const bool clear4x = pitch == 320 && msaa == 2 && dbase == 736;
+  if (!scene && !clear4x) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  const bool is_copy = (rf[kModeControl] & 7u) == 6;
+  const bool pass_b = scene && rf[kWindowOffset] != 0;
+  if (pass_b && !is_copy) {
+    ++draws_this_frame_;
+    ++single_pass_skipped_;
+    return true;  // pass B draws: already rendered by pass A
+  }
+  const uint32_t saved_si = si, saved_di = di, saved_sc = rf[kScissorBr], saved_cc = rf[kCopyCtl];
+  const uint32_t saved_wo = rf[kWindowOffset], saved_db = rf[kCopyDestBaseReg];
+  if (pass_b) {
+    // Pass B's resolves: their rectangle is the right half in screen space,
+    // shifted onto EDRAM x 0..640 by the -640 window offset, and their dest
+    // base is pre-offset to the right half of the texture. With the full-width
+    // surface the right half lives at EDRAM x 640..1280, so drop the window
+    // offset - the resolve then adds the x=640 dest offset itself, so take the
+    // game's pre-applied offset back out of the dest base.
+    rf[kWindowOffset] = 0;
+    rf[kCopyDestBaseReg] = saved_db - uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                                          640, 0, 1280, 2));
+  }
+  if (scene) {
+    rf[kSurfaceInfo] = (si & ~0x33FFFu) | 1280u;  // pitch 1280, 1x
+    if ((saved_sc & 0x7FFFu) == 640) rf[kScissorBr] = (saved_sc & ~0x7FFFu) | 1280u;
+    if ((rf[kModeControl] & 7u) == 6) rf[kCopyCtl] = saved_cc & ~(7u << 4);  // 1x: sample 0
+  } else {
+    rf[kSurfaceInfo] = (si & ~0x3FFFu) | 640u;  // pitch 640, still 4x
+    rf[kScissorBr] = (360u << 16) | 640u;
+  }
+  rf[kDepthInfo] = (di & ~0xFFFu) | 720u;
+  const bool rv =
+      IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  rf[kSurfaceInfo] = saved_si;
+  rf[kDepthInfo] = saved_di;
+  rf[kScissorBr] = saved_sc;
+  rf[kCopyCtl] = saved_cc;
+  rf[kWindowOffset] = saved_wo;
+  rf[kCopyDestBaseReg] = saved_db;
+  return rv;
+}
+
+bool NhlVkCommandProcessor::IssueDrawImpl(
     rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
     bool major_mode_explicit) {
@@ -65,7 +149,10 @@ bool NhlVkCommandProcessor::IssueDraw(
         primitive_type, index_count, index_buffer_info, major_mode_explicit);
   }
   if (rtlog_ < 0) rtlog_ = std::getenv("NHL_VK_RTLOG") ? 1 : 0;
-  if (rtlog_) RtLogDraw();
+  if (rtlog_) {
+    RtLogDraw();
+    RtLogPassSig(uint32_t(primitive_type), index_count);
+  }
   // Resolve experiment env once.
   if (!exp_resolved_) {
     exp_skip_dxt3_ = std::getenv("NHL_VK_SKIP_DXT3") != nullptr;
@@ -308,6 +395,41 @@ void NhlVkCommandProcessor::RtLogDraw() {
   s->scissor_br = rf[kWindowScissorBr];
 }
 
+
+// Per-draw signatures of the two half-screen scene passes (2xMSAA pitch-640
+// surface, window offset 0 vs -640), to check whether pass B re-submits exactly
+// pass A's draws. sig1 = shaders + primitive + textures + vertex buffers;
+// sig2 = the first 64 float-constant vectors (transforms).
+namespace {
+struct PassSig { uint64_t state, consts; };
+std::vector<PassSig> g_pass_sigs[2];
+uint64_t Fnv(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+  return h;
+}
+}  // namespace
+
+void NhlVkCommandProcessor::RtLogPassSig(uint32_t prim, uint32_t index_count) {
+  const auto& rf = *register_file_;
+  const uint32_t si = rf[0x2000];
+  if ((si & 0x3FFFu) != 640 || ((si >> 16) & 3u) != 1 || (rf[0x2208] & 7u) != 4) return;
+  if ((rf[0x2002] & 0xFFFu) != 736) return;
+  if ((rf[0x2104] & 0xFFFFu) == 0 && (rf[0x2200] & 7u) == 0) return;  // tiny no-write query draws
+  const int pass = rf[0x2080] ? 1 : 0;
+  uint64_t h = Fnv(&prim, 4);
+  h = Fnv(&index_count, 4, h);
+  const uint64_t vs = active_vertex_shader() ? active_vertex_shader()->ucode_data_hash() : 0;
+  const uint64_t ps = active_pixel_shader() ? active_pixel_shader()->ucode_data_hash() : 0;
+  h = Fnv(&vs, 8, h);
+  h = Fnv(&ps, 8, h);
+  h = Fnv(&rf.values[0x4800], 192 * 4, h);  // fetch constants (textures + vertex buffers)
+  h = Fnv(&rf.values[0x2200], 4, h);        // depth control
+  h = Fnv(&rf.values[0x2104], 4, h);        // color mask
+  const uint64_t c = Fnv(&rf.values[0x4000], 64 * 4 * 4);
+  if (g_pass_sigs[pass].size() < 4096) g_pass_sigs[pass].push_back({h, c});
+}
+
 bool NhlVkCommandProcessor::IssueCopy() {
   if (rtlog_ > 0 && register_file_) {
     const auto& rf = *register_file_;
@@ -397,6 +519,20 @@ void NhlVkCommandProcessor::RtLogDump() {
     seq += buf;
   }
   REXLOG_INFO("[nhl-rt] seq: {}", seq);
+  {
+    const auto& a = g_pass_sigs[0];
+    const auto& b = g_pass_sigs[1];
+    size_t same_state = 0, same_consts = 0;
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+      same_state += a[i].state == b[i].state;
+      same_consts += a[i].consts == b[i].consts;
+    }
+    REXLOG_INFO("[nhl-rt] scene passes: A={} draws, B={} draws, same state {}/{}, same consts {}/{}",
+                a.size(), b.size(), same_state, n, same_consts, n);
+    g_pass_sigs[0].clear();
+    g_pass_sigs[1].clear();
+  }
   rt_draws_.clear();
   rt_copies_.clear();
   rt_seq_.clear();

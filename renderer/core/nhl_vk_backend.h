@@ -115,7 +115,12 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
  public:
   bool IssueCopy() override;
  private:
+  bool IssueDrawImpl(rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
+                     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
+                     bool major_mode_explicit);
+  uint64_t single_pass_skipped_ = 0;
   void RtLogDraw();
+  void RtLogPassSig(uint32_t prim, uint32_t index_count);
   void RtLogDump();
   struct RtDrawKey {
     uint32_t surface_info, color_info, color1_info, depth_info, modecontrol, depthcontrol,
