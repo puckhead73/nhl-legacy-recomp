@@ -24,6 +24,7 @@ patches=(
   "$repo/sdk/rexglue-renderdoc-attach-check.patch"
   "$repo/sdk/rexglue-linux-fault-recheck-fix.patch"
   "$repo/sdk/rexglue-sdl-guide-mapping-fix.patch"
+  "$repo/sdk/rexglue-idle-cpu-fixes.patch"
 )
 
 if [ ! -d "$sdk/.git" ]; then

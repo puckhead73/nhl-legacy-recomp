@@ -52,7 +52,8 @@ $patches = @($patch, (Join-Path $repo "sdk\rexglue-codegen-bcctr-tail-fix.patch"
              (Join-Path $repo "sdk\rexglue-linux-shm-leak-fix.patch"),
              (Join-Path $repo "sdk\rexglue-renderdoc-attach-check.patch"),
              (Join-Path $repo "sdk\rexglue-linux-fault-recheck-fix.patch"),
-             (Join-Path $repo "sdk\rexglue-sdl-guide-mapping-fix.patch"))
+             (Join-Path $repo "sdk\rexglue-sdl-guide-mapping-fix.patch"),
+             (Join-Path $repo "sdk\rexglue-idle-cpu-fixes.patch"))
 foreach ($p in $patches) {
     $pname = Split-Path -Leaf $p
     git -C $SdkDir apply --check $p 2>$null

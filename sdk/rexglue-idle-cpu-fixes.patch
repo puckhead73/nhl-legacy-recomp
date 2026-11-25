@@ -1,0 +1,121 @@
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index 5cfea058..9604f18d 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -10,12 +10,16 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <condition_variable>
+ #include <forward_list>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+ #include <disruptorplus/sequence_barrier.hpp>
+-#include <disruptorplus/spin_wait_strategy.hpp>
++#include <disruptorplus/sequence.hpp>
+ 
+ #include <rex/assert.h>
+ #include <rex/thread.h>
+@@ -23,6 +27,64 @@
+ 
+ namespace dp = disruptorplus;
+ 
++namespace {
++
++// Condition-variable wait strategy for the timer ring buffer.
++// disruptorplus::blocking_wait_strategy has this shape but its timed overloads
++// pass (lock, predicate, time) to std::condition_variable, which does not
++// compile, so the queue was built on spin_wait_strategy instead.
++class BlockingWaitStrategy {
++ public:
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[]) {
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait(lock, [&]() -> bool {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  template <typename Rep, typename Period>
++  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
++                                      const std::atomic<dp::sequence_t>* const sequences[],
++                                      const std::chrono::duration<Rep, Period>& timeout) {
++    return wait_until_published(sequence, count, sequences,
++                                std::chrono::steady_clock::now() + timeout);
++  }
++
++  template <typename Clock, typename Duration>
++  dp::sequence_t wait_until_published(
++      dp::sequence_t sequence, size_t count,
++      const std::atomic<dp::sequence_t>* const sequences[],
++      const std::chrono::time_point<Clock, Duration>& timeout_time) {
++    if (timeout_time == std::chrono::time_point<Clock, Duration>::max()) {
++      return wait_until_published(sequence, count, sequences);
++    }
++    dp::sequence_t result;
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.wait_until(lock, timeout_time, [&]() -> bool {
++      result = dp::minimum_sequence_after(sequence, count, sequences);
++      return dp::difference(result, sequence) >= 0;
++    });
++    return result;
++  }
++
++  void signal_all_when_blocking() {
++    // Under the lock, so a waiter cannot miss this between checking the
++    // sequences and going to sleep.
++    std::unique_lock<std::mutex> lock(mutex_);
++    cv_.notify_all();
++  }
++
++ private:
++  std::mutex mutex_;
++  std::condition_variable cv_;
++};
++
++}  // namespace
++
+ namespace rex::thread {
+ 
+ using WaitItem = TimerQueueWaitItem;
+@@ -142,9 +204,13 @@ class TimerQueue {
+   // This ring buffer will be used to introduce timers queued by the public API
+   static constexpr size_t kWaitCount = 512;
+   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
+-  dp::spin_wait_strategy wait_strategy_;
+-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
+-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
++  // Blocking, not spinning: the dispatch thread waits here until the next timer
++  // is due or a new one is queued. With the spin strategy it yield-looped the
++  // whole time any timer was pending (always, in practice), which kept a core
++  // awake for nothing - about 15% of one on a Steam Deck during a match.
++  BlockingWaitStrategy wait_strategy_;
++  dp::multi_threaded_claim_strategy<BlockingWaitStrategy> claim_strategy_;
++  dp::sequence_barrier<BlockingWaitStrategy> consumed_;
+ 
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -445,9 +445,14 @@
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
++#ifndef NDEBUG
++  // Debug builds only: the lookup is a large switch and this runs for every
++  // register write in the command stream (several percent of the command
++  // thread in a match) just to feed a debug-level log line.
+   if (!regs.GetRegisterInfo(index)) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
++#endif
+ 
+   // Scratch register writeback.
+   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
