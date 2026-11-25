@@ -18,6 +18,7 @@ patches=(
   "$repo/sdk/rexglue-codegen-bcctr-tail-fix.patch"
   # POSIX timed multi-waits busy-spun (ms truncation -> sleep_for(0)).
   "$repo/sdk/rexglue-linux-wait-spin-fix.patch"
+  "$repo/sdk/rexglue-silent-audio-fallback.patch"
 )
 
 if [ ! -d "$sdk/.git" ]; then

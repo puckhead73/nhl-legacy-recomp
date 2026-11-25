@@ -15,6 +15,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <chrono>
+#include <cstdio>
 #include <thread>
 #include <vector>
 
@@ -275,18 +277,17 @@ class NhllegacyApp : public rex::ReXApp {
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
           _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
-#if !defined(_WIN32)
-        // Linux default: delayed ("fast") readback instead of a full GPU drain
-        // per resolve. The SDK honors NHL_VK_READBACK_MODE (read once at the
-        // first resolve). On a Steam Deck the per-resolve drains left CPU and
-        // GPU waiting on each other (GPU ~62% busy at half clock): fast took
-        // matches from ~21 to ~28 fps with equipment composites still correct
-        // (they land one frame later). Windows keeps "full" (validated there).
+        // Default: delayed ("fast") readback instead of a full GPU drain per
+        // resolve. The SDK honors NHL_VK_READBACK_MODE (read once at the first
+        // resolve). The per-resolve drains left CPU and GPU waiting on each
+        // other: on a Steam Deck fast took matches from ~21 to ~28 fps, and on
+        // a desktop the command thread spent ~42% of a match frame in them
+        // (unattended matches: median 102 -> 144 fps, vsync off). Equipment
+        // composites stay correct (they land one frame later).
         // Set NHL_VK_READBACK_MODE=full to restore the old behavior.
         if (!std::getenv("NHL_VK_READBACK_MODE")) {
           _putenv_s("NHL_VK_READBACK_MODE", "fast");
         }
-#endif
         REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
                     "size gate {} B, mode override {})",
                     std::getenv("NHL_VK_READBACK_MAX_LEN"),
@@ -759,6 +760,37 @@ class NhllegacyApp : public rex::ReXApp {
       }).detach();
     }
 #endif
+    // NHL_AUTOSHOT=<seconds>: every that many seconds write the presented guest
+    // image to autoshot_NNN.png next to the exe. For unattended runs (see
+    // NHL_AUTOPLAY), where nobody is watching the window.
+    if (const char* s = std::getenv("NHL_AUTOSHOT"); s && *s) {
+      const unsigned secs = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+      if (secs) {
+        std::thread([this, secs]() {
+          for (unsigned n = 0;; ++n) {
+            std::this_thread::sleep_for(std::chrono::seconds(secs));
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+            auto* presenter = gs ? gs->presenter() : nullptr;
+            rex::ui::RawImage img;
+            if (!presenter || !presenter->CaptureGuestOutput(img) || !img.width || !img.height) {
+              continue;
+            }
+            std::vector<uint8_t> rgba(static_cast<size_t>(img.width) * img.height * 4);
+            for (uint32_t y = 0; y < img.height; ++y) {
+              for (uint32_t x = 0; x < img.width; ++x) {
+                const uint8_t* src = img.data.data() + static_cast<size_t>(y) * img.stride + x * 4;
+                uint8_t* d = rgba.data() + (static_cast<size_t>(y) * img.width + x) * 4;
+                d[0] = src[0]; d[1] = src[1]; d[2] = src[2]; d[3] = 255;
+              }
+            }
+            char name[32];
+            std::snprintf(name, sizeof(name), "autoshot_%03u.png", n);
+            nhl::replay::WritePng((rex::filesystem::GetExecutableFolder() / name).string(),
+                                  img.width, img.height, rgba.data());
+          }
+        }).detach();
+      }
+    }
     // Stage B of the Overall-formula hunt (overall_weights_dump.h). With
     // NHL_DUMP_OVERALL_WEIGHTS set, the image is already mapped into guest
     // memory by Setup, so scan it for the gCardOverallWeights_* anchors +

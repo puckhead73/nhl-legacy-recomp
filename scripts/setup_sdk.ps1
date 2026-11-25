@@ -46,7 +46,8 @@ if ($LASTEXITCODE -ne 0) { throw "git submodule update failed" }
 #    - the POSIX wait spin fix (Linux-only code; harmless on Windows, applied so
 #      both checkouts stay identical)
 $patches = @($patch, (Join-Path $repo "sdk\rexglue-codegen-bcctr-tail-fix.patch"),
-             (Join-Path $repo "sdk\rexglue-linux-wait-spin-fix.patch"))
+             (Join-Path $repo "sdk\rexglue-linux-wait-spin-fix.patch"),
+             (Join-Path $repo "sdk\rexglue-silent-audio-fallback.patch"))
 foreach ($p in $patches) {
     $pname = Split-Path -Leaf $p
     git -C $SdkDir apply --check $p 2>$null
