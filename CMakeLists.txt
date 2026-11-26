@@ -9,7 +9,30 @@ project(nhllegacy LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(generated/rexglue.cmake)
+# generated/rexglue.cmake is written by `rexglue init` next to the (untracked)
+# recompiled sources. A fresh checkout has neither, so fall back to an in-tree copy
+# of the same SDK template; it picks up generated/default/sources.cmake once codegen
+# has run, and until then lets the host code configure + compile on its own.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/rexglue.cmake")
+    include(generated/rexglue.cmake)
+else()
+    include(cmake/rexglue_fallback.cmake)
+endif()
+
+# The D3D12 side of the tree: the beta owned-D3D12 backend (renderer/core/
+# nhl_command_processor.cpp), the high-cut plume path (gpu/hooks/plume_present.cpp +
+# its D3D12/plume deps) and the path-C SPIR-V translator port (gpu/spirv/*). All of
+# it is reference-only (docs/current-status.md) and needs the Windows SDK, so it is
+# ON only for Windows builds. Linux / ARM64 / Switch builds are Vulkan-only.
+if(WIN32)
+    set(_nhl_d3d12_default ON)
+else()
+    set(_nhl_d3d12_default OFF)
+endif()
+option(NHLLEGACY_D3D12 "Build the reference D3D12 beta backend + high-cut plume path (Windows only)" ${_nhl_d3d12_default})
+if(NHLLEGACY_D3D12 AND NOT WIN32)
+    message(FATAL_ERROR "NHLLEGACY_D3D12 needs Windows (D3D12/DXGI); configure with -DNHLLEGACY_D3D12=OFF")
+endif()
 
 # Sources
 set(NHLLEGACY_SOURCES
@@ -26,6 +49,9 @@ set(NHLLEGACY_SOURCES
     # Env-gated (NHL_PIN_PCORES, default ON); no-op on AMD / non-hybrid CPUs. Called
     # from NhllegacyApp::OnPreSetup before any threads spin up.
     src/cpu_affinity.cpp
+    # Portable stand-ins for the few Win32 APIs the host code uses (VirtualQuery,
+    # hard exit, setenv, byteswap, ...). Pass-through to <windows.h> on Windows.
+    src/platform/host_compat.cpp
     # High-cut engine (H-1): D3D9 logical resource graph — pass-through hooks that
     # build the EDRAM-free RT/texture/resolve graph. Env-gated (NHL_HIGHCUT); no
     # behavior change. Supersedes the M1 correlation tap (gpu/hooks/d3d9_tap.cpp,
@@ -42,6 +68,21 @@ set(NHLLEGACY_SOURCES
     # (NHL_ANIM_DECODE); Milestone 0 validates the host->guest call mechanism on the
     # leaf decode fns. See docs cba-format.md §6.
     src/anim_decode.cpp
+    # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
+    # with per-file .dds -> .rx2 texture synthesis in the lower tree.
+    src/union_device.cpp
+    src/loose_tree_device.cpp
+    # Stage-1 texture-injection registry + sidecar (auto address->asset mapping).
+    src/injection_registry.cpp
+    # Trace replay + image dump, shared with tools/replay. Enables the in-host
+    # replay-and-screenshot mode (NHL_REPLAY_XTR=<frame.xtr>): replays a captured
+    # frame through the live backend + presenter and writes replay_frame.png.
+    tools/replay/src/xtr_player.cpp
+    tools/replay/src/image_dump.cpp
+)
+
+if(NHLLEGACY_D3D12)
+    list(APPEND NHLLEGACY_SOURCES
     # High-cut engine (H-2): first plume-driven frame — an in-process plume D3D12
     # swapchain driven by the guest Present hook. Env-gated (NHL_HIGHCUT_PRESENT).
     gpu/hooks/plume_present.cpp
@@ -63,21 +104,15 @@ set(NHLLEGACY_SOURCES
     gpu/spirv/spirv_shader.cc
     # Const data tables the SDK declares (ucode.h / util/draw.h) but doesn't export.
     gpu/spirv/spirv_translator_tables.cc
-    # Loose-file overlay: union-mount _compiled over the cache: scratch dir,
-    # with per-file .dds -> .rx2 texture synthesis in the lower tree.
-    src/union_device.cpp
-    src/loose_tree_device.cpp
-    # Stage-1 texture-injection registry + sidecar (auto address->asset mapping).
-    src/injection_registry.cpp
     # Custom renderer backend (Sprint 1: log-and-delegate over the SDK front-end)
     renderer/core/nhl_graphics_system.cpp
     renderer/core/nhl_command_processor.cpp
-    # Trace replay + image dump, shared with tools/replay. Enables the in-host
-    # replay-and-screenshot mode (NHL_REPLAY_XTR=<frame.xtr>): replays a captured
-    # frame through the live backend + presenter and writes replay_frame.png.
-    tools/replay/src/xtr_player.cpp
-    tools/replay/src/image_dump.cpp
-)
+    )
+else()
+    # d3d9_resources.cpp drives HighcutPlumeTick() once per guest Present; without
+    # the plume path it is a no-op stub.
+    list(APPEND NHLLEGACY_SOURCES gpu/hooks/highcut_stubs.cpp)
+endif()
 
 if(WIN32)
     add_executable(nhllegacy WIN32 ${NHLLEGACY_SOURCES})
@@ -86,12 +121,24 @@ else()
 endif()
 
 rexglue_setup_target(nhllegacy)
+if(NHLLEGACY_D3D12)
+    target_compile_definitions(nhllegacy PRIVATE NHL_HAVE_D3D12_BACKEND=1)
+endif()
 
 # SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend is
 # a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips). When
 # CMAKE_PREFIX_PATH points at an SDK built with it ON, enable this to compile the
 # NHL_VK_BACKEND env gate (src/nhllegacy_app.h) and link the Vulkan graphics system.
-option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" OFF)
+# Off Windows there is no D3D12 fallback, so Vulkan is the only renderer.
+if(NHLLEGACY_D3D12)
+    set(_nhl_vk_default OFF)
+else()
+    set(_nhl_vk_default ON)
+endif()
+option(NHLLEGACY_VULKAN_BACKEND "Link the SDK's Vulkan ROV backend (needs an SDK built with REXGLUE_USE_VULKAN=ON)" ${_nhl_vk_default})
+if(NOT NHLLEGACY_D3D12 AND NOT NHLLEGACY_VULKAN_BACKEND)
+    message(FATAL_ERROR "No renderer: enable NHLLEGACY_VULKAN_BACKEND (NHLLEGACY_D3D12 is off)")
+endif()
 if(NHLLEGACY_VULKAN_BACKEND)
     target_compile_definitions(nhllegacy PRIVATE NHL_HAVE_VULKAN_BACKEND=1)
     # Compiled ONLY in the Vulkan build dir — links the SDK's Vulkan backend symbols
@@ -108,6 +155,7 @@ if(NHLLEGACY_VULKAN_BACKEND)
     message(STATUS "nhllegacy: Vulkan backend gate ENABLED (NHL_HAVE_VULKAN_BACKEND)")
 endif()
 
+if(NHLLEGACY_D3D12)
 # High-cut engine (H-2): vendored plume RHI (MIT, third_party/plume). Built as a
 # static lib in its own directory scope (C++17, its own backends) and linked into
 # nhllegacy so gpu/hooks/plume_present.cpp can drive an in-process plume swapchain
@@ -178,17 +226,49 @@ endif()
 # root to the include path makes the SDK's `#include <SPIRV/SpvBuilder.h>` resolve.
 target_link_libraries(nhllegacy PRIVATE SPIRV)
 target_include_directories(nhllegacy PRIVATE "${glslang_SOURCE_DIR}")
+else()
+    # The SDK's installed Vulkan headers (rex/graphics/pipeline/shader/spirv_builder.h,
+    # pulled in by nhl_vk_backend / the app) #include <SPIRV/SpvBuilder.h>, but the SDK
+    # install does not ship glslang's headers. The D3D12 build gets them from the
+    # glslang FetchContent above; here point at the SDK's own pinned glslang checkout
+    # (matches the installed libSPIRV.a). Headers only - nothing from it is linked.
+    set(_glslang_guess "")
+    foreach(_cand
+            "${REXSDK_DIR}/thirdparty/glslang"
+            "${rexglue_DIR}/../../../../../../thirdparty/glslang"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk/thirdparty/glslang")
+        if(EXISTS "${_cand}/SPIRV/SpvBuilder.h")
+            get_filename_component(_glslang_guess "${_cand}" ABSOLUTE)
+            break()
+        endif()
+    endforeach()
+    set(NHLLEGACY_GLSLANG_INCLUDE_DIR "${_glslang_guess}" CACHE PATH
+        "glslang source root providing SPIRV/SpvBuilder.h (the SDK's thirdparty/glslang)")
+    if(NOT EXISTS "${NHLLEGACY_GLSLANG_INCLUDE_DIR}/SPIRV/SpvBuilder.h")
+        message(FATAL_ERROR "SPIRV/SpvBuilder.h not found. Set NHLLEGACY_GLSLANG_INCLUDE_DIR "
+                            "to the SDK source tree's thirdparty/glslang.")
+    endif()
+    target_include_directories(nhllegacy SYSTEM PRIVATE "${NHLLEGACY_GLSLANG_INCLUDE_DIR}")
+endif()  # NHLLEGACY_D3D12
 
 # snappy (for .xtr trace decompression in the in-host replay mode). Statically
 # linked into rexruntime.dll but not re-exported, so link it directly; lib name
 # is config-specific. SDK lib dir derived from the package config location.
 get_filename_component(_rexsdk_lib "${rexglue_DIR}/../.." ABSOLUTE)
-target_link_libraries(nhllegacy PRIVATE
-    $<$<CONFIG:Debug>:${_rexsdk_lib}/snappyd.lib>
-    $<$<CONFIG:RelWithDebInfo>:${_rexsdk_lib}/snappyrd.lib>
-    $<$<CONFIG:Release>:${_rexsdk_lib}/snappy.lib>
-    $<$<CONFIG:MinSizeRel>:${_rexsdk_lib}/snappy.lib>
-)
+set(_snappy_pre "${_rexsdk_lib}/${CMAKE_STATIC_LIBRARY_PREFIX}snappy")
+set(_snappy_suf "${CMAKE_STATIC_LIBRARY_SUFFIX}")
+if(TARGET snappy)
+    # SDK consumed from its source tree (REXSDK_DIR): the target is in scope.
+    target_link_libraries(nhllegacy PRIVATE snappy)
+else()
+    target_link_libraries(nhllegacy PRIVATE
+        $<$<CONFIG:Debug>:${_snappy_pre}d${_snappy_suf}>
+        $<$<CONFIG:RelWithDebInfo>:${_snappy_pre}rd${_snappy_suf}>
+        $<$<CONFIG:Release>:${_snappy_pre}${_snappy_suf}>
+        $<$<CONFIG:MinSizeRel>:${_snappy_pre}${_snappy_suf}>
+        $<$<CONFIG:>:${_snappy_pre}${_snappy_suf}>
+    )
+endif()
 
 # rex/ui/renderdoc_api.h does `#include <renderdoc_app.h>`, which lives in the
 # SDK's include/renderdoc subdir (not on the default -isystem include path). Add
@@ -210,6 +290,20 @@ if(WIN32 AND EXISTS "${RX2FFI_LIB}")
 else()
     message(WARNING "tdb-rx2-ffi not found at ${RX2FFI_LIB}; loose .dds texture "
                     "override disabled (build it: cargo build -p tdb-rx2-ffi --release)")
+endif()
+
+# Cross builds (e.g. aarch64 from x86_64): the SDK's nhllegacy_codegen target runs
+# $<TARGET_FILE:rex::rexglue>, an IMPORTED executable, and CMake does not prepend
+# CMAKE_CROSSCOMPILING_EMULATOR to imported targets - so it would exec an aarch64
+# binary on the build host. Provide a variant that runs it under the emulator
+# (qemu-user; see cmake/toolchains/linux-aarch64-clang.cmake).
+if(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR AND TARGET rex::rexglue)
+    add_custom_target(nhllegacy_codegen_emu
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:rex::rexglue>
+                codegen ${CMAKE_CURRENT_SOURCE_DIR}/nhllegacy_manifest.toml
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Generating recompiled code for nhllegacy (rexglue under ${CMAKE_CROSSCOMPILING_EMULATOR})"
+        VERBATIM)
 endif()
 
 # End-user packager CLI (disc dump -> playable install). See tools/packager/.

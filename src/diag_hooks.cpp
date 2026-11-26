@@ -27,13 +27,7 @@
 #include <cstring>
 #include <thread>
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
+#include "platform/host_compat.h"  // VirtualQuery, GetTickCount, _byteswap_* (portable)
 
 #include <rex/graphics/graphics_system.h>
 #include <rex/hook.h>
@@ -617,6 +611,9 @@ extern "C" REX_FUNC(sub_827C2848) {
   std::fclose(f);
 }
 
+#if defined(_WIN32)
+// Windows-only: relies on a vectored exception handler + VirtualProtect + the
+// x64 CONTEXT (Rip). NHL_VP6_TRAP is a one-off RE aid; not ported.
 // --- Plane write-origin trap (env NHL_VP6_TRAP=<hex phys addr>) --------------
 // Locates WHICH recompiled function writes the VP6 luma plane ring (the two
 // known VP3-family IDCTs sub_827D2FE8/sub_82898660 do NOT run during the
@@ -771,6 +768,8 @@ static const int g_vp6_trap_init = [] {
   }).detach();
   return 0;
 }();
+
+#endif  // _WIN32 (NHL_VP6_TRAP)
 
 // Frame driver tap: dump the codec object (r3) at entry, find plane-candidate
 // pointers inside it (physical-alloc range), and dump a slice of each plane

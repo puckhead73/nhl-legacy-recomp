@@ -9,7 +9,7 @@
 //   input : the SDK's NtCreateFile exports the last opened *.vp6 guest path
 //           in the NHL_VP6_LAST_OPEN process env var; the movie-setup hook
 //           (sub_8277ABB8) maps it to a host file under --game_data_root.
-//   decode: ffmpeg.exe (PATH or NHL_VP6_FFMPEG) is spawned per movie with
+//   decode: ffmpeg (ffmpeg.exe on Windows; PATH or NHL_VP6_FFMPEG) is spawned per movie with
 //           "-f rawvideo -pix_fmt yuv420p pipe:1"; a reader thread buffers
 //           the raw frames (bounded).
 //   output: the plane-publish hook (sub_8277CC98, see diag_hooks.cpp) calls
@@ -25,6 +25,8 @@
 #include "vp6_bridge.h"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -36,13 +38,18 @@
 #include <thread>
 #include <vector>
 
-#ifndef NOMINMAX
-#define NOMINMAX
+#include <filesystem>
+
+#include "platform/host_compat.h"  // _strnicmp, GetTickCount, env helpers
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
 #endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 
 namespace {
 
@@ -74,8 +81,13 @@ struct BridgeState {
   std::mutex m;
   std::condition_variable cv;
   std::string host_path;   // current movie file on host
+#if defined(_WIN32)
   HANDLE proc = nullptr;   // ffmpeg child
   HANDLE pipe_rd = nullptr;
+#else
+  pid_t proc = 0;          // ffmpeg child
+  int pipe_rd = -1;
+#endif
   std::thread reader;
   // Frame-granular FIFO: whole decoded frames as moved vectors. NEVER buffer
   // the raw byte stream in a std::deque<uint8_t> - MSVC's deque uses 16-byte
@@ -97,7 +109,31 @@ BridgeState& S() {
 constexpr size_t kMaxFrames = 24;             // decoded frames queued ahead
 constexpr size_t kMaxStaging = 32ull << 20;   // pre-first-publish cap
 
-void ReaderThread(HANDLE pipe_rd) {
+#if defined(_WIN32)
+using PipeHandle = HANDLE;
+// Blocking read; false on EOF/error.
+bool ReadPipe(PipeHandle h, uint8_t* buf, size_t cap, size_t* got) {
+  DWORD n = 0;
+  if (!ReadFile(h, buf, DWORD(cap), &n, nullptr) || n == 0) return false;
+  *got = n;
+  return true;
+}
+#else
+using PipeHandle = int;
+bool ReadPipe(PipeHandle fd, uint8_t* buf, size_t cap, size_t* got) {
+  for (;;) {
+    const ssize_t n = ::read(fd, buf, cap);
+    if (n > 0) {
+      *got = size_t(n);
+      return true;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    return false;  // EOF, or the fd was shut down by StopMovie
+  }
+}
+#endif
+
+void ReaderThread(PipeHandle pipe_rd) {
   std::vector<uint8_t> chunk(1 << 20);
   for (;;) {
     if (S().reader_stop.load()) break;
@@ -114,9 +150,8 @@ void ReaderThread(HANDLE pipe_rd) {
       if (S().frame_size.load() == 0 && S().staging.size() >= kMaxStaging)
         continue;
     }
-    DWORD got = 0;
-    if (!ReadFile(pipe_rd, chunk.data(), DWORD(chunk.size()), &got, nullptr) ||
-        got == 0) {
+    size_t got = 0;
+    if (!ReadPipe(pipe_rd, chunk.data(), chunk.size(), &got)) {
       S().eof.store(true);
       std::lock_guard<std::mutex> lk(S().m);
       S().cv.notify_all();
@@ -143,6 +178,7 @@ void StopMovie() {
   BridgeState& s = S();
   s.reader_stop.store(true);
   s.cv.notify_all();
+#if defined(_WIN32)
   if (s.pipe_rd) CancelIoEx(s.pipe_rd, nullptr);
   if (s.reader.joinable()) s.reader.join();
   if (s.pipe_rd) CloseHandle(s.pipe_rd);
@@ -152,6 +188,16 @@ void StopMovie() {
   }
   s.pipe_rd = nullptr;
   s.proc = nullptr;
+#else
+  // Kill the child first: its stdout closes, so a reader blocked in read()
+  // returns 0 and the thread exits.
+  if (s.proc > 0) ::kill(s.proc, SIGKILL);
+  if (s.reader.joinable()) s.reader.join();
+  if (s.pipe_rd >= 0) ::close(s.pipe_rd);
+  if (s.proc > 0) ::waitpid(s.proc, nullptr, 0);
+  s.pipe_rd = -1;
+  s.proc = 0;
+#endif
   s.reader_stop.store(false);
   s.eof.store(false);
   std::lock_guard<std::mutex> lk(s.m);
@@ -161,9 +207,14 @@ void StopMovie() {
 
 std::string FfmpegPath() {
   if (const char* e = std::getenv("NHL_VP6_FFMPEG"); e && *e) return e;
+#if defined(_WIN32)
   return "ffmpeg.exe";  // PATH
+#else
+  return "ffmpeg";  // PATH (posix_spawnp)
+#endif
 }
 
+#if defined(_WIN32)
 bool StartMovie(const std::string& host_path) {
   BridgeState& s = S();
   StopMovie();
@@ -202,12 +253,69 @@ bool StartMovie(const std::string& host_path) {
   BridgeLog("spawned ffmpeg for %s", host_path.c_str());
   return true;
 }
+#else
+bool StartMovie(const std::string& host_path) {
+  BridgeState& s = S();
+  StopMovie();
+  int fds[2];
+  if (::pipe2(fds, O_CLOEXEC) != 0) return false;
+  // Same bounded-pipe intent as the 8 MB CreatePipe buffer (best effort).
+  ::fcntl(fds[0], F_SETPIPE_SZ, 8 << 20);
+  const std::string ffmpeg = FfmpegPath();
+  std::vector<std::string> args = {ffmpeg, "-v", "error", "-i", host_path,
+                                   "-map", "0:v:0", "-f", "rawvideo",
+                                   "-pix_fmt", "yuv420p", "pipe:1"};
+  std::vector<char*> argv;
+  for (auto& a : args) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);  // dup2 clears CLOEXEC
+  pid_t pid = 0;
+  const int err = ::posix_spawnp(&pid, ffmpeg.c_str(), &fa, nullptr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  ::close(fds[1]);
+  if (err != 0) {
+    ::close(fds[0]);
+    BridgeLog("spawn FAILED err=%d (%s) ffmpeg=%s", err, std::strerror(err), ffmpeg.c_str());
+    s.host_path = host_path;  // don't retry the spawn per frame
+    return false;
+  }
+  s.proc = pid;
+  s.pipe_rd = fds[0];
+  s.host_path = host_path;
+  s.frames_served = 0;
+  s.reader = std::thread(ReaderThread, fds[0]);
+  BridgeLog("spawned ffmpeg for %s", host_path.c_str());
+  return true;
+}
+#endif
 
 // Map a guest VFS path (game:\..., cache:\..., update:\...) to a host file
 // under --game_data_root (parsed from the command line).
 std::string GameDataRoot() {
   static const std::string root = [] {
+#if defined(_WIN32)
     std::string cl = GetCommandLineA();
+#else
+    // argv joined with spaces, quoting args that contain one, so the parser
+    // below sees the same shape as GetCommandLineA.
+    std::string cl;
+    if (std::FILE* f = std::fopen("/proc/self/cmdline", "rb")) {
+      std::string arg;
+      int c;
+      auto flush = [&] {
+        if (!cl.empty()) cl += ' ';
+        cl += arg.find(' ') != std::string::npos ? "\"" + arg + "\"" : arg;
+        arg.clear();
+      };
+      while ((c = std::fgetc(f)) != EOF) {
+        if (c == 0) flush(); else arg += char(c);
+      }
+      if (!arg.empty()) flush();
+      std::fclose(f);
+    }
+#endif
     const char* key = "--game_data_root";
     size_t p = cl.find(key);
     if (p == std::string::npos) return std::string();
@@ -229,6 +337,11 @@ std::string GameDataRoot() {
 std::string MapGuestPath(std::string g) {
   for (auto& c : g)
     if (c == '/') c = '\\';
+#if defined(_WIN32)
+  const std::string sep = "\\";
+#else
+  const std::string sep = "/";
+#endif
   auto strip = [&](const char* pfx) -> bool {
     size_t n = std::strlen(pfx);
     if (g.size() > n && _strnicmp(g.c_str(), pfx, n) == 0) {
@@ -239,12 +352,19 @@ std::string MapGuestPath(std::string g) {
   };
   std::string root = GameDataRoot();
   if (root.empty()) return {};
-  if (strip("game:\\")) return root + "\\" + g;
+  auto host = [&](std::string rel) {
+#if !defined(_WIN32)
+    for (auto& c : rel)
+      if (c == '\\') c = '/';
+#endif
+    return root + sep + rel;
+  };
+  if (strip("game:\\")) return host(g);
   // cache:\X overlays game_data_root\_compiled\X (loose-asset tree).
-  if (strip("cache:\\")) return root + "\\_compiled\\" + g;
-  if (strip("update:\\")) return root + "\\" + g;
+  if (strip("cache:\\")) return host("_compiled\\" + g);
+  if (strip("update:\\")) return host(g);
   // Raw device path - try as-is under the root.
-  return root + "\\" + g;
+  return host(g);
 }
 
 }  // namespace
@@ -254,25 +374,24 @@ std::string MapGuestPath(std::string g) {
 // lazily from the publish hook too.
 static void MaybeStartFromEnv(const char* who) {
   std::string host;
-  char hostbuf[512] = {};
-  DWORD hn = GetEnvironmentVariableA("NHL_VP6_LAST_OPEN_HOST", hostbuf,
-                                     sizeof(hostbuf));
-  if (hn && hn < sizeof(hostbuf)) {
+  // Process env, not the CRT copy: the producers (loose_tree_device.cpp, and the
+  // SDK's NtCreateFile when built with sdk/rexglue-vp6-sharedmem-fixes.patch)
+  // publish via SetEnvironmentVariableA (setenv off Windows).
+  std::string hostbuf = nhl_host::GetProcessEnv("NHL_VP6_LAST_OPEN_HOST");
+  if (!hostbuf.empty()) {
     host = hostbuf;  // loose-tree open: already a host path
   } else {
-    char guest[512] = {};
-    DWORD n =
-        GetEnvironmentVariableA("NHL_VP6_LAST_OPEN", guest, sizeof(guest));
-    if (!n || n >= sizeof(guest)) return;
+    std::string guest = nhl_host::GetProcessEnv("NHL_VP6_LAST_OPEN");
+    if (guest.empty()) return;
     host = MapGuestPath(guest);
   }
   // Already decoding it - or already tried and failed (don't respawn per
   // frame; StartMovie records the path on spawn failure).
   if (host == S().host_path) return;
-  DWORD attrs = GetFileAttributesA(host.c_str());
-  BridgeLog("%s: host='%s' exists=%d", who, host.c_str(),
-            attrs != INVALID_FILE_ATTRIBUTES);
-  if (attrs == INVALID_FILE_ATTRIBUTES) return;
+  std::error_code ec;
+  const bool exists = std::filesystem::exists(host, ec);
+  BridgeLog("%s: host='%s' exists=%d", who, host.c_str(), int(exists));
+  if (!exists) return;
   StartMovie(host);
 }
 

@@ -15,6 +15,12 @@
 // Windows headers are confined to this TU (the widely-included nhllegacy_app.h
 // deliberately avoids <windows.h>); the app calls the plain extern below.
 
+#if !defined(_WIN32)
+// Non-Windows: the hybrid-core problem is Windows/Intel-specific (Linux's EAS /
+// ITMT scheduler already prefers P-cores; Tegra X1 has no hybrid cores). No-op.
+void rex_pin_pcores_if_hybrid() {}
+#else
+
 #include <windows.h>
 
 #include <cstdio>
@@ -106,3 +112,5 @@ void rex_pin_pcores_if_hybrid() {
                  GetLastError());
   }
 }
+
+#endif  // _WIN32

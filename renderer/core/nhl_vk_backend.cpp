@@ -13,8 +13,13 @@
 #include <rex/logging.h>
 
 // Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
-// <windows.h> out of this TU, mirroring the D3D12 path).
+// <windows.h> out of this TU, mirroring the D3D12 path). Elsewhere the portable
+// stub reports "up" (F9 capture is a Windows dev aid until an SDL poll lands).
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
+#else
+static short GetAsyncKeyState(int /*v_key*/) { return 0; }
+#endif
 
 namespace nhl::graphics {
 

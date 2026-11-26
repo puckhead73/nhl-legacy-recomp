@@ -35,15 +35,7 @@
 #include <vector>
 #include <string>
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include "platform/host_compat.h"  // VirtualQuery (portable)
 
 namespace nhllegacy {
 
@@ -257,7 +249,6 @@ done:
 // VA `a` -> host `vbase + a`; host `h` -> guest VA `(uint32_t)(h - vbase)`.
 // ---------------------------------------------------------------------------
 
-#if defined(_WIN32)
 // True if [vbase+gva, +len) is committed and readable.
 inline bool rt_readable(const uint8_t* vbase, uint32_t gva, size_t len) {
   const uint8_t* p = vbase + gva;
@@ -398,6 +389,5 @@ after_scan:
        total_hits, double(scanned_bytes) / (1024.0 * 1024.0));
   if (out != stderr) std::fclose(out);
 }
-#endif  // _WIN32
 
 }  // namespace nhllegacy

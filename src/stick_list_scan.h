@@ -21,19 +21,10 @@
 #include <cstring>
 #include <vector>
 
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
+#include "platform/host_compat.h"  // VirtualQuery (portable)
 
 namespace nhllegacy {
 
-#if defined(_WIN32)
 
 // The 23 stick model IDs the picker currently shows (capture nhllegacy_055.log,
 // user-confirmed count). Any other selectable-list would still be dense in this
@@ -147,6 +138,5 @@ inline void ScanStickList(const uint8_t* vbase, const char* out_path) {
   if (out != stderr) std::fclose(out);
 }
 
-#endif  // _WIN32
 
 }  // namespace nhllegacy
