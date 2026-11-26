@@ -422,7 +422,12 @@ class NhllegacyApp : public rex::ReXApp {
       // so apply the persisted overlay choices here before SetupPresentation.
 #if defined(REX_HAS_FIDELITYFX_SDK)
       {
-        const std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+        // The persisted overlay choice (nhl_enhancements.ini: ffx_effect);
+        // NHL_PRESENT_EFFECT=bilinear|cas|fsr is a launch-time override.
+        std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+        if (const char* e = std::getenv("NHL_PRESENT_EFFECT"); e && *e) {
+          effect = e;
+        }
         if (effect != "bilinear") {
           REXCVAR_SET(present_effect, effect);
           REXCVAR_SET(present_cas_additional_sharpness,

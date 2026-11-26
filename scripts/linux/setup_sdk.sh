@@ -25,6 +25,8 @@ patches=(
   "$repo/sdk/rexglue-linux-fault-recheck-fix.patch"
   "$repo/sdk/rexglue-sdl-guide-mapping-fix.patch"
   "$repo/sdk/rexglue-idle-cpu-fixes.patch"
+  # CAS / FSR 1 present effects without the (MSVC-only) FidelityFX library.
+  "$repo/sdk/rexglue-fidelityfx-headers-only.patch"
 )
 
 if [ ! -d "$sdk/.git" ]; then
