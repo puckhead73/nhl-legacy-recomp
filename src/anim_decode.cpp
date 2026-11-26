@@ -5,7 +5,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include "platform/host_compat.h"  // VirtualQuery (portable)
 
 #include <algorithm>
 #include <cstdarg>

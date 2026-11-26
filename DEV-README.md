@@ -73,6 +73,16 @@ the `$<NOT:$<CONFIG:Release>>` profiling gate). On Intel hybrid CPUs the port
 pins itself to the P-cores at startup (`NHL_PIN_PCORES`, default on; set `=0` to
 disable).
 
+## Linux / ARM64 build (Switch port)
+
+`NHLLEGACY_D3D12` (default ON only on Windows) controls the reference D3D12 beta
+backend and the high-cut plume path. With it off the build is Vulkan-only and
+configures on Linux, both native and cross-compiled to aarch64 with
+`cmake/toolchains/linux-aarch64-clang.cmake`. Use `scripts/setup_sdk.sh`, then
+`scripts/build_linux.sh arm64`. Full steps, status and known gaps are in
+[docs/switch-port/linux-arm64-build.md](docs/switch-port/linux-arm64-build.md).
+The Switch/Horizon roadmap is in [docs/switch-port/README.md](docs/switch-port/README.md).
+
 ## Cutting a release
 
 ```powershell

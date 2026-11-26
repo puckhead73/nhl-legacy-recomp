@@ -71,7 +71,7 @@ inline uint32_t G32(uint8_t* base, uint32_t addr) {
     uint32_t v = 0;
     std::memcpy(&v, base + addr, 4);
 #if defined(_MSC_VER)
-    return _byteswap_ulong(v);
+    return __builtin_bswap32(v);  // clang/gcc on every host
 #else
     return __builtin_bswap32(v);
 #endif

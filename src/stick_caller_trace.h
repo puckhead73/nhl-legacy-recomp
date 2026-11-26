@@ -61,6 +61,10 @@ inline void CaptureStickCaller(const char* stick_name, const char* out_path) {
   if (f != stderr) std::fclose(f);
 }
 
+#else
+// Host stack capture is Windows-only (RtlCaptureStackBackTrace + PE module RVAs
+// for offline .pdb symbolization). No-op elsewhere.
+inline void CaptureStickCaller(const char* /*stick_name*/, const char* /*out_path*/) {}
 #endif  // _WIN32
 
 }  // namespace nhllegacy
