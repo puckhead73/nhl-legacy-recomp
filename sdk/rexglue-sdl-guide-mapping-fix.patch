@@ -1,0 +1,28 @@
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index bdef5857..a09340c8 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -552,15 +552,19 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+           X_INPUT_GAMEPAD_DPAD_RIGHT,
+           // There are additional buttons only available on some controllers.
+           // For now just assign sensible defaults
+-          // Misc:
+-          X_INPUT_GAMEPAD_GUIDE,
++          // Misc (share / mute / capture / Steam Deck "..."): not a Guide
++          // button. Mapping it (and the touchpad click below) to Guide made a
++          // stray press toggle any Guide-bound host UI - on a Steam Deck, where
++          // the trackpads sit under the thumbs, that silently opened the
++          // title's overlay, which blocks guest input.
++          0,
+           // Xbox Elite paddles:
+           X_INPUT_GAMEPAD_Y,
+           X_INPUT_GAMEPAD_B,
+           X_INPUT_GAMEPAD_X,
+           X_INPUT_GAMEPAD_A,
+-          // PS touchpad button
+-          X_INPUT_GAMEPAD_GUIDE,
++          // PS touchpad button / Steam Deck trackpad click (see Misc above)
++          0,
+       };
+   static_assert(SDL_GAMEPAD_BUTTON_SOUTH == 0);
+   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);

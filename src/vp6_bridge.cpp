@@ -9,7 +9,7 @@
 //   input : the SDK's NtCreateFile exports the last opened *.vp6 guest path
 //           in the NHL_VP6_LAST_OPEN process env var; the movie-setup hook
 //           (sub_8277ABB8) maps it to a host file under --game_data_root.
-//   decode: ffmpeg.exe (PATH or NHL_VP6_FFMPEG) is spawned per movie with
+//   decode: ffmpeg (PATH or NHL_VP6_FFMPEG) is spawned per movie with
 //           "-f rawvideo -pix_fmt yuv420p pipe:1"; a reader thread buffers
 //           the raw frames (bounded).
 //   output: the plane-publish hook (sub_8277CC98, see diag_hooks.cpp) calls
@@ -21,21 +21,31 @@
 //
 // Audio is untouched (the guest EA-audio path has always been correct); sync
 // is inherently guest-paced because we only swap pixels at publish time.
+//
+// Platform layer: the child process + pipe handling (Child*) is the only
+// OS-specific part - CreateProcess/ReadFile on Windows, posix_spawn/read on
+// Linux. Linux also resolves guest paths case-insensitively, since the guest
+// asks for e.g. "EAlogo.vp6" while extracted files are lower-case.
 
 #include "vp6_bridge.h"
 
 #include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -43,6 +53,15 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <strings.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char** environ;
+#endif
 
 namespace {
 
@@ -68,14 +87,174 @@ void BridgeLog(const char* fmt, ...) {
   std::fclose(f);
 }
 
+unsigned long TickMs() {
+  using namespace std::chrono;
+  return (unsigned long)duration_cast<milliseconds>(
+             steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string GetEnvStr(const char* name) {
+#if defined(_WIN32)
+  // SetEnvironmentVariableA (used by the loose-tree device) does not update the
+  // CRT getenv table, so read the process environment block directly.
+  char buf[512] = {};
+  DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+  if (!n || n >= sizeof(buf)) return {};
+  return buf;
+#else
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : std::string();
+#endif
+}
+
+// ---- child process (ffmpeg) -------------------------------------------------
+
+struct Child {
+#if defined(_WIN32)
+  HANDLE proc = nullptr;
+  HANDLE pipe_rd = nullptr;
+#else
+  pid_t pid = -1;
+  int pipe_rd = -1;
+#endif
+  bool running() const {
+#if defined(_WIN32)
+    return proc != nullptr;
+#else
+    return pid > 0;
+#endif
+  }
+};
+
+std::string FfmpegPath() {
+  if (const char* e = std::getenv("NHL_VP6_FFMPEG"); e && *e) return e;
+#if defined(_WIN32)
+  return "ffmpeg.exe";  // beside the exe, else PATH
+#else
+  // Prefer an ffmpeg shipped beside the executable, else PATH.
+  std::error_code ec;
+  auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+  if (!ec) {
+    auto local = exe.parent_path() / "ffmpeg";
+    if (access(local.c_str(), X_OK) == 0) return local.string();
+  }
+  return "ffmpeg";
+#endif
+}
+
+// Spawn ffmpeg decoding `host_path` to raw yuv420p on its stdout.
+bool ChildSpawn(const std::string& host_path, Child& out) {
+  const std::string ffmpeg = FfmpegPath();
+#if defined(_WIN32)
+  SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe(&rd, &wr, &sa, 8 << 20)) return false;
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  std::string cmd = "\"" + ffmpeg + "\" -v error -i \"" + host_path +
+                    "\" -map 0:v:0 -f rawvideo -pix_fmt yuv420p pipe:1";
+  STARTUPINFOA si{};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr;
+  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  PROCESS_INFORMATION pi{};
+  std::vector<char> cmdbuf(cmd.begin(), cmd.end());
+  cmdbuf.push_back(0);
+  BOOL ok = CreateProcessA(nullptr, cmdbuf.data(), nullptr, nullptr, TRUE,
+                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+  CloseHandle(wr);
+  if (!ok) {
+    CloseHandle(rd);
+    BridgeLog("spawn FAILED err=%lu cmd=%s", GetLastError(), cmd.c_str());
+    return false;
+  }
+  CloseHandle(pi.hThread);
+  out.proc = pi.hProcess;
+  out.pipe_rd = rd;
+  return true;
+#else
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0) return false;
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+  std::vector<std::string> args = {ffmpeg,      "-v",       "error",
+                                   "-i",        host_path,  "-map",
+                                   "0:v:0",     "-f",       "rawvideo",
+                                   "-pix_fmt",  "yuv420p",  "pipe:1"};
+  std::vector<char*> argv;
+  for (auto& a : args) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  pid_t pid = -1;
+  int rc = posix_spawnp(&pid, ffmpeg.c_str(), &fa, nullptr, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(fds[1]);
+  if (rc != 0) {
+    close(fds[0]);
+    BridgeLog("spawn FAILED err=%d (%s) ffmpeg=%s", rc, std::strerror(rc),
+              ffmpeg.c_str());
+    return false;
+  }
+  out.pid = pid;
+  out.pipe_rd = fds[0];
+  return true;
+#endif
+}
+
+// Blocking read from the child's stdout. Returns bytes read; 0 on EOF/error.
+size_t ChildRead(const Child& c, uint8_t* buf, size_t len) {
+#if defined(_WIN32)
+  DWORD got = 0;
+  if (!ReadFile(c.pipe_rd, buf, DWORD(len), &got, nullptr)) return 0;
+  return got;
+#else
+  for (;;) {
+    ssize_t n = read(c.pipe_rd, buf, len);
+    if (n < 0 && errno == EINTR) continue;
+    return n > 0 ? size_t(n) : 0;
+  }
+#endif
+}
+
+// Unblock a pending ChildRead (called before joining the reader thread).
+void ChildCancelRead(Child& c) {
+#if defined(_WIN32)
+  if (c.pipe_rd) CancelIoEx(c.pipe_rd, nullptr);
+#else
+  // Killing the writer makes the blocked read() return EOF.
+  if (c.pid > 0) kill(c.pid, SIGTERM);
+#endif
+}
+
+void ChildClose(Child& c) {
+#if defined(_WIN32)
+  if (c.pipe_rd) CloseHandle(c.pipe_rd);
+  if (c.proc) {
+    TerminateProcess(c.proc, 0);
+    CloseHandle(c.proc);
+  }
+  c.pipe_rd = nullptr;
+  c.proc = nullptr;
+#else
+  if (c.pipe_rd >= 0) close(c.pipe_rd);
+  if (c.pid > 0) {
+    kill(c.pid, SIGTERM);
+    int status = 0;
+    waitpid(c.pid, &status, 0);
+  }
+  c.pipe_rd = -1;
+  c.pid = -1;
+#endif
+}
+
 // ---- movie decode state ------------------------------------------------------
 
 struct BridgeState {
   std::mutex m;
   std::condition_variable cv;
   std::string host_path;   // current movie file on host
-  HANDLE proc = nullptr;   // ffmpeg child
-  HANDLE pipe_rd = nullptr;
+  Child child;             // ffmpeg child + its stdout pipe
   std::thread reader;
   // Frame-granular FIFO: whole decoded frames as moved vectors. NEVER buffer
   // the raw byte stream in a std::deque<uint8_t> - MSVC's deque uses 16-byte
@@ -97,7 +276,7 @@ BridgeState& S() {
 constexpr size_t kMaxFrames = 24;             // decoded frames queued ahead
 constexpr size_t kMaxStaging = 32ull << 20;   // pre-first-publish cap
 
-void ReaderThread(HANDLE pipe_rd) {
+void ReaderThread(Child child) {
   std::vector<uint8_t> chunk(1 << 20);
   for (;;) {
     if (S().reader_stop.load()) break;
@@ -114,9 +293,8 @@ void ReaderThread(HANDLE pipe_rd) {
       if (S().frame_size.load() == 0 && S().staging.size() >= kMaxStaging)
         continue;
     }
-    DWORD got = 0;
-    if (!ReadFile(pipe_rd, chunk.data(), DWORD(chunk.size()), &got, nullptr) ||
-        got == 0) {
+    const size_t got = ChildRead(child, chunk.data(), chunk.size());
+    if (got == 0) {
       S().eof.store(true);
       std::lock_guard<std::mutex> lk(S().m);
       S().cv.notify_all();
@@ -143,15 +321,9 @@ void StopMovie() {
   BridgeState& s = S();
   s.reader_stop.store(true);
   s.cv.notify_all();
-  if (s.pipe_rd) CancelIoEx(s.pipe_rd, nullptr);
+  ChildCancelRead(s.child);
   if (s.reader.joinable()) s.reader.join();
-  if (s.pipe_rd) CloseHandle(s.pipe_rd);
-  if (s.proc) {
-    TerminateProcess(s.proc, 0);
-    CloseHandle(s.proc);
-  }
-  s.pipe_rd = nullptr;
-  s.proc = nullptr;
+  ChildClose(s.child);
   s.reader_stop.store(false);
   s.eof.store(false);
   std::lock_guard<std::mutex> lk(s.m);
@@ -159,46 +331,20 @@ void StopMovie() {
   s.staging.clear();
 }
 
-std::string FfmpegPath() {
-  if (const char* e = std::getenv("NHL_VP6_FFMPEG"); e && *e) return e;
-  return "ffmpeg.exe";  // PATH
-}
-
 bool StartMovie(const std::string& host_path) {
   BridgeState& s = S();
   StopMovie();
-  SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-  HANDLE rd = nullptr, wr = nullptr;
-  if (!CreatePipe(&rd, &wr, &sa, 8 << 20)) return false;
-  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-  std::string cmd = "\"" + FfmpegPath() +
-                    "\" -v error -i \"" + host_path +
-                    "\" -map 0:v:0 -f rawvideo -pix_fmt yuv420p pipe:1";
-  STARTUPINFOA si{};
-  si.cb = sizeof(si);
-  si.dwFlags = STARTF_USESTDHANDLES;
-  si.hStdOutput = wr;
-  si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-  PROCESS_INFORMATION pi{};
-  std::vector<char> cmdbuf(cmd.begin(), cmd.end());
-  cmdbuf.push_back(0);
-  BOOL ok = CreateProcessA(nullptr, cmdbuf.data(), nullptr, nullptr, TRUE,
-                           CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-  CloseHandle(wr);
-  if (!ok) {
-    CloseHandle(rd);
-    BridgeLog("spawn FAILED err=%lu cmd=%s", GetLastError(), cmd.c_str());
+  Child c;
+  if (!ChildSpawn(host_path, c)) {
     // Remember the path so the publish hook doesn't retry the spawn per
     // frame (e.g. ffmpeg not installed) - the guest's own frames show.
     s.host_path = host_path;
     return false;
   }
-  CloseHandle(pi.hThread);
-  s.proc = pi.hProcess;
-  s.pipe_rd = rd;
+  s.child = c;
   s.host_path = host_path;
   s.frames_served = 0;
-  s.reader = std::thread(ReaderThread, rd);
+  s.reader = std::thread(ReaderThread, c);
   BridgeLog("spawned ffmpeg for %s", host_path.c_str());
   return true;
 }
@@ -207,8 +353,9 @@ bool StartMovie(const std::string& host_path) {
 // under --game_data_root (parsed from the command line).
 std::string GameDataRoot() {
   static const std::string root = [] {
-    std::string cl = GetCommandLineA();
     const char* key = "--game_data_root";
+#if defined(_WIN32)
+    std::string cl = GetCommandLineA();
     size_t p = cl.find(key);
     if (p == std::string::npos) return std::string();
     p += std::strlen(key);
@@ -222,16 +369,79 @@ std::string GameDataRoot() {
       v = cl.substr(p, q - p);
     }
     return v;
+#else
+    // argv is NUL-separated in /proc/self/cmdline; accept "--key value" and
+    // "--key=value".
+    std::vector<std::string> args;
+    if (FILE* f = std::fopen("/proc/self/cmdline", "rb")) {
+      std::string cur;
+      for (int ch; (ch = std::fgetc(f)) != EOF;) {
+        if (ch == 0) {
+          args.push_back(cur);
+          cur.clear();
+        } else {
+          cur.push_back(char(ch));
+        }
+      }
+      std::fclose(f);
+    }
+    const size_t klen = std::strlen(key);
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (args[i] == key && i + 1 < args.size()) return args[i + 1];
+      if (args[i].compare(0, klen, key) == 0 && args[i].size() > klen &&
+          args[i][klen] == '=')
+        return args[i].substr(klen + 1);
+    }
+    // Same default as the app (OnConfigurePaths): exe-relative game/.
+    std::error_code ec;
+    auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    return ec ? std::string() : (exe.parent_path() / "game").string();
+#endif
   }();
   return root;
 }
+
+#if !defined(_WIN32)
+// Join `rel` (backslash-separated guest path) onto `root`, matching each
+// component case-insensitively against what's on disk. Falls back to the
+// literal spelling for components that don't exist (the caller checks).
+std::string ResolveCi(const std::string& root, const std::string& rel) {
+  namespace fs = std::filesystem;
+  fs::path cur = root;
+  size_t start = 0;
+  while (start <= rel.size()) {
+    size_t end = rel.find('\\', start);
+    if (end == std::string::npos) end = rel.size();
+    std::string comp = rel.substr(start, end - start);
+    start = end + 1;
+    if (comp.empty()) continue;
+    std::error_code ec;
+    fs::path exact = cur / comp;
+    if (!fs::exists(exact, ec)) {
+      for (const auto& de : fs::directory_iterator(cur, ec)) {
+        const std::string name = de.path().filename().string();
+        if (strcasecmp(name.c_str(), comp.c_str()) == 0) {
+          exact = de.path();
+          break;
+        }
+      }
+    }
+    cur = exact;
+  }
+  return cur.string();
+}
+#endif
 
 std::string MapGuestPath(std::string g) {
   for (auto& c : g)
     if (c == '/') c = '\\';
   auto strip = [&](const char* pfx) -> bool {
     size_t n = std::strlen(pfx);
+#if defined(_WIN32)
     if (g.size() > n && _strnicmp(g.c_str(), pfx, n) == 0) {
+#else
+    if (g.size() > n && strncasecmp(g.c_str(), pfx, n) == 0) {
+#endif
       g = g.substr(n);
       return true;
     }
@@ -239,12 +449,28 @@ std::string MapGuestPath(std::string g) {
   };
   std::string root = GameDataRoot();
   if (root.empty()) return {};
-  if (strip("game:\\")) return root + "\\" + g;
-  // cache:\X overlays game_data_root\_compiled\X (loose-asset tree).
-  if (strip("cache:\\")) return root + "\\_compiled\\" + g;
-  if (strip("update:\\")) return root + "\\" + g;
-  // Raw device path - try as-is under the root.
-  return root + "\\" + g;
+  std::string base = root;
+  if (strip("game:\\")) {
+  } else if (strip("cache:\\")) {
+    // cache:\X overlays game_data_root\_compiled\X (loose-asset tree).
+#if defined(_WIN32)
+    base = root + "\\_compiled";
+#else
+    base = root + (root.back() == '/' ? "" : "/") + "_compiled";
+#endif
+  } else {
+    strip("update:\\");  // update:\ and raw device paths: as-is under root
+  }
+#if defined(_WIN32)
+  return base + "\\" + g;
+#else
+  return ResolveCi(base, g);
+#endif
+}
+
+bool HostFileExists(const std::string& p) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(p, ec);
 }
 
 }  // namespace
@@ -253,26 +479,20 @@ std::string MapGuestPath(std::string g) {
 // file open happens asynchronously AFTER the movie-setup call, so this runs
 // lazily from the publish hook too.
 static void MaybeStartFromEnv(const char* who) {
-  std::string host;
-  char hostbuf[512] = {};
-  DWORD hn = GetEnvironmentVariableA("NHL_VP6_LAST_OPEN_HOST", hostbuf,
-                                     sizeof(hostbuf));
-  if (hn && hn < sizeof(hostbuf)) {
-    host = hostbuf;  // loose-tree open: already a host path
-  } else {
-    char guest[512] = {};
-    DWORD n =
-        GetEnvironmentVariableA("NHL_VP6_LAST_OPEN", guest, sizeof(guest));
-    if (!n || n >= sizeof(guest)) return;
+  std::string host = GetEnvStr("NHL_VP6_LAST_OPEN_HOST");
+  if (host.empty()) {
+    // Loose-tree open sets the host path directly; otherwise map the guest
+    // path the SDK recorded.
+    std::string guest = GetEnvStr("NHL_VP6_LAST_OPEN");
+    if (guest.empty()) return;
     host = MapGuestPath(guest);
   }
   // Already decoding it - or already tried and failed (don't respawn per
   // frame; StartMovie records the path on spawn failure).
   if (host == S().host_path) return;
-  DWORD attrs = GetFileAttributesA(host.c_str());
-  BridgeLog("%s: host='%s' exists=%d", who, host.c_str(),
-            attrs != INVALID_FILE_ATTRIBUTES);
-  if (attrs == INVALID_FILE_ATTRIBUTES) return;
+  const bool exists = HostFileExists(host);
+  BridgeLog("%s: host='%s' exists=%d", who, host.c_str(), exists ? 1 : 0);
+  if (!exists) return;
   StartMovie(host);
 }
 
@@ -286,7 +506,7 @@ void Vp6BridgePublish(uint8_t* y, uint8_t* u, uint8_t* v, uint32_t w,
   if (!BridgeOn()) return;
   MaybeStartFromEnv("publish");
   BridgeState& s = S();
-  if (!s.proc) return;
+  if (!s.child.running()) return;
   const size_t ysz = size_t(w) * h;
   const size_t csz = size_t(w / 2) * (h / 2);
   const size_t fsz = ysz + 2 * csz;
@@ -343,7 +563,6 @@ void Vp6BridgePublish(uint8_t* y, uint8_t* u, uint8_t* v, uint32_t w,
   ++s.frames_served;
   if (s.frames_served % 120 == 0) {
     BridgeLog("served %llu frames tick=%lu queue=%zu",
-              (unsigned long long)s.frames_served,
-              (unsigned long)GetTickCount(), s.frames.size());
+              (unsigned long long)s.frames_served, TickMs(), s.frames.size());
   }
 }

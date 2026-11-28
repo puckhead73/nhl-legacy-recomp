@@ -1,0 +1,38 @@
+diff --git a/include/rex/audio/xma/context.h b/include/rex/audio/xma/context.h
+index 5298d1eb..2439c8e6 100644
+--- a/include/rex/audio/xma/context.h
++++ b/include/rex/audio/xma/context.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <array>
+ #include <atomic>
+ #include <mutex>
+@@ -216,10 +217,23 @@ class XmaContext {
+       work_completion_event_->Set();
+     }
+   }
++  // Called by the thread that kicked this context, to see the decoded data
++  // before it continues. The worker only signals after a Work() pass that
++  // found the context enabled, so an unbounded wait here hangs the caller for
++  // good whenever that pass never happens: another thread disabled the
++  // context first, two threads kicked it and the single (auto-reset) signal
++  // woke only one, or it was never allocated. Wait on the state instead: until
++  // the worker has claimed the context (or it stopped being runnable), then
++  // until an in-flight decode has released the context lock. The event is
++  // just the prompt wakeup.
+   void WaitForWorkDone() {
+-    if (work_completion_event_) {
+-      rex::thread::Wait(work_completion_event_.get(), false);
++    while (is_allocated() && is_enabled()) {
++      if (!work_completion_event_) {
++        break;
++      }
++      rex::thread::Wait(work_completion_event_.get(), false, std::chrono::milliseconds(1));
+     }
++    Block(false);
+   }
+ 
+  private:

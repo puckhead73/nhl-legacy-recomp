@@ -6,7 +6,7 @@ REM nest ~145 chars below the build dir, and MSBuild hard-fails past MAX_PATH
 REM (260). Under third_party\rexglue-sdk\out\...\_deps the in-tree build_vk
 REM blows the limit; %USERPROFILE% keeps it well under.
 if not defined FFX_BUILD_DIR set "FFX_BUILD_DIR=%USERPROFILE%\_ffxbuild\vk"
-cmake -S "%FFXAPI%" -B "%FFX_BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 ^
+cmake -S "%FFXAPI%" -B "%FFX_BUILD_DIR%" -G "%FFX_VS_GENERATOR%" -A x64 ^
   -DFFX_API_BACKEND=VK_X64 -DFFX_API_AUTO_COMPILE_SHADERS=ON
 if errorlevel 1 exit /b 1
 cmake --build "%FFX_BUILD_DIR%" --config Release --parallel

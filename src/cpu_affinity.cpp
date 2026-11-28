@@ -14,6 +14,13 @@
 //
 // Windows headers are confined to this TU (the widely-included nhllegacy_app.h
 // deliberately avoids <windows.h>); the app calls the plain extern below.
+//
+// Non-Windows: no-op. Linux has no CPU-set "EfficiencyClass" equivalent wired up
+// here, and the Steam Deck's Zen 2 APU isn't hybrid anyway.
+
+#if !defined(_WIN32)
+void rex_pin_pcores_if_hybrid() {}
+#else
 
 #include <windows.h>
 
@@ -106,3 +113,4 @@ void rex_pin_pcores_if_hybrid() {
                  GetLastError());
   }
 }
+#endif  // _WIN32

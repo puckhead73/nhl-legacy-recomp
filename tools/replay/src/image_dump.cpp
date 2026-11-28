@@ -93,8 +93,8 @@ bool WritePng(const std::string& path, uint32_t width, uint32_t height, const ui
   WriteChunk(out, "IDAT", zlib);
   WriteChunk(out, "IEND", {});
 
-  FILE* f = nullptr;
-  if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
   const bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
   fclose(f);
   return ok;

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/vulkan/command_processor.h>
@@ -102,6 +103,46 @@ class NhlVkCommandProcessor : public rex::graphics::vulkan::VulkanCommandProcess
   uint64_t frames_total_ = 0;
   std::chrono::steady_clock::time_point window_start_{};
   bool started_ = false;
+
+  // Present frame cap (NHL_FPS_CAP, see IssueSwap). Deadline of the next
+  // allowed present; default-constructed = not started.
+  void ThrottlePresent();
+  std::chrono::steady_clock::time_point present_deadline_{};
+
+  // Render-target / resolve inventory (NHL_VK_RTLOG=1): per frame, every
+  // distinct EDRAM render-target configuration drawn into and every resolve,
+  // with counts - to see what the host-RT (fbo) path mishandles.
+ public:
+  bool IssueCopy() override;
+ private:
+  bool IssueDrawImpl(rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
+                     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
+                     bool major_mode_explicit);
+  uint64_t single_pass_skipped_ = 0;
+  void RtLogDraw();
+  void RtLogPassSig(uint32_t prim, uint32_t index_count);
+  void RtLogDump();
+  struct RtDrawKey {
+    uint32_t surface_info, color_info, color1_info, depth_info, modecontrol, depthcontrol,
+        colormask, window_offset;
+    bool operator==(const RtDrawKey&) const = default;
+  };
+  struct RtDrawStat {
+    RtDrawKey key;
+    uint32_t draws = 0, viz_query_draws = 0;
+    float vp_w = 0, vp_h = 0;  // largest viewport seen (2*|scale|)
+    uint32_t scissor_br = 0;
+  };
+  struct RtCopyStat {
+    uint32_t surface_info, color_info, depth_info, copy_control, dest_base, dest_pitch,
+        dest_info, scissor_br, window_offset;
+    uint32_t count = 0;
+  };
+  int rtlog_ = -1;  // -1 unresolved, 0 off, 1 on
+  std::vector<RtDrawStat> rt_draws_;
+  std::vector<RtCopyStat> rt_copies_;
+  // In-order event sequence: (index into rt_draws_ | 0x8000 for rt_copies_, run).
+  std::vector<std::pair<uint32_t, uint32_t>> rt_seq_;
 
   // F9 hotkey streaming capture (NHL_HOTKEY_CAPTURE=1): press F9 in-scene to
   // start, F9 again to stop -> gpu_trace/scene_NN/<title>_stream.xtr. Mirrors the

@@ -1,0 +1,107 @@
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index f8949cae..d8eed6e0 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -18,6 +18,9 @@
+ #include <rex/audio/audio_driver.h>
+ #include <rex/thread.h>
+ 
++#include <atomic>
++#include <thread>
++
+ #include <SDL3/SDL.h>
+ 
+ namespace rex::audio::sdl {
+@@ -37,6 +40,10 @@ class SDLAudioDriver : public AudioDriver {
+ 
+   rex::thread::Semaphore* semaphore_ = nullptr;
+ 
++  bool StartSilent();
++  std::thread silent_thread_;
++  std::atomic<bool> silent_run_{false};
++
+   SDL_AudioStream* sdl_stream_ = nullptr;
+   bool sdl_initialized_ = false;
+   uint8_t sdl_device_channels_ = 0;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 46719f3a..bfa937e4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -47,7 +48,7 @@ bool SDLAudioDriver::Initialize() {
+ 
+   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
+-    return false;
++    return StartSilent();
+   }
+   sdl_initialized_ = true;
+ 
+@@ -61,7 +62,7 @@ bool SDLAudioDriver::Initialize() {
+                                           SDLCallback, this);
+   if (!sdl_stream_) {
+     REXAPU_ERROR("SDL_OpenAudioDeviceStream() failed: {}", SDL_GetError());
+-    return false;
++    return StartSilent();
+   }
+ 
+   SDL_AudioDeviceID sdl_device = SDL_GetAudioStreamDevice(sdl_stream_);
+@@ -101,6 +102,40 @@ bool SDLAudioDriver::Initialize() {
+   return true;
+ }
+ 
++// No usable playback device (none connected, or the audio service is down):
++// keep the title running without sound. The guest's audio thread is paced by
++// the client semaphore, so a timer thread drains the queue at the real frame
++// rate (256 samples at 48 kHz) and releases the semaphore exactly as the
++// device callback would.
++bool SDLAudioDriver::StartSilent() {
++  REXAPU_WARN("No audio playback device - running without sound");
++  silent_run_.store(true);
++  silent_thread_ = std::thread([this] {
++    const auto period = std::chrono::nanoseconds(1000000000ll * channel_samples_ / frame_frequency_);
++    auto next = std::chrono::steady_clock::now();
++    while (silent_run_.load(std::memory_order_relaxed)) {
++      next += period;
++      std::this_thread::sleep_until(next);
++      bool consumed = false;
++      {
++        std::unique_lock<std::mutex> guard(frames_mutex_);
++        if (!frames_queued_.empty()) {
++          frames_unused_.push(frames_queued_.front());
++          frames_queued_.pop();
++          consumed = true;
++        }
++      }
++      if (consumed) {
++        semaphore_->Release(1, nullptr);
++      }
++      // Don't try to catch up after a long stall.
++      const auto now = std::chrono::steady_clock::now();
++      if (now - next > std::chrono::milliseconds(100)) next = now;
++    }
++  });
++  return true;
++}
++
+ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
+   float* output_frame;
+@@ -131,6 +166,10 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
++  if (silent_thread_.joinable()) {
++    silent_run_.store(false);
++    silent_thread_.join();
++  }
+   if (sdl_stream_) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;

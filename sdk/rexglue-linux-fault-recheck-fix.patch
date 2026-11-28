@@ -1,0 +1,63 @@
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b930058..a4ebbb1d 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -406,6 +406,16 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+     auto lock = global_critical_region_.Acquire();
++#if defined(__linux__)
++    // No recheck on Linux. memory::QueryProtect has no cheap implementation
++    // there - it opens and parses /proc/self/maps - and this path runs for
++    // every write-watch fault with the global lock held. In a match that was
++    // roughly a third of the guest render thread's time, with every other
++    // thread that needs the lock queued behind it. The recheck only short-cuts
++    // the race where another thread already cleared the watch; the access
++    // violation callback handles that case from its own page tables (no watch
++    // left -> page is writable in guest metadata -> resume).
++#else
+     memory::PageAccess cur_access;
+     size_t page_length = memory::page_size();
+     memory::QueryProtect(fault_host_address, page_length, cur_access);
+@@ -414,6 +424,7 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+       // Another thread has cleared this watch. Abort.
+       return true;
+     }
++#endif
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index ca7f4e86..c0e8e2c2 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -527,10 +528,17 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
+-        REXSYS_WARN(
+-            "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+-            "guest_protect {:08X})",
+-            virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        // Also reached when several threads fault on one watched page and the
++        // first has already cleared the watch (on Linux the fault handler no
++        // longer filters that case out up front), which can be hundreds of
++        // times a second - so only log the first few.
++        static std::atomic<uint32_t> recovered_log_count{0};
++        if (recovered_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
++          REXSYS_WARN(
++              "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
++              "guest_protect {:08X})",
++              virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        }
+         return true;
+       }
+     }

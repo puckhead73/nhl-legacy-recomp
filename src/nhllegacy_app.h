@@ -13,7 +13,10 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <chrono>
+#include <cstdio>
 #include <thread>
 #include <vector>
 
@@ -24,12 +27,18 @@
 #include <rex/filesystem/file.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/pipeline/texture/util.h>  // GetTiledOffset2D (replay dumps)
+#include <rex/memory.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/presenter.h>
 
+// The D3D12 graphics-system subclass is Windows-only (Linux builds the SDK's
+// Vulkan backend alone - see NHL_HAVE_VULKAN_BACKEND below).
+#if defined(_WIN32)
 #include "renderer/core/nhl_graphics_system.h"
+#endif
 // SPIKE (docs/vulkan-rov-backend-spike-prompt.md): the SDK's Vulkan ROV backend
 // is a COMPILE-TIME option (REXGLUE_USE_VULKAN, OFF in the stock win-amd64 zips).
 // The header always installs; the implementation only links against an SDK built
@@ -64,6 +73,10 @@ REXCVAR_DECLARE(bool, protect_zero);
 REXCVAR_DECLARE(bool, scribble_heap);
 REXCVAR_DECLARE(bool, vsync);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+// Host-RT (fbo) fixes, see OnPreSetup: real EDRAM extent for clip-disabled
+// 8192x8192-scissor draws, and fake occlusion results.
+REXCVAR_DECLARE(bool, execute_unclipped_draw_vs_on_cpu);
+REXCVAR_DECLARE(bool, occlusion_query_enable);
 // Audio queue depth (frames buffered before the SDL device callback underruns to
 // silence — the audible pop). Default 8 (~43 ms) is thin when the CP thread stalls
 // on resolution-scaled swap work at high SSAA and starves audio servicing; a deeper
@@ -78,7 +91,10 @@ REXCVAR_DECLARE(std::string, readback_resolve);
 // D3D12 render-target path: "rtv" (fast host path) vs "rov" (rasterizer-
 // ordered-views, accurate per-sample EDRAM — handles the in-game scene's
 // predicated tiling/overlapping resolves the rtv path renders black).
+// Defined by the SDK's D3D12 backend, which only exists on Windows.
+#if defined(_WIN32)
 REXCVAR_DECLARE(std::string, render_target_path_d3d12);
+#endif
 // TEMP black-screen diagnosis: dump the guest PM4 command stream so we can
 // count draw packets (DRAW_INDX / DRAW_INDX_2) vs swap-only frames.
 REXCVAR_DECLARE(bool, trace_gpu_stream);
@@ -125,8 +141,14 @@ REXCVAR_DECLARE(int32_t, shadow_softness);
 
 // Win32 process-exit primitives (declared directly to avoid pulling <windows.h>
 // into this widely-included header). Used only by the replay-mode fast-exit.
+// Elsewhere platform_compat.h provides POSIX equivalents (TerminateProcess on
+// the current process == _exit) plus Sleep/_putenv_s.
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) void* __stdcall GetCurrentProcess();
 extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void* handle, unsigned int code);
+#else
+#include "platform_compat.h"
+#endif
 
 #ifdef NHL_PGO_INSTRUMENT
 // PGO instrumentation profile writer (compiler-rt profile runtime, auto-linked by
@@ -181,11 +203,52 @@ class NhllegacyApp : public rex::ReXApp {
       // Vulkan backend otherwise, so rendering matches the stock path.
       config.graphics = std::make_unique<nhl::graphics::NhlVkGraphicsSystem>();
       // NOTE: the Vulkan backend only honors "fsi" (Path::kPixelShaderInterlock —
-      // the real per-tile EDRAM path the in-game 3D scene needs). ANY other value
-      // (incl. "rov") falls through to kHostRenderTargets (== D3D12 "rtv"), which
-      // renders the in-game scene black/missing. So default to fsi, not rov.
+      // the real per-tile EDRAM path). ANY other value (incl. "rov", "fbo") falls
+      // through to kHostRenderTargets (== D3D12 "rtv"). fsi stays the default;
+      // host RTs (NHL_VK_RT_PATH=fbo) are opt-in and need the two settings below.
       const char* vk_rt = std::getenv("NHL_VK_RT_PATH");
       REXCVAR_SET(render_target_path_vulkan, std::string(vk_rt ? vk_rt : "fsi"));
+      // Host-RT black in-game scene - ROOT CAUSE: the game renders the 1280x720
+      // 2xMSAA scene in two 640-wide halves (window offset -640) and, between
+      // each half's draws and its color resolve, clears depth/stencil with an
+      // EDRAM depth-only (mode 5) quad drawn through a 4xMSAA pitch-320 alias,
+      // with clipping disabled and the D3D9 8192x8192 scissor. With no viewport
+      // to bound it, the host-RT cache's draw-extent estimate is the full
+      // scissor, clamped to the whole EDRAM; EDRAM addressing wraps, so the
+      // clear's depth RT (base 736) took ownership of ALL 2048 tiles - including
+      // the scene's color at tiles 0-720 - and the resolve then dumped the
+      // clear's RT: black (only the depth-test-off HUD survived; title-dialog
+      // text lost most glyphs the same way). Running the vertex shader on the
+      // CPU for exactly these unclipped 8192 draws (SDK cvar, off by default)
+      // gives the real extent; an F9 match trace replayed through both paths
+      // then matches fsi (scene mean 75.3 vs 75.4). fsi tracks EDRAM per pixel
+      // and never needed it.
+      //
+      // Host occlusion queries off too: with host RTs, match loads hung
+      // intermittently on a Steam Deck (a game thread polling in a sleep loop,
+      // GPU idle); with queries off (fixed fake sample count, like the base CP)
+      // the repeated loads tested then did not hang. Host-RT queries count only
+      // samples passing the hardware depth test and can read 0, while under fsi
+      // (depth tested in the shader) they never do - a loader retrying until
+      // "visible" can then spin forever. A rarer load stall has since been seen
+      // with queries off too, so treat this as a mitigation, not a full cure.
+      if (vk_rt && std::string_view(vk_rt) != "fsi") {
+        REXCVAR_SET(execute_unclipped_draw_vs_on_cpu, true);
+        REXCVAR_SET(occlusion_query_enable, false);
+        REXLOG_INFO(
+            "[nhl-vk] host render targets: execute_unclipped_draw_vs_on_cpu=1, "
+            "occlusion_query_enable=0");
+      }
+#if !defined(_WIN32)
+      // The same intermittent match-load hang later hit fsi on the Deck as well
+      // (rarer); fake occlusion results then held across repeated loads on both
+      // paths, so they are the Linux default. NHL_REAL_OCCLUSION_QUERIES=1 opts
+      // back into host queries. Windows keeps them (no hang seen there).
+      if (!std::getenv("NHL_REAL_OCCLUSION_QUERIES")) {
+        REXCVAR_SET(occlusion_query_enable, false);
+        REXLOG_INFO("[nhl-vk] occlusion_query_enable=0 (fake sample counts; Linux default)");
+      }
+#endif
       // Perf measurement wants the present rate uncapped: vsync is forced on below
       // (console-pacing experiment) and would peg fps at the refresh rate, hiding
       // both headroom and dense-scene drops. NHL_VK_NO_VSYNC=1 frees it.
@@ -214,9 +277,22 @@ class NhllegacyApp : public rex::ReXApp {
         if (!std::getenv("NHL_VK_READBACK_MAX_LEN")) {
           _putenv_s("NHL_VK_READBACK_MAX_LEN", "3000000");
         }
+        // Default: delayed ("fast") readback instead of a full GPU drain per
+        // resolve. The SDK honors NHL_VK_READBACK_MODE (read once at the first
+        // resolve). The per-resolve drains left CPU and GPU waiting on each
+        // other: on a Steam Deck fast took matches from ~21 to ~28 fps, and on
+        // a desktop the command thread spent ~42% of a match frame in them
+        // (unattended matches: median 102 -> 144 fps, vsync off). Equipment
+        // composites stay correct (they land one frame later).
+        // Set NHL_VK_READBACK_MODE=full to restore the old behavior.
+        if (!std::getenv("NHL_VK_READBACK_MODE")) {
+          _putenv_s("NHL_VK_READBACK_MODE", "fast");
+        }
         REXLOG_INFO("[nhl-vk] resolve readback enabled (readback_resolve=full, "
-                    "size gate {} B)",
-                    std::getenv("NHL_VK_READBACK_MAX_LEN"));
+                    "size gate {} B, mode override {})",
+                    std::getenv("NHL_VK_READBACK_MAX_LEN"),
+                    std::getenv("NHL_VK_READBACK_MODE") ? std::getenv("NHL_VK_READBACK_MODE")
+                                                        : "none");
       }
       // Deepen the audio queue on the Vulkan/SSAA path: at >=2x the CP thread
       // stalls on resolution-scaled swap/fence work and starves the guest audio
@@ -241,9 +317,16 @@ class NhllegacyApp : public rex::ReXApp {
       REXCVAR_SET(guide_button, true);
       REXLOG_INFO("[nhl-vk-spike] Vulkan backend selected (render_target_path_vulkan={})",
                   vk_rt ? vk_rt : "fsi");
-    } else
+    }
+#if defined(_WIN32)
+    else
 #endif
+#endif
+#if defined(_WIN32)
+    // D3D12 fallback (NHL_VK_BACKEND_OFF). Linux has no D3D12; there the Vulkan
+    // backend above is the only renderer.
     config.graphics = std::make_unique<nhl::graphics::NhlD3D12GraphicsSystem>();
+#endif
     REXCVAR_SET(protect_zero, false);  // see comment at REXCVAR_DECLARE above
     // NHL Legacy reads heap fields it never wrote (sub_82705510 record walk);
     // it relies on allocations being zero-filled like Xenia/Windows provide.
@@ -260,7 +343,9 @@ class NhllegacyApp : public rex::ReXApp {
     // green flash/overlay artifacts come from skipped fetches.
     REXCVAR_SET(gpu_allow_invalid_fetch_constants, true);
     // Accurate EDRAM path (in-game scene renders black under the rtv path).
+#if defined(_WIN32)
     REXCVAR_SET(render_target_path_d3d12, std::string("rov"));
+#endif
     // Black-screen diagnosis: flip to true to dump the guest PM4 stream to
     // gpu_trace/<title>_stream.xtr (~5MB / 25s boot). Parse with
     // tools/parse_gpu_trace.py / trace_resolve_analysis.py. Xenia accepts the
@@ -337,7 +422,12 @@ class NhllegacyApp : public rex::ReXApp {
       // so apply the persisted overlay choices here before SetupPresentation.
 #if defined(REX_HAS_FIDELITYFX_SDK)
       {
-        const std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+        // The persisted overlay choice (nhl_enhancements.ini: ffx_effect);
+        // NHL_PRESENT_EFFECT=bilinear|cas|fsr is a launch-time override.
+        std::string effect = nhl::LoadFfxEffect(/*fallback=*/"bilinear");
+        if (const char* e = std::getenv("NHL_PRESENT_EFFECT"); e && *e) {
+          effect = e;
+        }
         if (effect != "bilinear") {
           REXCVAR_SET(present_effect, effect);
           REXCVAR_SET(present_cas_additional_sharpness,
@@ -395,10 +485,12 @@ class NhllegacyApp : public rex::ReXApp {
     // Opt-in D3D12 debug layer (NHL_BETA_D3D12_DEBUG): must be set before the
     // provider creates the device. Used to get the exact device-removal reason
     // while debugging the beta owned-draw path.
+#if defined(_WIN32)
     if (std::getenv("NHL_BETA_D3D12_DEBUG")) {
       REXCVAR_SET(d3d12_debug, true);
       REXLOG_INFO("[nhl-beta] D3D12 debug layer enabled via NHL_BETA_D3D12_DEBUG");
     }
+#endif
     // Opt-in verbose SDK logging (NHL_LOG_LEVEL=debug|trace): surfaces the texture
     // cache's per-texture create/load actions (TextureKey::LogAction) for diagnosing
     // textures that bind but sample zero.
@@ -417,6 +509,8 @@ class NhllegacyApp : public rex::ReXApp {
     // assumes — SetGraphicsRootDescriptorTable(5) then faults the draw. Bindful
     // makes the base CP, our PipelineCache, and our hand-written binding code
     // agree. Gated on beta so default gameplay keeps the faster bindless path.
+    // (D3D12-only, so Windows-only.)
+#if defined(_WIN32)
     if (const char* be = std::getenv("NHL_BACKEND"); be && std::strcmp(be, "beta") == 0) {
       REXCVAR_SET(d3d12_bindless, false);
       REXLOG_INFO("[nhl-beta] forcing bindful descriptor path (d3d12_bindless=false) for beta");
@@ -440,6 +534,7 @@ class NhllegacyApp : public rex::ReXApp {
         REXLOG_INFO("[nhl-beta] d3d12_tiled_shared_memory = false (full buffer)");
       }
     }
+#endif
   }
 
   // End-user installs assembled by tools/packager ship game data in a
@@ -670,6 +765,37 @@ class NhllegacyApp : public rex::ReXApp {
       }).detach();
     }
 #endif
+    // NHL_AUTOSHOT=<seconds>: every that many seconds write the presented guest
+    // image to autoshot_NNN.png next to the exe. For unattended runs (see
+    // NHL_AUTOPLAY), where nobody is watching the window.
+    if (const char* s = std::getenv("NHL_AUTOSHOT"); s && *s) {
+      const unsigned secs = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+      if (secs) {
+        std::thread([this, secs]() {
+          for (unsigned n = 0;; ++n) {
+            std::this_thread::sleep_for(std::chrono::seconds(secs));
+            auto* gs = static_cast<rex::graphics::GraphicsSystem*>(runtime()->graphics_system());
+            auto* presenter = gs ? gs->presenter() : nullptr;
+            rex::ui::RawImage img;
+            if (!presenter || !presenter->CaptureGuestOutput(img) || !img.width || !img.height) {
+              continue;
+            }
+            std::vector<uint8_t> rgba(static_cast<size_t>(img.width) * img.height * 4);
+            for (uint32_t y = 0; y < img.height; ++y) {
+              for (uint32_t x = 0; x < img.width; ++x) {
+                const uint8_t* src = img.data.data() + static_cast<size_t>(y) * img.stride + x * 4;
+                uint8_t* d = rgba.data() + (static_cast<size_t>(y) * img.width + x) * 4;
+                d[0] = src[0]; d[1] = src[1]; d[2] = src[2]; d[3] = 255;
+              }
+            }
+            char name[32];
+            std::snprintf(name, sizeof(name), "autoshot_%03u.png", n);
+            nhl::replay::WritePng((rex::filesystem::GetExecutableFolder() / name).string(),
+                                  img.width, img.height, rgba.data());
+          }
+        }).detach();
+      }
+    }
     // Stage B of the Overall-formula hunt (overall_weights_dump.h). With
     // NHL_DUMP_OVERALL_WEIGHTS set, the image is already mapped into guest
     // memory by Setup, so scan it for the gCardOverallWeights_* anchors +
@@ -954,6 +1080,14 @@ class NhllegacyApp : public rex::ReXApp {
         xtr_path, stats.draw_packets, stats.primary_packets, stats.memory_ranges, stats.frames,
         stats.skipped_wait_reg_mem, stats.skipped_empty_leaves);
 
+    // NHL_REPLAY_DUMP=<hexaddr>:<w>:<h>[,...] - after the replay, untile a 32bpp
+    // resolve destination from guest memory and write replay_dump_<addr>.png, to
+    // see which stage of a render->resolve->composite chain loses content. For
+    // host-RT runs set NHL_VK_READBACK_MAX_LEN=0 so large resolves are read back.
+    if (const char* d = std::getenv("NHL_REPLAY_DUMP"); d && *d) {
+      DumpGuestTextures(*gs, d);
+    }
+
     auto* presenter = gs->presenter();
     if (!presenter) {
       REXLOG_ERROR("[nhl-replay] no presenter to capture from");
@@ -984,6 +1118,39 @@ class NhllegacyApp : public rex::ReXApp {
     }
     REXLOG_ERROR("[nhl-replay] failed to write {}", out);
     return false;
+  }
+
+  void DumpGuestTextures(rex::graphics::GraphicsSystem& gs, const std::string& spec) {
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) end = spec.size();
+      const std::string item = spec.substr(pos, end - pos);
+      pos = end + 1;
+      uint32_t addr = 0, w = 0, h = 0;
+      if (std::sscanf(item.c_str(), "%x:%u:%u", &addr, &w, &h) != 3 || !w || !h) continue;
+      const uint8_t* src = gs.memory()->TranslatePhysical<const uint8_t*>(addr & 0x1FFFFFFFu);
+      if (!src) continue;
+      const uint32_t pitch = (w + 31u) & ~31u;  // tiled pitch in texels
+      std::vector<uint8_t> rgba(size_t(w) * h * 4);
+      uint64_t sum = 0;
+      for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+          const int32_t off = rex::graphics::texture_util::GetTiledOffset2D(
+              int32_t(x), int32_t(y), pitch, 2);
+          const uint8_t* p = src + off;  // k_8_8_8_8, 8-in-32 swapped
+          uint8_t* o = rgba.data() + (size_t(y) * w + x) * 4;
+          o[0] = p[3]; o[1] = p[2]; o[2] = p[1]; o[3] = 255;
+          sum += o[0] + o[1] + o[2];
+        }
+      }
+      char name[64];
+      std::snprintf(name, sizeof(name), "replay_dump_%08X.png", addr);
+      const std::string out = (rex::filesystem::GetExecutableFolder() / name).string();
+      nhl::replay::WritePng(out, w, h, rgba.data());
+      REXLOG_INFO("[nhl-replay] dump {:08X} {}x{} mean={:.1f} -> {}", addr, w, h,
+                  double(sum) / (3.0 * w * h), out);
+    }
   }
 
   std::thread replay_thread_;

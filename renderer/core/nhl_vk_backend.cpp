@@ -1,20 +1,29 @@
 #include "renderer/core/nhl_vk_backend.h"
 
+#include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
+#include <thread>
 #include <utility>
 
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 
 // Win32 keyboard poll for the F9 hotkey capture (declared directly to keep
-// <windows.h> out of this TU, mirroring the D3D12 path).
+// <windows.h> out of this TU, mirroring the D3D12 path). Elsewhere the hotkey
+// is simply never "down" (dev-only frame capture).
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) short __stdcall GetAsyncKeyState(int v_key);
+#else
+static short GetAsyncKeyState(int) { return 0; }
+#endif
 
 namespace nhl::graphics {
 
@@ -45,7 +54,90 @@ NhlVkGraphicsSystem::CreateCommandProcessor() {
   return std::make_unique<NhlVkCommandProcessor>(this, kernel_state());
 }
 
+// Single-pass scene rendering (NHL_SINGLE_PASS=1).
+//
+// A 1280x720 2xMSAA color+depth surface doesn't fit the 360's 10 MB EDRAM, so
+// the game renders the in-game scene TWICE, as two 640-wide halves: pass A
+// (window offset 0) and pass B (window offset -640) submit the exact same
+// draws - same shaders, textures, vertex buffers and constants (verified per
+// draw on a match trace: 284/284 and 948/948 identical) - each followed by a
+// depth + color resolve into the left / right half of the same 1280x720
+// textures. That doubles the scene's CPU (command processor) and GPU cost.
+//
+// A host GPU has no such limit, but the emulated EDRAM does, so the full-width
+// surface only fits WITHOUT MSAA: color at tile 0 and depth at tile 720, pitch
+// 1280, 1x - the same layout the game's own composite pass uses. So:
+//   - pass A draws: surface -> pitch 1280 / 1x / depth base 720, scissor 1280;
+//   - the game's 4x-aliased clears of the half surface (pitch 320, 4x, depth
+//     base 736, unclipped) -> pitch 640 / 4x / depth base 720 with a 640x360
+//     scissor (= 1280x720 samples: exactly the new color and depth extents);
+//   - pass A's resolves: same surface override, 1x sample, scissor 1280 so one
+//     resolve fills the whole destination;
+//   - pass B draws and resolves: skipped.
+// Cost: the scene loses its 2x (vertical) MSAA; use supersampling instead.
 bool NhlVkCommandProcessor::IssueDraw(
+    rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
+    rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
+    bool major_mode_explicit) {
+  static const bool single_pass = [] {
+    const char* e = std::getenv("NHL_SINGLE_PASS");
+    return e && *e && *e != '0';
+  }();
+  if (!single_pass || !register_file_) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  constexpr uint32_t kSurfaceInfo = 0x2000, kDepthInfo = 0x2002, kWindowOffset = 0x2080,
+                     kScissorBr = 0x2082, kModeControl = 0x2208, kCopyCtl = 0x2318,
+                     kCopyDestBaseReg = 0x2319;
+  auto& rf = *register_file_;
+  const uint32_t si = rf[kSurfaceInfo], di = rf[kDepthInfo];
+  const uint32_t pitch = si & 0x3FFFu, msaa = (si >> 16) & 3u, dbase = di & 0xFFFu;
+  const bool scene = pitch == 640 && msaa == 1 && dbase == 736;
+  const bool clear4x = pitch == 320 && msaa == 2 && dbase == 736;
+  if (!scene && !clear4x) {
+    return IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  const bool is_copy = (rf[kModeControl] & 7u) == 6;
+  const bool pass_b = scene && rf[kWindowOffset] != 0;
+  if (pass_b && !is_copy) {
+    ++draws_this_frame_;
+    ++single_pass_skipped_;
+    return true;  // pass B draws: already rendered by pass A
+  }
+  const uint32_t saved_si = si, saved_di = di, saved_sc = rf[kScissorBr], saved_cc = rf[kCopyCtl];
+  const uint32_t saved_wo = rf[kWindowOffset], saved_db = rf[kCopyDestBaseReg];
+  if (pass_b) {
+    // Pass B's resolves: their rectangle is the right half in screen space,
+    // shifted onto EDRAM x 0..640 by the -640 window offset, and their dest
+    // base is pre-offset to the right half of the texture. With the full-width
+    // surface the right half lives at EDRAM x 640..1280, so drop the window
+    // offset - the resolve then adds the x=640 dest offset itself, so take the
+    // game's pre-applied offset back out of the dest base.
+    rf[kWindowOffset] = 0;
+    rf[kCopyDestBaseReg] = saved_db - uint32_t(rex::graphics::texture_util::GetTiledOffset2D(
+                                          640, 0, 1280, 2));
+  }
+  if (scene) {
+    rf[kSurfaceInfo] = (si & ~0x33FFFu) | 1280u;  // pitch 1280, 1x
+    if ((saved_sc & 0x7FFFu) == 640) rf[kScissorBr] = (saved_sc & ~0x7FFFu) | 1280u;
+    if ((rf[kModeControl] & 7u) == 6) rf[kCopyCtl] = saved_cc & ~(7u << 4);  // 1x: sample 0
+  } else {
+    rf[kSurfaceInfo] = (si & ~0x3FFFu) | 640u;  // pitch 640, still 4x
+    rf[kScissorBr] = (360u << 16) | 640u;
+  }
+  rf[kDepthInfo] = (di & ~0xFFFu) | 720u;
+  const bool rv =
+      IssueDrawImpl(primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  rf[kSurfaceInfo] = saved_si;
+  rf[kDepthInfo] = saved_di;
+  rf[kScissorBr] = saved_sc;
+  rf[kCopyCtl] = saved_cc;
+  rf[kWindowOffset] = saved_wo;
+  rf[kCopyDestBaseReg] = saved_db;
+  return rv;
+}
+
+bool NhlVkCommandProcessor::IssueDrawImpl(
     rex::graphics::xenos::PrimitiveType primitive_type, uint32_t index_count,
     rex::graphics::CommandProcessor::IndexBufferInfo* index_buffer_info,
     bool major_mode_explicit) {
@@ -55,6 +147,11 @@ bool NhlVkCommandProcessor::IssueDraw(
   if (!register_file_) {
     return rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
         primitive_type, index_count, index_buffer_info, major_mode_explicit);
+  }
+  if (rtlog_ < 0) rtlog_ = std::getenv("NHL_VK_RTLOG") ? 1 : 0;
+  if (rtlog_) {
+    RtLogDraw();
+    RtLogPassSig(uint32_t(primitive_type), index_count);
   }
   // Resolve experiment env once.
   if (!exp_resolved_) {
@@ -167,6 +264,39 @@ bool NhlVkCommandProcessor::IssueDraw(
     (*register_file_)[color_idx] = saved_color;
     return rv;
   }
+  // Experiment (NHL_VK_EXP_ZALWAYS=1): depth-tested draws pass the depth test
+  // unconditionally (ZFUNC=ALWAYS, writes kept) - tells "depth buffer content
+  // rejects everything" apart from other host-RT draw losses.
+  // Experiment (NHL_VK_EXP_SKIP_MSAA4=1): drop draws into 4x-MSAA surfaces (the
+  // game's EDRAM clear trick at pitch 320), to test whether host-RT ownership
+  // transfers between the 4x/320 and 2x/640 layouts lose the scene.
+  // Value = bit mask of which 4x draws to drop: 1 = color(+depth) writes
+  // (mode 4, cmask!=0), 2 = depth-only (mode 5), 4 = no-write (cmask==0, no z).
+  static const uint32_t exp_skip_msaa4 = [] {
+    const char* e = std::getenv("NHL_VK_EXP_SKIP_MSAA4");
+    return (e && *e) ? uint32_t(std::strtoul(e, nullptr, 0)) : 0u;
+  }();
+  if (exp_skip_msaa4 && (((*register_file_)[0x2000] >> 16) & 3u) == 2u) {
+    const uint32_t mode = (*register_file_)[0x2208] & 7u;
+    const uint32_t cmask = (*register_file_)[0x2104] & 0xFFFFu;
+    const bool z_on = ((*register_file_)[0x2200] & 0x7u) != 0;
+    uint32_t kind;
+    if (mode == 5) kind = 2;
+    else if (cmask == 0 && !z_on) kind = 4;
+    else kind = 1;
+    if (exp_skip_msaa4 & kind) return true;
+  }
+  static const bool exp_zalways = std::getenv("NHL_VK_EXP_ZALWAYS") != nullptr;
+  if (exp_zalways) {
+    constexpr uint32_t kZCtl = 0x2200;
+    uint32_t& z = (*register_file_)[kZCtl];
+    const uint32_t saved = z;
+    if (z & 0x2u) z = (z & ~(7u << 4)) | (7u << 4);
+    const bool rv = rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
+        primitive_type, index_count, index_buffer_info, major_mode_explicit);
+    z = saved;
+    return rv;
+  }
   // Forward unchanged — rendering is identical to the stock Vulkan backend.
   return rex::graphics::vulkan::VulkanCommandProcessor::IssueDraw(
       primitive_type, index_count, index_buffer_info, major_mode_explicit);
@@ -227,15 +357,234 @@ void NhlVkCommandProcessor::PollHotkeyCapture() {
   }
 }
 
+// --- Render-target / resolve inventory (NHL_VK_RTLOG=1) ---------------------
+// Raw Xenos register dwords (see register_table.inc) so the log is easy to
+// decode against Xenia/SDK docs.
+namespace {
+constexpr uint32_t kRbSurfaceInfo = 0x2000, kRbColorInfo = 0x2001, kRbDepthInfo = 0x2002,
+                   kRbColor1Info = 0x2003, kWindowOffset = 0x2080, kWindowScissorBr = 0x2082,
+                   kRbColorMask = 0x2104, kVportXScale = 0x210F, kVportYScale = 0x2111,
+                   kRbDepthControl = 0x2200, kRbModeControl = 0x2208, kVizQuery = 0x2293,
+                   kCopyControl = 0x2318, kCopyDestBase = 0x2319, kCopyDestPitch = 0x231A,
+                   kCopyDestInfo = 0x231B;
+}  // namespace
+
+void NhlVkCommandProcessor::RtLogDraw() {
+  const auto& rf = *register_file_;
+  RtDrawKey k{rf[kRbSurfaceInfo], rf[kRbColorInfo],   rf[kRbColor1Info], rf[kRbDepthInfo],
+              rf[kRbModeControl], rf[kRbDepthControl], rf[kRbColorMask], rf[kWindowOffset]};
+  RtDrawStat* s = nullptr;
+  for (auto& e : rt_draws_) {
+    if (e.key == k) { s = &e; break; }
+  }
+  if (!s) {
+    if (rt_draws_.size() >= 256) return;
+    rt_draws_.push_back(RtDrawStat{k});
+    s = &rt_draws_.back();
+  }
+  ++s->draws;
+  const uint32_t idx = uint32_t(s - rt_draws_.data());
+  if (!rt_seq_.empty() && rt_seq_.back().first == idx) {
+    ++rt_seq_.back().second;
+  } else if (rt_seq_.size() < 512) {
+    rt_seq_.emplace_back(idx, 1u);
+  }
+  if (rf[kVizQuery] & 1u) ++s->viz_query_draws;
+  s->vp_w = std::max(s->vp_w, 2.0f * std::abs(std::bit_cast<float>(rf[kVportXScale])));
+  s->vp_h = std::max(s->vp_h, 2.0f * std::abs(std::bit_cast<float>(rf[kVportYScale])));
+  s->scissor_br = rf[kWindowScissorBr];
+}
+
+
+// Per-draw signatures of the two half-screen scene passes (2xMSAA pitch-640
+// surface, window offset 0 vs -640), to check whether pass B re-submits exactly
+// pass A's draws. sig1 = shaders + primitive + textures + vertex buffers;
+// sig2 = the first 64 float-constant vectors (transforms).
+namespace {
+struct PassSig { uint64_t state, consts; };
+std::vector<PassSig> g_pass_sigs[2];
+uint64_t Fnv(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
+  const uint8_t* p = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+  return h;
+}
+}  // namespace
+
+void NhlVkCommandProcessor::RtLogPassSig(uint32_t prim, uint32_t index_count) {
+  const auto& rf = *register_file_;
+  const uint32_t si = rf[0x2000];
+  if ((si & 0x3FFFu) != 640 || ((si >> 16) & 3u) != 1 || (rf[0x2208] & 7u) != 4) return;
+  if ((rf[0x2002] & 0xFFFu) != 736) return;
+  if ((rf[0x2104] & 0xFFFFu) == 0 && (rf[0x2200] & 7u) == 0) return;  // tiny no-write query draws
+  const int pass = rf[0x2080] ? 1 : 0;
+  uint64_t h = Fnv(&prim, 4);
+  h = Fnv(&index_count, 4, h);
+  const uint64_t vs = active_vertex_shader() ? active_vertex_shader()->ucode_data_hash() : 0;
+  const uint64_t ps = active_pixel_shader() ? active_pixel_shader()->ucode_data_hash() : 0;
+  h = Fnv(&vs, 8, h);
+  h = Fnv(&ps, 8, h);
+  h = Fnv(&rf.values[0x4800], 192 * 4, h);  // fetch constants (textures + vertex buffers)
+  h = Fnv(&rf.values[0x2200], 4, h);        // depth control
+  h = Fnv(&rf.values[0x2104], 4, h);        // color mask
+  const uint64_t c = Fnv(&rf.values[0x4000], 64 * 4 * 4);
+  if (g_pass_sigs[pass].size() < 4096) g_pass_sigs[pass].push_back({h, c});
+}
+
+bool NhlVkCommandProcessor::IssueCopy() {
+  if (rtlog_ > 0 && register_file_) {
+    const auto& rf = *register_file_;
+    RtCopyStat c{rf[kRbSurfaceInfo], rf[kRbColorInfo],  rf[kRbDepthInfo],
+                 rf[kCopyControl],   rf[kCopyDestBase], rf[kCopyDestPitch],
+                 rf[kCopyDestInfo],  rf[kWindowScissorBr], rf[kWindowOffset]};
+    bool found = false;
+    uint32_t cidx = 0;
+    for (auto& e : rt_copies_) {
+      if (e.surface_info == c.surface_info && e.color_info == c.color_info &&
+          e.depth_info == c.depth_info && e.copy_control == c.copy_control &&
+          e.dest_base == c.dest_base && e.dest_pitch == c.dest_pitch &&
+          e.dest_info == c.dest_info && e.scissor_br == c.scissor_br) {
+        ++e.count;
+        found = true;
+        break;
+      }
+      ++cidx;
+    }
+    if (!found && rt_copies_.size() < 256) {
+      c.count = 1;
+      rt_copies_.push_back(c);
+    }
+    if (rt_seq_.size() < 512) rt_seq_.emplace_back(0x8000u | cidx, 1u);
+  }
+  // Experiment (NHL_VK_EXP_COPY_SAMPLE=<0..6>): force RB_COPY_CONTROL's
+  // copy_sample_select for color resolves, restoring it afterwards - separates
+  // "MSAA draws never landed" from "multi-sample resolve loses them".
+  static const int exp_sample = [] {
+    const char* e = std::getenv("NHL_VK_EXP_COPY_SAMPLE");
+    return (e && *e) ? int(std::strtol(e, nullptr, 10)) : -1;
+  }();
+  if (exp_sample >= 0 && register_file_) {
+    uint32_t& cc = (*register_file_)[kCopyControl];
+    const uint32_t saved = cc;
+    if ((cc & 7u) != 4u) {  // color source only (4 = depth)
+      cc = (cc & ~(7u << 4)) | (uint32_t(exp_sample & 7) << 4);
+    }
+    const bool r = rex::graphics::vulkan::VulkanCommandProcessor::IssueCopy();
+    cc = saved;
+    return r;
+  }
+  return rex::graphics::vulkan::VulkanCommandProcessor::IssueCopy();
+}
+
+// Decode helpers per Xenos: SURFACE_INFO pitch[13:0] msaa[17:16];
+// COLOR_INFO base[11:0] (EDRAM tiles) format[19:16]; DEPTH_INFO base[11:0]
+// format[16]; COPY_CONTROL src[2:0] sample[6:4] cmd[21:20].
+void NhlVkCommandProcessor::RtLogDump() {
+  if (rt_draws_.empty() && rt_copies_.empty()) return;
+  REXLOG_INFO("[nhl-rt] ---- frame {}: {} rt configs, {} resolve kinds ----", frames_total_,
+              rt_draws_.size(), rt_copies_.size());
+  uint32_t di = 0;
+  for (const auto& e : rt_draws_) {
+    const auto& k = e.key;
+    REXLOG_INFO(
+        "[nhl-rt] D{:<2} x{:<5} pitch={:<4} msaa={} c0base={:<4} c0fmt={:<2} c1={:08X} "
+        "dbase={:<4} dfmt={} mode={} zctl={:08X} cmask={:04X} woff={:08X} vp={:.0f}x{:.0f} "
+        "sc_br={:08X} viz={}",
+        di++, e.draws, k.surface_info & 0x3FFFu, (k.surface_info >> 16) & 3u,
+        k.color_info & 0xFFFu, (k.color_info >> 16) & 0xFu, k.color1_info,
+        k.depth_info & 0xFFFu, (k.depth_info >> 16) & 1u, k.modecontrol & 7u, k.depthcontrol,
+        k.colormask & 0xFFFFu, k.window_offset, e.vp_w, e.vp_h, e.scissor_br,
+        e.viz_query_draws);
+  }
+  uint32_t ci = 0;
+  for (const auto& c : rt_copies_) {
+    REXLOG_INFO(
+        "[nhl-rt] C{:<2} x{:<3} pitch={:<4} msaa={} c0base={:<4} c0fmt={:<2} dbase={:<4} "
+        "src={} sample={} cmd={} clr={}{} dest=0x{:08X} dpitch={}x{} dinfo={:08X} "
+        "sc_br={:08X} woff={:08X}",
+        ci++, c.count, c.surface_info & 0x3FFFu, (c.surface_info >> 16) & 3u, c.color_info & 0xFFFu,
+        (c.color_info >> 16) & 0xFu, c.depth_info & 0xFFFu, c.copy_control & 7u,
+        (c.copy_control >> 4) & 7u, (c.copy_control >> 20) & 3u, (c.copy_control >> 8) & 1u,
+        (c.copy_control >> 9) & 1u, c.dest_base, c.dest_pitch & 0x3FFFu,
+        (c.dest_pitch >> 16) & 0x3FFFu, c.dest_info, c.scissor_br, c.window_offset);
+  }
+  // In-order sequence, "D<draw config #>x<run>" / "C<copy #>", indices as listed above.
+  std::string seq;
+  for (const auto& [id, run] : rt_seq_) {
+    char buf[24];
+    if (id & 0x8000u) {
+      std::snprintf(buf, sizeof(buf), "C%u ", id & 0x7FFFu);
+    } else {
+      std::snprintf(buf, sizeof(buf), "D%ux%u ", id, run);
+    }
+    seq += buf;
+  }
+  REXLOG_INFO("[nhl-rt] seq: {}", seq);
+  {
+    const auto& a = g_pass_sigs[0];
+    const auto& b = g_pass_sigs[1];
+    size_t same_state = 0, same_consts = 0;
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+      same_state += a[i].state == b[i].state;
+      same_consts += a[i].consts == b[i].consts;
+    }
+    REXLOG_INFO("[nhl-rt] scene passes: A={} draws, B={} draws, same state {}/{}, same consts {}/{}",
+                a.size(), b.size(), same_state, n, same_consts, n);
+    g_pass_sigs[0].clear();
+    g_pass_sigs[1].clear();
+  }
+  rt_draws_.clear();
+  rt_copies_.clear();
+  rt_seq_.clear();
+}
+
+// Present frame cap. On Windows the guest's presents pace themselves (60 fps in
+// menus, 30 in matches). On Linux the same build presents uncapped in menus
+// (~200+ fps, measured on a Steam Deck) - game *timing* stays correct (movies
+// play at their encoded rate), the extra frames just burn CPU/GPU power. Holding
+// the CP thread here backpressures the guest render thread to the cap without
+// touching simulation time. NHL_FPS_CAP=<fps> overrides (0 = off). Default 60
+// off Windows; off on Windows, where it never triggers and the coarse system
+// timer could only add jitter.
+void NhlVkCommandProcessor::ThrottlePresent() {
+  static const double cap = [] {
+    if (const char* e = std::getenv("NHL_FPS_CAP"); e && *e) {
+      const double v = std::strtod(e, nullptr);
+      return v > 0.0 ? v : 0.0;
+    }
+#if defined(_WIN32)
+    return 0.0;
+#else
+    return 60.0;
+#endif
+  }();
+  if (cap <= 0.0) return;
+  using clock = std::chrono::steady_clock;
+  const auto interval =
+      std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / cap));
+  const auto now = clock::now();
+  if (present_deadline_ == clock::time_point{} || now - present_deadline_ > interval) {
+    // First frame, or we fell more than a frame behind (slow scene): resync
+    // instead of bursting to catch up.
+    present_deadline_ = now + interval;
+    return;
+  }
+  if (present_deadline_ > now) std::this_thread::sleep_until(present_deadline_);
+  present_deadline_ += interval;
+}
+
 void NhlVkCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
-  // Present the frame via the SDK's own Vulkan presenter, then sample timing.
+  // Pace presents to the cap, then present the frame via the SDK's own Vulkan
+  // presenter and sample timing.
+  ThrottlePresent();
   rex::graphics::vulkan::VulkanCommandProcessor::IssueSwap(
       frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   // F9 streaming capture toggle (gameplay-trace benchmark source).
   PollHotkeyCapture();
+  if (rtlog_ > 0) RtLogDump();
 
   const auto now = std::chrono::steady_clock::now();
   last_frame_draws_ = draws_this_frame_;

@@ -1,0 +1,32 @@
+--- a/cmake/rexglue_fidelityfx.cmake
++++ b/cmake/rexglue_fidelityfx.cmake
+@@ -9,7 +9,17 @@
+ endif()
+ 
+ # ── Dependency validation ────────────────────────────────────────────────
+-if(NOT WIN32)
++# Headers-only mode: fetch the FidelityFX sources for their headers and build
++# no FidelityFX library. That is all the spatial present effects need - CAS and
++# FSR 1 (EASU + RCAS) are shader passes whose SPIR-V is checked in, driven by
++# constants computed from the FidelityFX headers. The temporal upscalers
++# (fsr2 / fsr3) need the runtime library and stay unavailable. This is the mode
++# for toolchains the upstream ffx-api build does not support (anything that is
++# not MSVC + the Visual Studio generator, e.g. Linux).
++option(REXGLUE_FIDELITYFX_HEADERS_ONLY
++    "Fetch FidelityFX headers only (CAS / FSR 1 present effects, no fsr2/fsr3)" OFF)
++
++if(NOT WIN32 AND NOT REXGLUE_FIDELITYFX_HEADERS_ONLY)
+     find_package(Vulkan QUIET)
+     if(NOT Vulkan_FOUND)
+         message(WARNING
+@@ -114,7 +124,9 @@
+ set(REXGLUE_FIDELITYFX_PREBUILT_DIR "" CACHE PATH
+     "Directory containing a prebuilt amd_fidelityfx_<backend>.dll + .lib (skips the in-tree FidelityFX build)")
+ 
+-if(REXGLUE_FIDELITYFX_PREBUILT_DIR AND
++if(REXGLUE_FIDELITYFX_HEADERS_ONLY)
++    message(STATUS "FidelityFX: headers only (CAS / FSR 1 present effects; no runtime library)")
++elseif(REXGLUE_FIDELITYFX_PREBUILT_DIR AND
+    EXISTS "${REXGLUE_FIDELITYFX_PREBUILT_DIR}/amd_fidelityfx_${_rexglue_fidelityfx_backend}.dll")
+     set(_ffx_name "amd_fidelityfx_${_rexglue_fidelityfx_backend}")
+     add_library(${_ffx_name} SHARED IMPORTED GLOBAL)

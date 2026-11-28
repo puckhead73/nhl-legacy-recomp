@@ -33,7 +33,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <windows.h>
+#include "platform_compat.h"
 
 #include <rex/graphics/graphics_system.h>
 #include <rex/hook.h>
@@ -617,6 +617,7 @@ extern "C" REX_FUNC(sub_827C2848) {
   std::fclose(f);
 }
 
+#if defined(_WIN32)  // VEH + VirtualProtect page trap: Windows-only debug tool.
 // --- Plane write-origin trap (env NHL_VP6_TRAP=<hex phys addr>) --------------
 // Locates WHICH recompiled function writes the VP6 luma plane ring (the two
 // known VP3-family IDCTs sub_827D2FE8/sub_82898660 do NOT run during the
@@ -771,6 +772,7 @@ static const int g_vp6_trap_init = [] {
   }).detach();
   return 0;
 }();
+#endif  // _WIN32
 
 // Frame driver tap: dump the codec object (r3) at entry, find plane-candidate
 // pointers inside it (physical-alloc range), and dump a slice of each plane
