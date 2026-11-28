@@ -7,3 +7,6 @@
 
 # PowerShell tolerates LF, but keep our shipped drivers CRLF for consistency.
 *.ps1 text eol=crlf
+
+# SDK patches are applied with `git apply` to an LF tree - CRLF checkouts fail.
+*.patch text eol=lf
